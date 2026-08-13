@@ -1,0 +1,15 @@
+# Claude Code workspace
+.claude/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local scratch
+*.log
+*.bak

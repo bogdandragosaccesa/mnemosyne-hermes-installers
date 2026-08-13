@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# A CRLF in a shell script makes bash fail with "\r: command not found".
+*.sh text eol=lf
+
+# PowerShell is fine with either; CRLF matches the platform it runs on.
+*.ps1 text eol=crlf
