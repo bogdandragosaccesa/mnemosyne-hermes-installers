@@ -6,15 +6,28 @@ memory provider on [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 | Script | Platform |
 | --- | --- |
 | `install-mnemosyne-hermes-unix.sh` | Linux / macOS |
+| `uninstall-mnemosyne-hermes-unix.sh` | Linux / macOS |
 | `install-mnemosyne-hermes-windows.ps1` | Windows (PowerShell 5.1+) |
 | `uninstall-mnemosyne-hermes-windows.ps1` | Windows (PowerShell 5.1+) |
 
-The Windows scripts are a port of the Unix installer. They bootstrap Hermes itself
-via the official `install.ps1` when it is missing, create a dedicated virtual
-environment for Mnemosyne, register the memory provider with Hermes, and point
-`memory.provider` at it.
+Every installer bootstraps Hermes itself when it is missing, creates a dedicated virtual
+environment for Mnemosyne, registers the memory provider with Hermes, and points
+`memory.provider` at it. The Windows scripts are a port of the Unix ones.
 
 ## Install
+
+Linux / macOS:
+
+```bash
+./install-mnemosyne-hermes-unix.sh
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--no-embeddings` | Request `mnemosyne-memory` without the `[embeddings]` extra. See the caveat below. |
+| `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
+
+Windows:
 
 ```powershell
 .\install-mnemosyne-hermes-windows.ps1
@@ -26,17 +39,32 @@ environment for Mnemosyne, register the memory provider with Hermes, and point
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
 
-Re-running the installer is safe: it upgrades the packages in place and re-registers
+Re-running an installer is safe: it upgrades the packages in place and re-registers
 the provider.
 
 ## Uninstall
+
+Linux / macOS:
+
+```bash
+./uninstall-mnemosyne-hermes-unix.sh --dry-run   # preview
+./uninstall-mnemosyne-hermes-unix.sh             # prompts before removing
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--keep-data` | Preserve the Mnemosyne data directory. |
+| `--include-hermes` | Also remove Hermes Agent: the whole `HERMES_HOME` tree, the gateway service, every `~/.local/bin` entry pointing into it, and the `HERMES_HOME` export. |
+| `--dry-run` | Print the removal plan and change nothing. |
+| `--force` | Skip the confirmation prompt. |
+| `--non-interactive` | Never prompt. Implied when stdin is not a terminal; needs `--force` to remove anything. |
+
+Windows:
 
 ```powershell
 .\uninstall-mnemosyne-hermes-windows.ps1 -DryRun   # preview
 .\uninstall-mnemosyne-hermes-windows.ps1           # prompts before removing
 ```
-
-The default is a complete removal, **including the memory database**.
 
 | Flag | Effect |
 | --- | --- |
@@ -44,17 +72,40 @@ The default is a complete removal, **including the memory database**.
 | `-IncludeHermes` | Also remove Hermes Agent: the whole `HERMES_HOME` tree, its PATH entries, and its environment variables. |
 | `-DryRun` | Print the removal plan and change nothing. |
 | `-Force` | Skip the confirmation prompt. |
+| `-NonInteractive` | Never prompt. Requires `-Force` to remove anything. |
 
-It stops the gateway and any file-locking processes first, unsets `memory.provider`
-in the main config and in every profile, removes the provider registration, the
-bundled memory skill, the virtual environment and the user environment variables,
-then verifies and exits non-zero if anything survived.
+The default is a complete removal, **including the memory database**.
 
-Tooling that came from winget (`uv`, and with `-IncludeHermes` also `ripgrep` and
-`ffmpeg`) is deliberately left in place — the script prints the `winget uninstall`
-commands instead of removing shared tooling it cannot prove it introduced.
+Both scripts stop the gateway and any process still holding the virtual environment,
+unset `memory.provider` in the main config and in every profile, remove the provider
+registration, the bundled memory skill, the virtual environment and the persisted
+environment variables, then verify and exit non-zero if anything survived.
 
-## Windows differences from the Unix script
+Where they persist those variables differs: the Unix script strips the `export` lines
+the installer appended to your shell rc file, while the Windows script clears User
+environment variables.
+
+Shared tooling is deliberately left in place. Neither script removes the system
+packages the installer may have pulled in (`curl` and `python3-venv` on Unix, winget
+packages on Windows), because it cannot prove it introduced them; the Windows script
+prints the `winget uninstall` commands instead. `--include-hermes` likewise leaves
+systemd lingering enabled and prints the command to disable it, since other user
+services may depend on it.
+
+## The gateway background service
+
+`hermes gateway restart` only restarts a service that has been registered with
+`hermes gateway install`. With no service registered it silently falls back to running
+the gateway in the **foreground**, where it never returns — which would hang the
+installer before it reached its verification steps. The Unix installer therefore runs
+`hermes gateway install` first, and bounds the restart with `timeout` where that
+command exists.
+
+`--include-hermes` reverses this: it runs `hermes gateway uninstall` while the Hermes
+binary still exists, because removing `HERMES_HOME` first would strand the systemd unit
+pointing at a deleted interpreter.
+
+## Windows differences from the Unix scripts
 
 These are forced by the platform, not preferences:
 
@@ -69,6 +120,8 @@ These are forced by the platform, not preferences:
   so the data lands where it was asked to.
 - The provider is registered in `wrapper` mode, because creating a symlink on Windows
   requires Developer Mode or elevation.
+- Deleting an open file fails on Windows, so the uninstaller kills file-locking
+  processes and retries; on Unix unlinking an open file always succeeds.
 
 ## Known upstream quirks
 
@@ -89,8 +142,33 @@ the warning.
 through with a misleading `No such file or directory`. The installer warns when the
 venv path is long; set `MNEMOSYNE_VENV` to something shorter if you hit it.
 
+**`hermes gateway restart` hangs without a registered service.** See
+[The gateway background service](#the-gateway-background-service).
+
 ## Requirements
+
+Linux / macOS:
+
+- bash (the scripts are written for bash 3.2, so stock macOS works)
+- `sudo` rights, if `curl` or the Python `venv` module still need installing
+
+Windows:
 
 - Windows 10 1803+ / Server 2019+ (for the bundled `curl.exe`)
 - PowerShell 5.1 or newer
 - winget, if uv or Python still need to be installed
+
+## Development
+
+The repository uses [pre-commit](https://pre-commit.com/) so that malformed docs and
+broken shell scripts cannot be committed. After cloning:
+
+```bash
+pre-commit install
+```
+
+`pre-commit run --all-files` checks the whole tree. The hooks are whitespace and
+end-of-file fixers, `check-yaml`, a shebang/executable-bit consistency check,
+[codespell](https://github.com/codespell-project/codespell) for typos in prose and help
+text, [markdownlint](https://github.com/igorshubovych/markdownlint-cli) for the docs,
+and [shellcheck](https://www.shellcheck.net/) for the installers.

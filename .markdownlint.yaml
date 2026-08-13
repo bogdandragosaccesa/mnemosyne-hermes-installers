@@ -1,0 +1,13 @@
+default: true
+
+# Prose wraps at 100; tables and fenced code are allowed to run long because
+# breaking them changes what they mean.
+MD013:
+  line_length: 100
+  tables: false
+  code_blocks: false
+
+# Flag-name headings such as `-KeepData` repeat between the install and
+# uninstall sections; they are only ambiguous out of context.
+MD024:
+  siblings_only: true

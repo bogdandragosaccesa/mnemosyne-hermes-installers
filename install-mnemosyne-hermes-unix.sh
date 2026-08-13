@@ -19,6 +19,12 @@ for arg in "$@"; do
     esac
 done
 as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+# `timeout` is coreutils, so it is missing on a stock macOS; there the command
+# simply runs unbounded rather than not running at all.
+run_bounded() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+}
 install_system_package() {
     local package="$1"
     if command -v apt-get >/dev/null 2>&1; then
@@ -49,6 +55,9 @@ MNEMOSYNE_HOME="${MNEMOSYNE_HOME:-$HERMES_HOME/mnemosyne}"
 MNEMOSYNE_VENV="${MNEMOSYNE_VENV:-$HOME/.mnemosyne-venv}"
 export HERMES_HOME MNEMOSYNE_HOME MNEMOSYNE_VENV
 mkdir -p "$HERMES_HOME" "$MNEMOSYNE_HOME"
+# The single quotes are deliberate: these lines are appended to the rc file
+# verbatim, so the parameter expansions run when a future shell starts.
+# shellcheck disable=SC2016
 persist_env() {
     local rc_file="$1"; touch "$rc_file"
     grep -qxF 'export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"' "$rc_file" || echo 'export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"' >> "$rc_file"
@@ -84,7 +93,12 @@ if (( ! SKIP_HERMES_CONFIGURATION )); then
             else echo 'Run: sudo loginctl enable-linger '"$(id -un)" >&2; fi
         fi
     fi
-    hermes gateway restart || echo 'Gateway restart was not completed. Run: hermes gateway restart' >&2
+    # With no background service registered, `hermes gateway restart` falls back
+    # to running the gateway in the foreground and never returns, which hangs
+    # the installer before it reaches its verification steps. Registering the
+    # service first makes restart a real, bounded service restart.
+    hermes gateway install || echo 'Could not install the gateway service. Run: hermes gateway install' >&2
+    run_bounded 300 hermes gateway restart || echo 'Gateway restart was not completed. Run: hermes gateway restart' >&2
 fi
 printf '\nInstallation complete.\nHermes home:    %s\nMnemosyne data: %s\n' "$HERMES_HOME" "$MNEMOSYNE_HOME"
 hermes memory status
