@@ -14,6 +14,16 @@ Every installer bootstraps Hermes itself when it is missing, creates a dedicated
 environment for Mnemosyne, registers the memory provider with Hermes, and points
 `memory.provider` at it. The Windows scripts are a port of the Unix ones.
 
+## Documentation
+
+- [Installation](docs/installation.md) — flags, paths, overrides, requirements
+- [Uninstallation](docs/uninstallation.md) — what is removed, what is deliberately kept
+- [How it works](docs/how-it-works.md) — wrapper mode, the Python-version invariant,
+  the gateway, uninstall ordering
+- [Troubleshooting](docs/troubleshooting.md) — silent embedding failures, DLL errors,
+  leftovers
+- [Changelog](CHANGELOG.md)
+
 ## Install
 
 Linux / macOS:
@@ -118,20 +128,25 @@ is stored with no embedding**, so semantic recall can never match it. Three furt
 subsystems degrade with warnings only on import: batch tool calls error out,
 `memory.mnemosyne` config keys fall back to defaults, and persona injection is disabled.
 
-The Unix installer therefore:
+Both installers therefore:
 
-- reads the version from `HERMES_HOME/hermes-agent/venv/bin/python` and builds the
-  Mnemosyne venv against **that** version rather than a hardcoded one;
-- looks for `uv` in `HERMES_HOME/bin` as well as on `PATH` — Hermes vendors its own uv
-  there and never adds it to `PATH`, and missing it is what silently downgraded this
-  step to the system Python;
-- rebuilds an existing venv that was built against the wrong version;
-- aborts with an explanation if the versions still differ;
-- after registering the provider, imports `numpy` and `onnxruntime` through Hermes'
-  interpreter and reports whether the embedding stack actually loads.
+- read the version from Hermes' own interpreter and build the Mnemosyne venv against
+  **that** version rather than a hardcoded one;
+- look for `uv` where Hermes vendors it (`HERMES_HOME/bin`) as well as on `PATH` —
+  missing it is what silently downgraded the Unix script to the system Python;
+- rebuild an existing venv that was built against the wrong version;
+- abort with an explanation if the versions still differ;
+- after registering the provider, import `numpy` and `onnxruntime` through Hermes'
+  interpreter and report whether the embedding stack actually loads.
 
-If you see `Warning: Hermes cannot import numpy/onnxruntime`, memories will be stored
-without embeddings — fix the interpreter mismatch before relying on recall.
+If you see `Hermes cannot import numpy/onnxruntime`, memories will be stored without
+embeddings. On Windows the usual cause is not a version mismatch but an outdated Visual
+C++ runtime — `onnxruntime` then fails with `DLL load failed ... initialization routine
+failed`. Fix it with:
+
+```powershell
+winget install --id Microsoft.VCRedist.2015+.x64
+```
 
 ## Windows differences from the Unix scripts
 
@@ -142,6 +157,11 @@ These are forced by the platform, not preferences:
   appended to a shell rc file.
 - System packages come from winget instead of apt/dnf/pacman/brew.
 - The systemd `loginctl enable-linger` step has no Windows equivalent and is omitted.
+- There is no Windows gateway *service*: `hermes gateway` spawns the process directly and
+  registers a login item at `%APPDATA%\…\Startup\Hermes_Gateway.vbs`. So the Windows
+  installer needs no `hermes gateway install` step and its restart never blocks, while
+  `-IncludeHermes` has to remove that login item or it keeps launching a deleted Hermes
+  at every sign-in.
 - Mnemosyne resolves its database from `MNEMOSYNE_DATA_DIR`, falling back to
   `$HERMES_HOME\mnemosyne`; `MNEMOSYNE_HOME` alone does not move it. When a
   non-default `MNEMOSYNE_HOME` is given, the installer also sets `MNEMOSYNE_DATA_DIR`
@@ -185,6 +205,9 @@ Windows:
 - Windows 10 1803+ / Server 2019+ (for the bundled `curl.exe`)
 - PowerShell 5.1 or newer
 - winget, if uv or Python still need to be installed
+- A current Microsoft Visual C++ x64 redistributable. `onnxruntime` needs a newer build
+  than the 14.29 (2019-era) runtime some Server images ship with, and without it
+  embeddings fail to load — see [Matching Hermes' Python](#matching-hermes-python).
 
 ## Development
 

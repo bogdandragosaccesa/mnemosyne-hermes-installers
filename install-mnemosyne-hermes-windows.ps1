@@ -92,6 +92,24 @@ function Invoke-Native {
     }
 }
 
+# Reads "3.11" from an interpreter, or $null if it cannot be run. Redirecting a
+# native command's stderr under $ErrorActionPreference='Stop' turns ordinary
+# output into a terminating error, so drop to 'Continue' for the probe.
+function Get-PyMinorVersion {
+    param([Parameter(Mandatory)][string]$PythonPath)
+    if (-not (Test-Path -LiteralPath $PythonPath)) { return $null }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $PythonPath -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) { return $null }
+    return ([string]($out | Select-Object -First 1)).Trim()
+}
+
 # winget / hermes install.ps1 write the *User* PATH; pull it back into this process.
 function Update-SessionPath {
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -294,8 +312,27 @@ $venvPython = Join-Path $mnemosyneVenv 'Scripts\python.exe'
 $mnemosyneHermesExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne-hermes.exe'
 $mnemosyneCliExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne.exe'
 
-# Mirror the Unix script: a venv that exists but has no working python/pip is
-# rebuilt rather than patched.
+# The provider is registered in wrapper mode, so Hermes' own interpreter imports
+# these packages in-process. Compiled wheels are ABI-locked to one Python minor
+# version, and a mismatch fails quietly: the provider still registers and
+# keyword recall still works, but embeddings never load, so memories are stored
+# without vectors and semantic recall can never match them.
+$hermesVenvPython = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
+$hermesPyVersion = Get-PyMinorVersion -PythonPath $hermesVenvPython
+if (-not $hermesPyVersion) {
+    Write-Warn "Could not determine Hermes' Python version; falling back to 3.11."
+    $hermesPyVersion = '3.11'
+} else {
+    Write-Ok "Hermes runs Python $hermesPyVersion; matching it."
+}
+
+# Mirror the Unix script: a venv that exists but has no working python/pip, or
+# was built against a different Python, is rebuilt rather than patched.
+if ((Test-Path -LiteralPath $mnemosyneVenv) -and (Test-Path -LiteralPath $venvPython) -and
+    ((Get-PyMinorVersion -PythonPath $venvPython) -ne $hermesPyVersion)) {
+    Write-Warn "Existing venv was built against Python $(Get-PyMinorVersion -PythonPath $venvPython), not $hermesPyVersion; recreating."
+    Remove-Item -LiteralPath $mnemosyneVenv -Recurse -Force
+}
 if ((Test-Path -LiteralPath $mnemosyneVenv) -and (Test-Path -LiteralPath $venvPython)) {
     # Windows PowerShell 5.1 wraps a native executable's stderr in ErrorRecords as
     # soon as any stream is redirected, and $ErrorActionPreference='Stop' turns
@@ -318,13 +355,21 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Step "Creating virtual environment at $mnemosyneVenv ..."
     if ($uvExe) {
         # --seed installs pip into the uv-created venv.
-        Invoke-Native -FilePath $uvExe -What 'uv venv' -ArgumentList @('venv', $mnemosyneVenv, '--python', '3.11', '--seed')
+        Invoke-Native -FilePath $uvExe -What 'uv venv' -ArgumentList @('venv', $mnemosyneVenv, '--python', $hermesPyVersion, '--seed')
     } else {
         Invoke-Native -FilePath $pythonExe -What 'python -m venv' -ArgumentList @('-m', 'venv', $mnemosyneVenv)
     }
 }
 if (-not (Test-Path -LiteralPath $venvPython)) { throw "Virtual environment creation did not produce $venvPython." }
 Write-Ok "venv python: $venvPython"
+
+$venvPyVersion = Get-PyMinorVersion -PythonPath $venvPython
+if ($venvPyVersion -ne $hermesPyVersion) {
+    throw ("Python version mismatch: Hermes runs $hermesPyVersion but the Mnemosyne " +
+        "environment is $venvPyVersion. Hermes imports Mnemosyne in-process, so compiled " +
+        "wheels built for $venvPyVersion cannot load under $hermesPyVersion; memories would be " +
+        "stored without embeddings. Install a Python $hermesPyVersion interpreter (or uv) and rerun.")
+}
 
 if ($NoEmbeddings) {
     $package = 'mnemosyne-memory'
@@ -360,6 +405,26 @@ if (Test-Path -LiteralPath (Join-Path $hermesHome 'plugins\mnemosyne')) {
     $installArgs += '--force'
 }
 Invoke-Native -FilePath $mnemosyneHermesExe -What 'mnemosyne-hermes install' -ArgumentList $installArgs
+
+# `hermes memory status` reports "available" from the registration alone, so it
+# stays green even when the embedding stack cannot load in Hermes' interpreter.
+# Import it the way the wrapper does and report what actually happens.
+if (-not $NoEmbeddings -and (Test-Path -LiteralPath $hermesVenvPython)) {
+    $site = Join-Path $mnemosyneVenv 'Lib\site-packages'
+    $previousEA = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $hermesVenvPython -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 | Out-Null
+    $embedProbe = $LASTEXITCODE
+    $ErrorActionPreference = $previousEA
+    if ($embedProbe -eq 0) {
+        Write-Ok "Verified: Hermes' interpreter can load the Mnemosyne embedding stack."
+    } else {
+        Write-Warn 'Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.'
+        Write-Warn '  Memories will be stored without embeddings; semantic recall will not match.'
+        Write-Warn '  On Windows this is usually an outdated Visual C++ runtime. Install the'
+        Write-Warn '  latest x64 build:  winget install --id Microsoft.VCRedist.2015+.x64'
+    }
+}
 
 if (-not $SkipHermesConfiguration) {
     Write-Step 'Configuring Hermes...'

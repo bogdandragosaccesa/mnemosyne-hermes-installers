@@ -1,0 +1,69 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
+project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0] - 2026-08-13
+
+First tagged release. Install and uninstall scripts for the Mnemosyne memory provider on
+Hermes Agent, covering Linux, macOS and Windows.
+
+### Added
+
+- `install-mnemosyne-hermes-unix.sh` — installer for Linux and macOS.
+- `uninstall-mnemosyne-hermes-unix.sh` — uninstaller for Linux and macOS, with
+  `--keep-data`, `--include-hermes`, `--dry-run`, `--force` and `--non-interactive`.
+  Written for bash 3.2 so it runs on stock macOS.
+- `install-mnemosyne-hermes-windows.ps1` — installer for Windows (PowerShell 5.1+).
+- `uninstall-mnemosyne-hermes-windows.ps1` — uninstaller for Windows, with `-KeepData`,
+  `-IncludeHermes`, `-DryRun`, `-Force` and `-NonInteractive`.
+- A plan → confirm → verify flow in both uninstallers. They print exactly what will be
+  removed, ask before touching anything, and exit non-zero if something survives.
+- Interpreter matching in both installers: the Mnemosyne virtual environment is built
+  against the Python version Hermes itself runs, an existing environment built against
+  the wrong version is rebuilt, and a remaining mismatch aborts the install.
+- A post-install health check that imports `numpy` and `onnxruntime` through Hermes' own
+  interpreter and reports whether the embedding stack actually loads.
+- `pre-commit` configuration: whitespace and end-of-file fixers, `check-yaml`, a
+  shebang/executable-bit consistency check, `codespell`, `markdownlint` and `shellcheck`.
+- Documentation under [`docs/`](docs/).
+
+### Fixed
+
+- **The Unix installer hung forever.** `hermes gateway restart` only restarts a
+  registered service; with none registered it falls back to running the gateway in the
+  foreground and never returns, so the installer never reached its verification steps.
+  It now registers the service first and bounds the restart with `timeout` where that
+  command exists.
+- **Memories were stored without embeddings.** Hermes imports Mnemosyne in-process, so
+  compiled wheels must match Hermes' Python. The Unix installer fell back to the system
+  Python (3.14) against Hermes' 3.11 because `command -v uv` missed the uv that Hermes
+  vendors at `HERMES_HOME/bin`. `numpy` and `onnxruntime` then failed to import inside
+  Hermes while everything else kept working: the provider still registered,
+  `hermes memory status` still reported `available`, and keyword recall still returned
+  rows — but nothing Hermes wrote ever got a vector, so semantic recall could not match
+  it. Semantic scores went from `0.0000` to `0.90`–`0.93` once the versions matched.
+- **Re-running the Unix installer failed.** `mnemosyne-hermes install` aborts with
+  "already exists" unless given `--force`, so any re-run exited 1 and, after a rebuild,
+  left the wrapper pointing at a stale `site-packages`.
+- **`--include-hermes` left broken launchers behind.** Hermes installs both wrapper
+  scripts (`hermes`, `hermes-acp`, `hermes-agent`) and vendored-node symlinks (`node`,
+  `npm`, `npx`) in `~/.local/bin`. They are now matched by where they point rather than
+  by name, so all of them are removed while an unrelated `node` is left alone.
+- **`-IncludeHermes` left a Windows login item behind.** Hermes has no Windows service;
+  it registers `Hermes_Gateway.vbs` in the Startup folder, which survived removal and
+  kept trying to launch a deleted Hermes at every sign-in.
+- **The Unix installer was not executable.** It was committed with mode `100644`, so a
+  fresh clone on Linux could not run it.
+
+### Known issues
+
+- The macOS code paths are written but untested on real hardware. In particular the
+  uninstaller's gateway handling recognises the systemd unit only; on macOS it relies on
+  `hermes gateway uninstall` and would not report a stranded launchd agent as a leftover.
+- `--no-embeddings` / `-NoEmbeddings` has no effect, because `mnemosyne-hermes` 0.5.0
+  declares `mnemosyne-memory[embeddings]` as a hard dependency.
+
+[1.0.0]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/releases/tag/v1.0.0

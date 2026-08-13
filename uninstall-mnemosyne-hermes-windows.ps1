@@ -127,6 +127,11 @@ if (-not (Test-Path -LiteralPath $hermesExe)) {
 $hermesVenvPython = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
 $mnemosyneHermesExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne-hermes.exe'
 
+# Hermes has no Windows service; `hermes gateway install` drops a login item in
+# the Startup folder instead. Left behind, it tries to launch a deleted Hermes
+# at every sign-in.
+$gatewayLoginItem = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Hermes_Gateway.vbs'
+
 # Directories that get deleted outright.
 $targets = New-Object System.Collections.Generic.List[object]
 function Add-Target {
@@ -174,7 +179,12 @@ foreach ($n in $envVarsToClear) {
     if ([Environment]::GetEnvironmentVariable($n, 'User')) { Write-Host ("  unset   user environment variable {0}" -f $n) }
 }
 if ($hermesExe -and -not $IncludeHermes) { Write-Host '  unset   memory.provider in Hermes configuration' }
-if ($IncludeHermes) { Write-Host ("  remove  {0}   [entire Hermes installation]" -f $hermesHome) }
+if ($IncludeHermes) {
+    if (Test-Path -LiteralPath $gatewayLoginItem) {
+        Write-Host ("  remove  {0}   [gateway login item]" -f $gatewayLoginItem)
+    }
+    Write-Host ("  remove  {0}   [entire Hermes installation]" -f $hermesHome)
+}
 Write-Host ''
 
 if ($DryRun) {
@@ -327,6 +337,25 @@ foreach ($parent in @((Join-Path $hermesHome 'skills\memory'), (Join-Path $herme
 
 if ($IncludeHermes) {
     Write-Step 'Removing Hermes Agent...'
+
+    # Must happen while hermes.exe still exists, or the login item outlives the
+    # installation it points at.
+    if ($hermesExe -and (Test-Path -LiteralPath $hermesExe)) {
+        if ((Invoke-NativeQuiet -FilePath $hermesExe -ArgumentList @('gateway', 'uninstall')) -eq 0) {
+            Write-Ok 'Removed the gateway login item'
+        } else {
+            Write-Note 'No gateway login item was registered'
+        }
+    }
+    if (Test-Path -LiteralPath $gatewayLoginItem) {
+        try {
+            Remove-Item -LiteralPath $gatewayLoginItem -Force -ErrorAction Stop
+            Write-Ok "Removed $gatewayLoginItem"
+        } catch {
+            Add-Failure ("Could not remove {0}: {1}" -f $gatewayLoginItem, $_.Exception.Message)
+        }
+    }
+
     [void](Remove-TreeHard -Path $hermesHome -Label 'Hermes installation')
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -383,7 +412,10 @@ foreach ($p in @(
     if (Test-Path -LiteralPath $p) { $leftovers += $p }
 }
 if (-not $KeepData -and (Test-Path -LiteralPath $dataDir)) { $leftovers += $dataDir }
-if ($IncludeHermes -and (Test-Path -LiteralPath $hermesHome)) { $leftovers += $hermesHome }
+if ($IncludeHermes) {
+    if (Test-Path -LiteralPath $hermesHome) { $leftovers += $hermesHome }
+    if (Test-Path -LiteralPath $gatewayLoginItem) { $leftovers += $gatewayLoginItem }
+}
 foreach ($n in $envVarsToClear) {
     if ([Environment]::GetEnvironmentVariable($n, 'User')) { $leftovers += "user variable $n" }
 }
