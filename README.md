@@ -23,6 +23,11 @@ environment for Mnemosyne, registers the memory provider with Hermes, and points
 - [Troubleshooting](docs/troubleshooting.md) — silent embedding failures, DLL errors,
   leftovers
 - [Changelog](CHANGELOG.md)
+- [TODO](TODO.md) — outstanding work, chiefly macOS verification
+
+> **macOS is untested.** The Linux/macOS scripts are written for macOS and audited for
+> BSD and bash 3.2 compatibility, but have only ever been run on Linux. See
+> [TODO](TODO.md#macos-verification) for the known gap and what still needs checking.
 
 ## Install
 
