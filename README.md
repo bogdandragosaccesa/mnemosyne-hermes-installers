@@ -39,8 +39,8 @@ Windows:
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
 
-Re-running an installer is safe: it upgrades the packages in place and re-registers
-the provider.
+Re-running an installer is safe: it upgrades the packages in place, re-registers the
+provider, and rebuilds the virtual environment if it was built against the wrong Python.
 
 ## Uninstall
 
@@ -104,6 +104,34 @@ command exists.
 `--include-hermes` reverses this: it runs `hermes gateway uninstall` while the Hermes
 binary still exists, because removing `HERMES_HOME` first would strand the systemd unit
 pointing at a deleted interpreter.
+
+## Matching Hermes' Python
+
+The provider is registered in `wrapper` mode, which means **Hermes' own interpreter
+imports Mnemosyne in-process** from the Mnemosyne virtual environment. Compiled wheels
+are ABI-locked to one Python minor version, so if the two disagree, `numpy` and
+`onnxruntime` fail to import inside Hermes while everything else keeps working.
+
+That failure is silent and easy to miss. `hermes memory status` still reports
+`available ✓`, storing and keyword recall still work — but **every memory Hermes writes
+is stored with no embedding**, so semantic recall can never match it. Three further
+subsystems degrade with warnings only on import: batch tool calls error out,
+`memory.mnemosyne` config keys fall back to defaults, and persona injection is disabled.
+
+The Unix installer therefore:
+
+- reads the version from `HERMES_HOME/hermes-agent/venv/bin/python` and builds the
+  Mnemosyne venv against **that** version rather than a hardcoded one;
+- looks for `uv` in `HERMES_HOME/bin` as well as on `PATH` — Hermes vendors its own uv
+  there and never adds it to `PATH`, and missing it is what silently downgraded this
+  step to the system Python;
+- rebuilds an existing venv that was built against the wrong version;
+- aborts with an explanation if the versions still differ;
+- after registering the provider, imports `numpy` and `onnxruntime` through Hermes'
+  interpreter and reports whether the embedding stack actually loads.
+
+If you see `Warning: Hermes cannot import numpy/onnxruntime`, memories will be stored
+without embeddings — fix the interpreter mismatch before relying on recall.
 
 ## Windows differences from the Unix scripts
 

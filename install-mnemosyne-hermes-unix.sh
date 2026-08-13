@@ -71,19 +71,88 @@ esac
 VENV_PYTHON="$MNEMOSYNE_VENV/bin/python"
 MNEMOSYNE_HERMES="$MNEMOSYNE_VENV/bin/mnemosyne-hermes"
 MNEMOSYNE_CLI="$MNEMOSYNE_VENV/bin/mnemosyne"
-if [[ -e "$MNEMOSYNE_VENV" ]] && { [[ ! -x "$VENV_PYTHON" ]] || ! "$VENV_PYTHON" -c 'import pip' >/dev/null 2>&1; }; then rm -rf "$MNEMOSYNE_VENV"; fi
+HERMES_VENV_PYTHON="$HERMES_HOME/hermes-agent/venv/bin/python"
+
+py_minor_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true; }
+
+# The provider is registered in wrapper mode, so Hermes' own interpreter imports
+# the packages out of this venv's site-packages. Compiled wheels (numpy,
+# onnxruntime) are ABI-locked to one Python minor version, so a venv built
+# against a different one imports far enough to look healthy while silently
+# losing embeddings. Match Hermes' interpreter, and refuse to proceed if we
+# cannot.
+HERMES_PY_VERSION=""
+if [[ -x "$HERMES_VENV_PYTHON" ]]; then HERMES_PY_VERSION="$(py_minor_version "$HERMES_VENV_PYTHON")"; fi
+if [[ -z "$HERMES_PY_VERSION" ]]; then
+    echo "Warning: could not determine Hermes' Python version; falling back to 3.11." >&2
+    HERMES_PY_VERSION='3.11'
+fi
+
+# Hermes ships its own uv under HERMES_HOME/bin, which is not on PATH. Missing
+# it is what silently downgraded this step to the system python.
+find_uv() {
+    local candidate
+    if command -v uv >/dev/null 2>&1; then command -v uv; return 0; fi
+    for candidate in "$HERMES_HOME/bin/uv" "$HOME/.local/bin/uv" "$HOME/.local/share/uv/uv" "$HOME/.cargo/bin/uv"; do
+        if [[ -x "$candidate" ]]; then printf '%s\n' "$candidate"; return 0; fi
+    done
+    return 1
+}
+
+# Rebuild the venv when it is broken *or* built against the wrong Python.
+if [[ -e "$MNEMOSYNE_VENV" ]]; then
+    if [[ ! -x "$VENV_PYTHON" ]] \
+        || ! "$VENV_PYTHON" -c 'import pip' >/dev/null 2>&1 \
+        || [[ "$(py_minor_version "$VENV_PYTHON")" != "$HERMES_PY_VERSION" ]]; then
+        rm -rf "$MNEMOSYNE_VENV"
+    fi
+fi
 if [[ ! -x "$VENV_PYTHON" ]]; then
-    if command -v uv >/dev/null 2>&1; then
+    UV_BIN="$(find_uv || true)"
+    if [[ -n "$UV_BIN" ]]; then
         # --seed installs pip into the uv-created venv.
-        uv venv "$MNEMOSYNE_VENV" --python 3.11 --seed
+        "$UV_BIN" venv "$MNEMOSYNE_VENV" --python "$HERMES_PY_VERSION" --seed
+    elif [[ -x "$HERMES_VENV_PYTHON" ]] && "$HERMES_VENV_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
+        "$HERMES_VENV_PYTHON" -m venv "$MNEMOSYNE_VENV"
     else
         python3 -m venv "$MNEMOSYNE_VENV"
     fi
 fi
+
+MNEMOSYNE_PY_VERSION="$(py_minor_version "$VENV_PYTHON")"
+if [[ "$MNEMOSYNE_PY_VERSION" != "$HERMES_PY_VERSION" ]]; then
+    cat >&2 <<EOF
+ERROR: Python version mismatch between Hermes and the Mnemosyne environment.
+  Hermes:    $HERMES_PY_VERSION  ($HERMES_VENV_PYTHON)
+  Mnemosyne: ${MNEMOSYNE_PY_VERSION:-unknown}  ($VENV_PYTHON)
+Hermes imports Mnemosyne in-process, so compiled wheels built for
+$MNEMOSYNE_PY_VERSION cannot load under $HERMES_PY_VERSION. Memories would be stored
+without embeddings and semantic recall would silently never match.
+Install a Python $HERMES_PY_VERSION interpreter (or uv) and re-run.
+EOF
+    exit 1
+fi
 if (( NO_EMBEDDINGS )); then PACKAGE='mnemosyne-memory'; else PACKAGE='mnemosyne-memory[embeddings]'; fi
 "$VENV_PYTHON" -m pip install --upgrade pip
 "$VENV_PYTHON" -m pip install --upgrade "$PACKAGE" mnemosyne-hermes
-"$MNEMOSYNE_HERMES" install --mode wrapper --python "$VENV_PYTHON"
+# --force is required for re-runs: without it this errors out with "already
+# exists" as soon as the plugin directory is there, which would both break
+# re-running the installer and leave the wrapper pointing at a stale
+# site-packages after the venv has been rebuilt.
+"$MNEMOSYNE_HERMES" install --mode wrapper --force --python "$VENV_PYTHON"
+
+# `hermes memory status` reports "available" purely from the registration, so it
+# stays green even when the embedding stack cannot load in Hermes' interpreter.
+# Import it the way the wrapper does and say so plainly.
+if (( ! NO_EMBEDDINGS )) && [[ -x "$HERMES_VENV_PYTHON" ]]; then
+    MNEMOSYNE_SITE="$MNEMOSYNE_VENV/lib/python$HERMES_PY_VERSION/site-packages"
+    if "$HERMES_VENV_PYTHON" -c "import sys; sys.path.insert(0, '$MNEMOSYNE_SITE'); import numpy, onnxruntime" >/dev/null 2>&1; then
+        echo "Verified: Hermes' interpreter can load the Mnemosyne embedding stack."
+    else
+        echo 'Warning: Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.' >&2
+        echo '         Memories would be stored without embeddings and semantic recall would not match.' >&2
+    fi
+fi
 if (( ! SKIP_HERMES_CONFIGURATION )); then
     hermes config set memory.provider mnemosyne
     if [[ "$(uname -s)" == Linux ]] && command -v loginctl >/dev/null 2>&1; then
