@@ -78,6 +78,9 @@ avoid downloading the extras — `mnemosyne-hermes` depends on
 sqlite-vec either way. What it does is stop dense retrieval at runtime: memories are
 stored without vectors and recall falls back to keyword/FTS only.
 
+The flag is declarative: **omitting it on a later install clears the variable again**, so
+one flagged run does not disable dense retrieval forever.
+
 That is the *deliberate* version of the failure described in
 [Troubleshooting](troubleshooting.md#memories-are-stored-but-semantic-recall-never-matches).
 If you did not ask for it and still see `dense_score: 0.0000`, something is broken rather

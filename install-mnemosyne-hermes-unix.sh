@@ -71,6 +71,17 @@ persist_env() {
     # is Mnemosyne's own MNEMOSYNE_NO_EMBEDDINGS switch, read at runtime.
     if (( NO_EMBEDDINGS )); then
         grep -qxF 'export MNEMOSYNE_NO_EMBEDDINGS=1' "$rc_file" || echo 'export MNEMOSYNE_NO_EMBEDDINGS=1' >> "$rc_file"
+    elif grep -qxF 'export MNEMOSYNE_NO_EMBEDDINGS=1' "$rc_file"; then
+        # The flag is declarative: omitting it has to undo a previous
+        # --no-embeddings run, or one flagged install disables dense retrieval
+        # forever. Rewrite through a temp file so mode and ownership survive.
+        local tmp
+        tmp="$(mktemp "${TMPDIR:-/tmp}/mnemosyne-rc.XXXXXX")"
+        grep -vxF 'export MNEMOSYNE_NO_EMBEDDINGS=1' "$rc_file" > "$tmp" || true
+        cat "$tmp" > "$rc_file"
+        rm -f "$tmp"
+        unset MNEMOSYNE_NO_EMBEDDINGS
+        echo "Cleared MNEMOSYNE_NO_EMBEDDINGS left by an earlier --no-embeddings install"
     fi
 }
 case "$(uname -s)" in

@@ -382,6 +382,13 @@ if ($NoEmbeddings) {
     Write-Ok 'Dense vector retrieval disabled via MNEMOSYNE_NO_EMBEDDINGS=1'
 } else {
     $package = 'mnemosyne-memory[embeddings]'
+    # The flag is declarative: omitting it has to undo a previous -NoEmbeddings
+    # run, or one flagged install would leave dense retrieval off forever.
+    if ([Environment]::GetEnvironmentVariable('MNEMOSYNE_NO_EMBEDDINGS', 'User')) {
+        [Environment]::SetEnvironmentVariable('MNEMOSYNE_NO_EMBEDDINGS', $null, 'User')
+        Remove-Item -LiteralPath 'Env:MNEMOSYNE_NO_EMBEDDINGS' -ErrorAction SilentlyContinue
+        Write-Ok 'Cleared MNEMOSYNE_NO_EMBEDDINGS left by an earlier -NoEmbeddings install'
+    }
 }
 
 Write-Step 'Installing packages...'

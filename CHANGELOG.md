@@ -42,6 +42,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on a fresh install those are what create the file, in the ANSI codepage. The fix was a
   no-op and every later Mnemosyne command still printed `'utf-8' codec can't decode byte
   0x97`. It now runs after them as well.
+- **`--no-embeddings` was sticky.** Setting the variable but never clearing it meant a
+  single flagged install disabled dense retrieval permanently — a later install without
+  the flag left it in place. Omitting the flag now clears it.
 - **Blob storage survived a full uninstall.** `MNEMOSYNE_BLOB_DIR` can point outside the
   data directory; it is now removed with it, and cleared as a variable on Windows.
 
