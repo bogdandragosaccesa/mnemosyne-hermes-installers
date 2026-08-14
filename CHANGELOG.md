@@ -9,6 +9,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `--disable-builtin-memory` / `-DisableBuiltinMemory`. Hermes' built-in `MEMORY.md` /
+  `USER.md` store stays active when an external provider is registered, and
+  [upstream recommends](https://docs.mnemosyne.site/api/hermes-plugin) turning it off so
+  the two do not both consume context every turn. The flag sets `memory_enabled` and
+  `user_profile_enabled` to `false`. It is opt-in because it changes what the agent
+  remembers rather than where memories are kept. The uninstallers restore either key
+  found set to `false`, so removing the provider cannot leave Hermes with no memory at
+  all.
+- `--all` / `-All`, installing `mnemosyne-memory[all]`: local embeddings plus the local
+  LLM used for sleep consolidation. Roughly 1.5 GB, and upstream suggests 8 GB+ of RAM.
+- Contradictory flag combinations now fail fast instead of applying a silent precedence
+  rule: `--all` with `--no-embeddings`, and `--disable-builtin-memory` with
+  `--skip-hermes-configuration`.
 - `--no-embeddings` / `-NoEmbeddings` now does something. It cannot skip the download —
   `mnemosyne-hermes` depends on `mnemosyne-memory[embeddings]` outright — but it sets
   Mnemosyne's own `MNEMOSYNE_NO_EMBEDDINGS=1`, which disables dense retrieval at runtime.

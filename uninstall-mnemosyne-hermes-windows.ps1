@@ -268,6 +268,20 @@ if (-not $IncludeHermes) {
         } else {
             Write-Note 'memory.provider is not set to mnemosyne'
         }
+
+        # -DisableBuiltinMemory turns Hermes' own store off. Removing the
+        # provider without putting it back would leave Hermes with no memory at
+        # all, so restore any key that is currently false.
+        foreach ($key in @('memory.memory_enabled', 'memory.user_profile_enabled')) {
+            $cur = Invoke-NativeCapture -FilePath $hermesExe -ArgumentList @('config', 'get', $key)
+            if (($cur.Output -join "`n") -match 'false') {
+                if ((Invoke-NativeQuiet -FilePath $hermesExe -ArgumentList @('config', 'set', $key, 'true')) -eq 0) {
+                    Write-Ok "Re-enabled $key (built-in memory was disabled for Mnemosyne)"
+                } else {
+                    Add-Failure "Could not re-enable $key; set it manually."
+                }
+            }
+        }
     }
 
     # Profile configs are separate files that `hermes config` does not touch.

@@ -11,6 +11,8 @@ cd mnemosyne-hermes-installers
 | Flag | Effect |
 | --- | --- |
 | `--no-embeddings` | Disable dense vector retrieval via `MNEMOSYNE_NO_EMBEDDINGS=1`. Does not skip the download — see [Configuration](configuration.md#embeddings). |
+| `--all` | Install `mnemosyne-memory[all]`: local embeddings plus the local LLM used for sleep consolidation. ~1.5 GB, wants 8 GB+ RAM. |
+| `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store — see [below](#the-built-in-memory-store). |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-h`, `--help` | Show usage. |
 
@@ -25,8 +27,40 @@ cd mnemosyne-hermes-installers
 | Flag | Effect |
 | --- | --- |
 | `-NoEmbeddings` | As above; sets the `MNEMOSYNE_NO_EMBEDDINGS` User environment variable. |
+| `-All` | As above. |
+| `-DisableBuiltinMemory` | As above. |
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
+
+`--all` and `--no-embeddings` are mutually exclusive, as are
+`--disable-builtin-memory` and `--skip-hermes-configuration`; passing both of either pair
+is an error rather than a silent precedence rule.
+
+## The built-in memory store
+
+Hermes ships its own `MEMORY.md` / `USER.md` store, and it stays active when an external
+provider is registered. Upstream
+[recommends turning it off](https://docs.mnemosyne.site/api/hermes-plugin) once Mnemosyne
+is the provider, so the two do not both consume context on every turn:
+
+```yaml
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: mnemosyne
+```
+
+`--disable-builtin-memory` / `-DisableBuiltinMemory` writes exactly that. It is **opt-in**
+because it changes what the agent remembers, not merely where memories are kept, and any
+existing `MEMORY.md` content stops being injected. The files are left on disk.
+
+The uninstallers reverse it: removing the provider while the built-in store is off would
+leave Hermes with no memory at all, so either key found set to `false` is restored to
+`true`.
+
+**Do not** use `hermes tools disable memory` for this. The `memory` toolset key gates
+both the built-in tool *and* the provider's tools, so it would take Mnemosyne's entire
+tool surface down with it.
 
 ## What the installer does
 

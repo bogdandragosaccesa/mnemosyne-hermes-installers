@@ -20,12 +20,21 @@
         MNEMOSYNE_DATA_DIR to keep the data where you asked for it.
 
 .PARAMETER NoEmbeddings
-    Request mnemosyne-memory without the [embeddings] extra.
+    Disable dense vector retrieval by setting MNEMOSYNE_NO_EMBEDDINGS=1.
 
-    Note that as of mnemosyne-hermes 0.5.0 this no longer changes the result:
-    that package declares `mnemosyne-memory[embeddings]` as a hard dependency,
-    so fastembed / onnxruntime / sqlite-vec are pulled in either way. The flag
-    is kept for parity with the Unix script, which has the same limitation.
+    It cannot skip the download: mnemosyne-hermes declares
+    `mnemosyne-memory[embeddings]` as a hard dependency, so fastembed /
+    onnxruntime / sqlite-vec are pulled in either way. What it does is stop
+    Mnemosyne generating vectors at runtime, leaving keyword/FTS recall only.
+
+.PARAMETER All
+    Install mnemosyne-memory[all]: local embeddings plus the local LLM used for
+    sleep consolidation. Roughly 1.5 GB, and upstream suggests 8 GB+ of RAM.
+
+.PARAMETER DisableBuiltinMemory
+    Turn off Hermes' built-in MEMORY.md / USER.md store, which upstream
+    recommends once Mnemosyne is the provider so the two do not both consume
+    context. Off by default because it changes what the agent remembers.
 
 .PARAMETER SkipHermesConfiguration
     Do not change Hermes provider configuration and do not restart the gateway.
@@ -43,12 +52,21 @@
 [CmdletBinding()]
 param(
     [switch]$NoEmbeddings,
+    [switch]$All,
+    [switch]$DisableBuiltinMemory,
     [switch]$SkipHermesConfiguration,
     [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ($All -and $NoEmbeddings) {
+    throw '-All and -NoEmbeddings contradict each other: one adds the local embedding and LLM stack, the other turns dense retrieval off. Pick one.'
+}
+if ($DisableBuiltinMemory -and $SkipHermesConfiguration) {
+    throw '-DisableBuiltinMemory needs to write Hermes configuration, which -SkipHermesConfiguration forbids. Pick one.'
+}
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -371,7 +389,10 @@ if ($venvPyVersion -ne $hermesPyVersion) {
         "stored without embeddings. Install a Python $hermesPyVersion interpreter (or uv) and rerun.")
 }
 
-if ($NoEmbeddings) {
+if ($All) {
+    $package = 'mnemosyne-memory[all]'
+    Write-Note 'Installing the [all] profile: local embeddings plus the local consolidation LLM.'
+} elseif ($NoEmbeddings) {
     $package = 'mnemosyne-memory'
     # mnemosyne-hermes requires mnemosyne-memory[embeddings] outright, so pip
     # resolves the extra back in regardless of what is requested here. The only
@@ -441,6 +462,17 @@ if (-not $SkipHermesConfiguration) {
     Write-Step 'Configuring Hermes...'
     Invoke-Native -FilePath $hermesExe -What 'hermes config set memory.provider mnemosyne' -ArgumentList @(
         'config', 'set', 'memory.provider', 'mnemosyne')
+
+    # Upstream recommends turning the built-in MEMORY.md / USER.md store off once
+    # Mnemosyne is the provider, so the two do not both consume context. Opt-in,
+    # because it changes what the agent remembers rather than how it is stored.
+    if ($DisableBuiltinMemory) {
+        foreach ($key in @('memory.memory_enabled', 'memory.user_profile_enabled')) {
+            Invoke-Native -FilePath $hermesExe -Quiet -What "hermes config set $key false" -ArgumentList @(
+                'config', 'set', $key, 'false')
+        }
+        Write-Ok 'Built-in MEMORY.md / USER.md injection disabled; Mnemosyne is now the only store.'
+    }
 
     Invoke-Native -FilePath $hermesExe -AllowFailure -What 'hermes gateway restart' -ArgumentList @('gateway', 'restart')
     if ($script:LastNativeExit -ne 0) {

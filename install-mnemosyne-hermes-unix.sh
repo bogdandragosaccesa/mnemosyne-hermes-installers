@@ -3,9 +3,15 @@ set -Eeuo pipefail
 
 NO_EMBEDDINGS=0
 SKIP_HERMES_CONFIGURATION=0
+DISABLE_BUILTIN_MEMORY=0
+ALL_EXTRAS=0
 usage() { cat <<'EOF'
 Usage: install-mnemosyne-hermes-unix.sh [options]
   --no-embeddings              Disable dense vector retrieval (sets MNEMOSYNE_NO_EMBEDDINGS=1)
+  --all                        Install mnemosyne-memory[all]: local embeddings plus the
+                               local LLM used for sleep consolidation (~1.5 GB, wants 8 GB RAM)
+  --disable-builtin-memory     Turn off Hermes' built-in MEMORY.md / USER.md store, which
+                               upstream recommends once Mnemosyne is the provider
   --skip-hermes-configuration  Do not change Hermes provider configuration
   -h, --help                   Show help
 EOF
@@ -13,11 +19,23 @@ EOF
 for arg in "$@"; do
     case "$arg" in
         --no-embeddings) NO_EMBEDDINGS=1 ;;
+        --all) ALL_EXTRAS=1 ;;
+        --disable-builtin-memory) DISABLE_BUILTIN_MEMORY=1 ;;
         --skip-hermes-configuration) SKIP_HERMES_CONFIGURATION=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
     esac
 done
+if (( ALL_EXTRAS && NO_EMBEDDINGS )); then
+    echo '--all and --no-embeddings contradict each other: one adds the local embedding and' >&2
+    echo 'LLM stack, the other turns dense retrieval off. Pick one.' >&2
+    exit 2
+fi
+if (( DISABLE_BUILTIN_MEMORY && SKIP_HERMES_CONFIGURATION )); then
+    echo '--disable-builtin-memory needs to write Hermes configuration, which' >&2
+    echo '--skip-hermes-configuration forbids. Pick one.' >&2
+    exit 2
+fi
 as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 # `timeout` is coreutils. Stock macOS has neither, and Homebrew's coreutils
 # installs it as `gtimeout`, so looking only for `timeout` silently drops the
@@ -153,7 +171,9 @@ Install a Python $HERMES_PY_VERSION interpreter (or uv) and re-run.
 EOF
     exit 1
 fi
-if (( NO_EMBEDDINGS )); then
+if (( ALL_EXTRAS )); then
+    PACKAGE='mnemosyne-memory[all]'
+elif (( NO_EMBEDDINGS )); then
     PACKAGE='mnemosyne-memory'
     echo 'Note: mnemosyne-hermes depends on mnemosyne-memory[embeddings], so the extras are'
     echo '      installed regardless. Dense retrieval is disabled via MNEMOSYNE_NO_EMBEDDINGS=1.'
@@ -182,6 +202,14 @@ if (( ! NO_EMBEDDINGS )) && [[ -x "$HERMES_VENV_PYTHON" ]]; then
 fi
 if (( ! SKIP_HERMES_CONFIGURATION )); then
     hermes config set memory.provider mnemosyne
+    # Upstream recommends turning the built-in MEMORY.md / USER.md store off once
+    # Mnemosyne is the provider, so the two do not both consume context. Opt-in,
+    # because it changes what the agent remembers rather than how it is stored.
+    if (( DISABLE_BUILTIN_MEMORY )); then
+        hermes config set memory.memory_enabled false
+        hermes config set memory.user_profile_enabled false
+        echo 'Built-in MEMORY.md / USER.md injection disabled; Mnemosyne is now the only store.'
+    fi
     if [[ "$(uname -s)" == Linux ]] && command -v loginctl >/dev/null 2>&1; then
         if loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null | grep -qx 'no'; then
             echo 'Enabling systemd user-service linger for the current user...'

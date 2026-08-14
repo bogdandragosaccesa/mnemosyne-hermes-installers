@@ -41,7 +41,9 @@ Linux / macOS:
 
 | Flag | Effect |
 | --- | --- |
-| `--no-embeddings` | Request `mnemosyne-memory` without the `[embeddings]` extra. See the caveat below. |
+| `--no-embeddings` | Disable dense vector retrieval. See the caveat below. |
+| `--all` | Install `mnemosyne-memory[all]` — local embeddings plus the local consolidation LLM. |
+| `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store. |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
 
 Windows:
@@ -52,9 +54,18 @@ Windows:
 
 | Flag | Effect |
 | --- | --- |
-| `-NoEmbeddings` | Request `mnemosyne-memory` without the `[embeddings]` extra. See the caveat below. |
+| `-NoEmbeddings` | Disable dense vector retrieval. See the caveat below. |
+| `-All` | Install `mnemosyne-memory[all]` — local embeddings plus the local consolidation LLM. |
+| `-DisableBuiltinMemory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store. |
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
+
+Hermes' own `MEMORY.md` / `USER.md` store stays active when a provider is registered, and
+upstream recommends turning it off so the two do not both consume context every turn.
+That is what `--disable-builtin-memory` does; it is opt-in because it changes what the
+agent remembers, and the uninstallers switch it back on so removing Mnemosyne cannot
+leave Hermes with no memory at all. See
+[Installation](docs/installation.md#the-built-in-memory-store).
 
 Re-running an installer is safe: it upgrades the packages in place, re-registers the
 provider, and rebuilds the virtual environment if it was built against the wrong Python.

@@ -373,6 +373,19 @@ if (( ! INCLUDE_HERMES )); then
         else
             write_note 'memory.provider is not set to mnemosyne'
         fi
+
+        # --disable-builtin-memory turns Hermes' own store off. Removing the
+        # provider without putting it back would leave Hermes with no memory at
+        # all, so restore any key that is currently false.
+        for key in memory.memory_enabled memory.user_profile_enabled; do
+            if "$HERMES_BIN" config get "$key" 2>/dev/null | grep -qi 'false'; then
+                if "$HERMES_BIN" config set "$key" true >/dev/null 2>&1; then
+                    write_ok "Re-enabled $key (built-in memory was disabled for Mnemosyne)"
+                else
+                    add_failure "Could not re-enable $key; set it manually."
+                fi
+            fi
+        done
     fi
 
     # Profile configs are separate files that `hermes config` does not touch.
