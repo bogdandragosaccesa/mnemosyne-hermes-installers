@@ -50,8 +50,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Note
 
-These macOS changes are written against the Hermes source but remain **unverified on
-real hardware** — see [TODO](TODO.md#still-requires-a-mac).
+bash 3.2 compatibility is now **verified rather than assumed**: bash 3.2.57, the version
+stock macOS ships, was compiled and both scripts were run under it — parse, flag
+handling, a full `--include-hermes --dry-run` against a live install, both installer
+paths, and the whole destructive matrix. No incompatibility surfaced.
+
+That removes the language-version risk but does not make macOS tested. The remaining
+macOS changes are written against the Hermes source and still **unverified on real
+hardware** — see [TODO](TODO.md#still-requires-a-mac).
 
 ## [1.0.0] - 2026-08-13
 

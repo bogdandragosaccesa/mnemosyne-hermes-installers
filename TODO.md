@@ -32,6 +32,13 @@ These were unknowns; they are now settled by reading `hermes_cli/gateway.py` and
 - **`timeout` on macOS.** `run_bounded` now falls back to `gtimeout`, which is what
   Homebrew's coreutils installs it as; looking only for `timeout` silently dropped the
   bound on the platform most likely to need it.
+- **bash 3.2 compatibility — verified, not assumed.** bash 3.2.57, the version stock
+  macOS ships, was compiled on the Linux VM (it needs `bison` and
+  `CFLAGS_FOR_BUILD="-g -std=gnu89"`, because GCC 14 rejects its K&R-era build tools) and
+  both scripts were run under it: parse, `--help`, bad-flag exit code, a full
+  `--include-hermes --dry-run` against a live install, both installer paths, and the
+  whole destructive matrix. No 3.2 incompatibility surfaced. This does not make macOS
+  tested — it removes the language-version risk, leaving the platform differences below.
 
 ### Still requires a Mac
 
@@ -50,18 +57,12 @@ These were unknowns; they are now settled by reading `hermes_cli/gateway.py` and
       line back out.
 - [ ] Confirm `install_system_package` via `brew`.
 
-### Blocked, worth retrying
+### Still open
 
-- [ ] **bash 3.2 verification.** The scripts are written for bash 3.2 (stock macOS
-      `/bin/bash`): parallel arrays instead of associative ones, `${arr[@]+"${arr[@]}"}`
-      guards, no `mapfile`. To test this without a Mac, bash 3.2.57 was being compiled on
-      the Linux VM to run both scripts under it. The build needed `bison` and
-      `CFLAGS_FOR_BUILD="-g -std=gnu89"` (GCC 14 rejects the K&R-era build tools); it was
-      still building when the VM went offline. Worth finishing — it converts the single
-      largest macOS assumption into a fact without owning a Mac.
 - [ ] BSD userland behaviour for `sed -E`, `mktemp` with a template, bare `readlink`,
       `pgrep -f`, `cmp -s` and `grep -qxF`. Audited statically, never executed against
-      BSD tools.
+      BSD tools. This is now the only untested *portability* assumption left — the
+      language-level one has been settled (below).
 
 ## Elsewhere
 
