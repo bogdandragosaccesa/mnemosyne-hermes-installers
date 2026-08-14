@@ -8,8 +8,10 @@ ALL_EXTRAS=0
 usage() { cat <<'EOF'
 Usage: install-mnemosyne-hermes-unix.sh [options]
   --no-embeddings              Disable dense vector retrieval (sets MNEMOSYNE_NO_EMBEDDINGS=1)
-  --all                        Install mnemosyne-memory[all]: local embeddings plus the
-                               local LLM used for sleep consolidation (~1.5 GB, wants 8 GB RAM)
+  --all                        Install mnemosyne-memory[all]: adds the local LLM used for
+                               sleep consolidation, plus the MCP and sync extras.
+                               llama-cpp-python is compiled from source, so expect a few
+                               minutes. The GGUF model downloads later, on first sleep.
   --disable-builtin-memory     Turn off Hermes' built-in MEMORY.md / USER.md store, which
                                upstream recommends once Mnemosyne is the provider
   --skip-hermes-configuration  Do not change Hermes provider configuration

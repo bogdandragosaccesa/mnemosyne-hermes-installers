@@ -28,8 +28,13 @@
     Mnemosyne generating vectors at runtime, leaving keyword/FTS recall only.
 
 .PARAMETER All
-    Install mnemosyne-memory[all]: local embeddings plus the local LLM used for
-    sleep consolidation. Roughly 1.5 GB, and upstream suggests 8 GB+ of RAM.
+    Install mnemosyne-memory[all]: adds the local LLM used for sleep
+    consolidation, plus the MCP and sync extras.
+
+    llama-cpp-python is compiled from source, so this takes several minutes.
+    Measured on mnemosyne-memory 3.15.1 it adds roughly 120 MB, not the ~1.5 GB
+    upstream quotes, and it does not pull in sentence-transformers or torch. The
+    GGUF model is fetched later, on the first sleep consolidation.
 
 .PARAMETER DisableBuiltinMemory
     Turn off Hermes' built-in MEMORY.md / USER.md store, which upstream
@@ -391,7 +396,7 @@ if ($venvPyVersion -ne $hermesPyVersion) {
 
 if ($All) {
     $package = 'mnemosyne-memory[all]'
-    Write-Note 'Installing the [all] profile: local embeddings plus the local consolidation LLM.'
+    Write-Note 'Installing the [all] profile; llama-cpp-python compiles from source, so this takes a few minutes.'
 } elseif ($NoEmbeddings) {
     $package = 'mnemosyne-memory'
     # mnemosyne-hermes requires mnemosyne-memory[embeddings] outright, so pip

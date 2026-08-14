@@ -11,7 +11,7 @@ cd mnemosyne-hermes-installers
 | Flag | Effect |
 | --- | --- |
 | `--no-embeddings` | Disable dense vector retrieval via `MNEMOSYNE_NO_EMBEDDINGS=1`. Does not skip the download — see [Configuration](configuration.md#embeddings). |
-| `--all` | Install `mnemosyne-memory[all]`: local embeddings plus the local LLM used for sleep consolidation. ~1.5 GB, wants 8 GB+ RAM. |
+| `--all` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. See [below](#local-sleep-consolidation). |
 | `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store — see [below](#the-built-in-memory-store). |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-h`, `--help` | Show usage. |
@@ -35,6 +35,35 @@ cd mnemosyne-hermes-installers
 `--all` and `--no-embeddings` are mutually exclusive, as are
 `--disable-builtin-memory` and `--skip-hermes-configuration`; passing both of either pair
 is an error rather than a silent precedence rule.
+
+## Local sleep consolidation
+
+`--all` / `-All` installs `mnemosyne-memory[all]`, which is what enables **local sleep
+consolidation** — the LLM pass that compresses working memory into episodic memory
+without calling out to an API.
+
+What it actually does, measured on `mnemosyne-memory` 3.15.1 rather than taken from the
+upstream table:
+
+| | Default (`[embeddings]`) | `--all` |
+| --- | --- | --- |
+| Packages | 36 | 65 |
+| Virtual environment | 224 MB | 345 MB |
+| Install time (4-core VM) | ~70 s | ~390 s |
+
+It adds `llama-cpp-python`, `ctransformers`, and the MCP/sync extras. Two corrections to
+the upstream description: it does **not** pull in `sentence-transformers` or `torch`, and
+the delta is about 120 MB rather than the ~1.5 GB quoted. The bulk of the time is
+`llama-cpp-python` compiling from source — pip supplies `cmake` and `ninja` in its build
+isolation, so no system toolchain beyond a C++ compiler is needed.
+
+The GGUF model itself (`MNEMOSYNE_LLM_REPO`, default `openbmb/MiniCPM5-1B-GGUF`) is
+**not** downloaded at install time. It arrives on the first sleep consolidation, which is
+where the remaining disk use shows up.
+
+You do not need `--all` to point consolidation at a remote LLM — set
+`MNEMOSYNE_LLM_BASE_URL` instead, and see
+[Configuration](configuration.md#sleep-consolidation).
 
 ## The built-in memory store
 

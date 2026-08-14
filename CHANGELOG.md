@@ -17,8 +17,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remembers rather than where memories are kept. The uninstallers restore either key
   found set to `false`, so removing the provider cannot leave Hermes with no memory at
   all.
-- `--all` / `-All`, installing `mnemosyne-memory[all]`: local embeddings plus the local
-  LLM used for sleep consolidation. Roughly 1.5 GB, and upstream suggests 8 GB+ of RAM.
+- `--all` / `-All`, installing `mnemosyne-memory[all]` — the profile that enables local
+  sleep consolidation. Measured on `mnemosyne-memory` 3.15.1 it takes the virtual
+  environment from 36 packages / 224 MB to 65 / 345 MB in about 390 s, most of it
+  `llama-cpp-python` compiling from source. Two corrections to the upstream description:
+  it does not pull in `sentence-transformers` or `torch`, and the delta is roughly 120 MB
+  rather than ~1.5 GB. The GGUF model is fetched on the first consolidation, not at
+  install. All of it — including the new compiled `llama_cpp` and `ctransformers` —
+  imports cleanly under Hermes' own interpreter.
 - Contradictory flag combinations now fail fast instead of applying a silent precedence
   rule: `--all` with `--no-embeddings`, and `--disable-builtin-memory` with
   `--skip-hermes-configuration`.

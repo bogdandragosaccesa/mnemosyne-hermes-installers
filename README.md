@@ -42,7 +42,7 @@ Linux / macOS:
 | Flag | Effect |
 | --- | --- |
 | `--no-embeddings` | Disable dense vector retrieval. See the caveat below. |
-| `--all` | Install `mnemosyne-memory[all]` — local embeddings plus the local consolidation LLM. |
+| `--all` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. |
 | `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store. |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
 
@@ -55,7 +55,7 @@ Windows:
 | Flag | Effect |
 | --- | --- |
 | `-NoEmbeddings` | Disable dense vector retrieval. See the caveat below. |
-| `-All` | Install `mnemosyne-memory[all]` — local embeddings plus the local consolidation LLM. |
+| `-All` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. |
 | `-DisableBuiltinMemory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store. |
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
