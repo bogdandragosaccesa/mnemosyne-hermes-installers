@@ -19,11 +19,14 @@ for arg in "$@"; do
     esac
 done
 as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
-# `timeout` is coreutils, so it is missing on a stock macOS; there the command
-# simply runs unbounded rather than not running at all.
+# `timeout` is coreutils. Stock macOS has neither, and Homebrew's coreutils
+# installs it as `gtimeout`, so looking only for `timeout` silently drops the
+# bound on exactly the platform that needs it most. Unbounded is the last resort.
 run_bounded() {
     local secs="$1"; shift
-    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+    else "$@"; fi
 }
 install_system_package() {
     local package="$1"

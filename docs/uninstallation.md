@@ -54,10 +54,18 @@ environment.
 ## What `--include-hermes` adds
 
 - The whole `HERMES_HOME` tree
-- The gateway background service. On Linux that is the systemd user unit
-  `hermes-gateway.service`; on Windows it is the `Hermes_Gateway.vbs` login item in the
-  Startup folder. Both are removed **while the Hermes binary still exists**, because
-  removing `HERMES_HOME` first would strand them.
+- The gateway background service, removed **while the Hermes binary still exists**,
+  because deleting `HERMES_HOME` first would strand it:
+
+  | Platform | Artifact |
+  | --- | --- |
+  | Linux | `~/.config/systemd/user/hermes-gateway*.service` and its `default.target.wants` link |
+  | macOS | `~/Library/LaunchAgents/ai.hermes.gateway*.plist` |
+  | Windows | `%APPDATA%\…\Startup\Hermes_Gateway.vbs` |
+
+  The Unix names are globbed because Hermes scopes them per profile
+  (`hermes-gateway-coder.service`, `ai.hermes.gateway-coder.plist`), and the script
+  releases each from `systemctl --user` or `launchctl` before deleting the file.
 - On Unix, every `~/.local/bin` entry that points into `HERMES_HOME` — the `hermes`,
   `hermes-acp` and `hermes-agent` wrapper scripts and the vendored `node`, `npm` and
   `npx` symlinks. They are matched by where they point, never by name, so a separately

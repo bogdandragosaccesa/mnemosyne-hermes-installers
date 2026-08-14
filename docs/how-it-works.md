@@ -65,12 +65,24 @@ installer to the system Python.
 
 The two platforms differ enough to matter.
 
-**Linux/macOS** — `hermes gateway install` registers a systemd user unit
-(`hermes-gateway.service`) or a launchd agent. Without that, `hermes gateway restart`
-falls back to running the gateway in the **foreground**, where it never returns. An
-installer that calls `restart` on an unregistered gateway therefore hangs forever. The
-installer registers the service first, and bounds the restart with `timeout` where that
-command exists.
+**Linux/macOS** — `hermes gateway install` registers a systemd user unit or a launchd
+agent. Without that, `hermes gateway restart` falls back to running the gateway in the
+**foreground**, where it never returns. An installer that calls `restart` on an
+unregistered gateway therefore hangs forever. The installer registers the service first,
+and bounds the restart with `timeout`, or `gtimeout` where Homebrew's coreutils provided
+it under that name.
+
+Both names are **profile-scoped**, which is why the uninstaller matches them by glob
+rather than by one fixed name:
+
+| Profile | Linux | macOS |
+| --- | --- | --- |
+| default | `~/.config/systemd/user/hermes-gateway.service` | `~/Library/LaunchAgents/ai.hermes.gateway.plist` |
+| `coder` | `…/hermes-gateway-coder.service` | `…/ai.hermes.gateway-coder.plist` |
+
+On macOS the agent lives under the **login account's** home from the passwd database, not
+`$HOME` — profile-mode Hermes repoints `HOME`, but launchd agents stay in the real user's
+`Library`.
 
 **Windows** — there is no service. `hermes gateway` spawns the process directly and
 registers a login item at

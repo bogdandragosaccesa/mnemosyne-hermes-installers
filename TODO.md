@@ -2,100 +2,71 @@
 
 ## macOS verification
 
-The macOS code paths are written but have **never run on real hardware**. Everything
-below was reasoned about or audited statically during the v1.0.0 work on Linux and
-Windows; none of it is confirmed. Until it is, treat macOS support as untested rather
-than working.
+The macOS code paths are written and, since the v1.0.0 follow-up work, corrected against
+the Hermes source rather than guessed at. They have still **never run on a Mac**. Treat
+macOS as unverified until the matrix below has actually been executed.
 
-### 1. The uninstaller only understands systemd
+### Resolved against the Hermes source
 
-The one item here that is a known defect rather than an unknown.
+These were unknowns; they are now settled by reading `hermes_cli/gateway.py` and
+`scripts/install.sh` in an installed Hermes, and the scripts have been changed to match.
 
-`uninstall-mnemosyne-hermes-unix.sh` hardcodes the gateway service as a systemd unit:
+- **launchd plist path.** `get_launchd_plist_path()` returns
+  `~/Library/LaunchAgents/ai.hermes.gateway.plist`, or `ai.hermes.gateway-<profile>.plist`
+  under a profile. It resolves the home from the **passwd database**, not `$HOME`,
+  because profile-mode Hermes repoints `HOME` while the agent stays in the login user's
+  `Library`. The uninstaller now mirrors both details.
+- **Service names are profile-scoped on both platforms.** `_SERVICE_BASE` is
+  `hermes-gateway`, so a profile install is `hermes-gateway-coder.service` /
+  `ai.hermes.gateway-coder.plist`. The uninstaller now globs instead of matching one
+  fixed name — this was also a live gap on **Linux**, where profile gateways were being
+  missed.
+- **uv location.** `install.sh` states that Hermes "owns its own uv at
+  `$HERMES_HOME/bin/uv`. Always install there — no PATH probing", on every Unix
+  platform. The v1.0.0 interpreter fix therefore holds on macOS.
+- **Command link directory.** `get_command_link_dir()` is `$PREFIX/bin` on Termux,
+  `/usr/local/bin` for a root FHS install, and `~/.local/bin` otherwise — and the
+  vendored `node`/`npm`/`npx` symlinks go to the same place. `hermes_launchers()` now
+  scans all three, so `--include-hermes` no longer misses a root install. This too was a
+  Linux bug, not just a macOS one.
+- **`timeout` on macOS.** `run_bounded` now falls back to `gtimeout`, which is what
+  Homebrew's coreutils installs it as; looking only for `timeout` silently dropped the
+  bound on the platform most likely to need it.
 
-```bash
-GATEWAY_UNIT="$HOME/.config/systemd/user/hermes-gateway.service"
-GATEWAY_UNIT_LINK="$HOME/.config/systemd/user/default.target.wants/hermes-gateway.service"
-```
+### Still requires a Mac
 
-On macOS `hermes gateway install` registers a **launchd agent** instead. The normal path
-still works, because the actual removal is done by `hermes gateway uninstall`, which is
-cross-platform. But the two safety nets around it are Linux-only:
+- [ ] Run the full matrix: install from bare, confirm no hang and that the health check
+      reports `Verified`; store and recall through the provider under Hermes' own
+      interpreter; confirm a `memory_embeddings` row and a non-zero dense score;
+      retention across a gateway restart; then `--dry-run`, refusal without `--force`,
+      `--keep-data`, full removal, reinstall, `--include-hermes`, and a repeat run on a
+      clean system.
+- [ ] Confirm nothing survives in `~/Library/LaunchAgents`, and that `launchctl bootout
+      gui/<uid>/<label>` is the right release call — the fallback is `launchctl unload`,
+      and neither has been executed.
+- [ ] Confirm the Python-version probe and health check behave on Apple Silicon as well
+      as Intel, where the `onnxruntime` wheel differs.
+- [ ] Confirm `persist_env` writes to `~/.zprofile` and the uninstaller strips that exact
+      line back out.
+- [ ] Confirm `install_system_package` via `brew`.
 
-- the fallback that deletes the unit file directly finds nothing, and
-- **the verify step cannot see a stranded agent**, so the script can print
-  `Nothing left behind` while a `~/Library/LaunchAgents` entry survives.
+### Blocked, worth retrying
 
-To do:
-
-- [ ] Confirm the plist path and label from the Hermes source rather than guessing —
-      `hermes_cli` is the authority. Expected shape:
-      `~/Library/LaunchAgents/<label>.plist`.
-- [ ] Add it alongside `GATEWAY_UNIT`, selected on `uname -s`.
-- [ ] Cover it in all three places the systemd unit appears: the removal plan, the
-      fallback delete under `--include-hermes`, and the leftovers check in `Verifying`.
-- [ ] Consider `launchctl bootout` / `unload` before deleting the plist, mirroring the
-      `systemctl --user daemon-reload` call.
-
-### 2. `timeout` does not exist on stock macOS
-
-`run_bounded` in the installer falls through to running the command unbounded when
-`timeout` is missing, which is the case on a stock macOS. The primary hang fix
-(`hermes gateway install` before `restart`) is cross-platform, so this only costs the
-backstop — but the backstop is exactly what protects against this recurring.
-
-- [ ] Fall back to `gtimeout` when present. Homebrew's coreutils installs it under that
-      name, so `command -v timeout` never finds it.
-- [ ] Decide whether an unbounded restart is acceptable when neither exists, or whether
-      to warn.
-
-### 3. Confirm the launcher layout matches
-
-`--include-hermes` removes entries in `~/.local/bin` that point into `HERMES_HOME`, found
-by reading symlink targets and scanning shebang scripts for the path.
-
-- [ ] Confirm Hermes installs to `~/.local/bin` on macOS at all, and that the wrapper
-      scripts and vendored `node`/`npm`/`npx` symlinks have the same shape there.
-- [ ] If the layout differs, `hermes_launchers()` needs the extra location — it matches on
-      where entries point, so it should generalise, but the directory list is hardcoded.
-
-### 4. Confirm the Python-version fix works there
-
-The v1.0.0 fix reads Hermes' interpreter version and finds uv at `$HERMES_HOME/bin/uv`.
-
-- [ ] Confirm Hermes vendors uv at the same path on macOS.
-- [ ] Confirm `$HERMES_HOME/hermes-agent/venv/bin/python` is the right probe target.
-- [ ] Run the post-install health check and confirm `numpy` / `onnxruntime` import under
-      Hermes' interpreter on Apple Silicon as well as Intel.
-
-### 5. Run the actual test matrix
-
-The same sequence used on Linux and Windows:
-
-- [ ] Install from bare, confirm no hang and the health check reports `Verified`
-- [ ] Store and recall through the provider under Hermes' own interpreter; confirm
-      memories get a `memory_embeddings` row and semantic recall scores above zero
-- [ ] Retention across a gateway restart
-- [ ] `--dry-run`, refusal without `--force`, `--keep-data`, full removal, reinstall,
-      `--include-hermes`, and a repeat run on a clean system
-- [ ] Confirm nothing is left in `~/Library/LaunchAgents`
-
-### 6. Confirm the portability assumptions
-
-Audited statically, never executed against BSD userland or bash 3.2:
-
-- [ ] bash 3.2 (stock `/bin/bash`) — parallel arrays, `${arr[@]+"${arr[@]}"}` guards, no
-      `mapfile`
-- [ ] BSD `sed -E`, `mktemp` with a template, bare `readlink`, `pgrep -f`, `cmp -s`,
-      `grep -qxF`
-- [ ] `persist_env` writing to `~/.zprofile`, and the uninstaller stripping that exact
-      line back out
-- [ ] `install_system_package` via `brew`
+- [ ] **bash 3.2 verification.** The scripts are written for bash 3.2 (stock macOS
+      `/bin/bash`): parallel arrays instead of associative ones, `${arr[@]+"${arr[@]}"}`
+      guards, no `mapfile`. To test this without a Mac, bash 3.2.57 was being compiled on
+      the Linux VM to run both scripts under it. The build needed `bison` and
+      `CFLAGS_FOR_BUILD="-g -std=gnu89"` (GCC 14 rejects the K&R-era build tools); it was
+      still building when the VM went offline. Worth finishing — it converts the single
+      largest macOS assumption into a fact without owning a Mac.
+- [ ] BSD userland behaviour for `sed -E`, `mktemp` with a template, bare `readlink`,
+      `pgrep -f`, `cmp -s` and `grep -qxF`. Audited statically, never executed against
+      BSD tools.
 
 ## Elsewhere
 
 - [ ] `--no-embeddings` / `-NoEmbeddings` still does nothing, because `mnemosyne-hermes`
       0.5.0 declares `mnemosyne-memory[embeddings]` as a hard dependency. Either drop the
       flag or make it install `mnemosyne-memory` with `--no-deps` handling.
-- [ ] No CI. `pre-commit run --all-files` is manual; a workflow running it (and
-      `shellcheck`) on push would stop regressions reaching a release.
+- [ ] No CI. `pre-commit run --all-files` is manual; a workflow running it on push would
+      stop regressions reaching a release.

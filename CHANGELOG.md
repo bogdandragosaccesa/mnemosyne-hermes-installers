@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Profile gateways were never removed.** Hermes scopes its gateway service per profile
+  (`hermes-gateway-coder.service`, `ai.hermes.gateway-coder.plist`), but the Unix
+  uninstaller matched one fixed name. Service artifacts are now globbed, and each is
+  released from `systemctl --user` / `launchctl` before its file is deleted. This
+  affected Linux as well as macOS.
+- **`--include-hermes` missed launchers outside `~/.local/bin`.** Hermes links its
+  command into `/usr/local/bin` for a root FHS install and `$PREFIX/bin` on Termux, and
+  puts the vendored `node`/`npm`/`npx` symlinks in the same place. All three directories
+  are now scanned; entries are still only removed when they point into `HERMES_HOME`.
+- **macOS gateway handling.** The Unix uninstaller recognised the systemd unit only, so
+  on macOS it could report `Nothing left behind` while a launchd agent survived. It now
+  handles `~/Library/LaunchAgents/ai.hermes.gateway*.plist`, resolved from the passwd
+  home rather than `$HOME` — profile-mode Hermes repoints `HOME`, but the agent does not
+  move. Paths were taken from `hermes_cli/gateway.py`, not guessed.
+- **`run_bounded` lost its bound on macOS.** It only looked for `timeout`; Homebrew's
+  coreutils installs it as `gtimeout`, which is now used as a fallback.
+
+### Note
+
+These macOS changes are written against the Hermes source but remain **unverified on
+real hardware** — see [TODO](TODO.md#still-requires-a-mac).
+
 ## [1.0.0] - 2026-08-13
 
 First tagged release. Install and uninstall scripts for the Mnemosyne memory provider on

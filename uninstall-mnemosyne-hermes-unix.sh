@@ -92,9 +92,55 @@ HERMES_VENV_PYTHON="$HERMES_HOME/hermes-agent/venv/bin/python"
 MNEMOSYNE_HERMES="$MNEMOSYNE_VENV/bin/mnemosyne-hermes"
 PROFILES_DIR="$HERMES_HOME/profiles"
 
-# The gateway background service the installer registers on Linux.
-GATEWAY_UNIT="$HOME/.config/systemd/user/hermes-gateway.service"
-GATEWAY_UNIT_LINK="$HOME/.config/systemd/user/default.target.wants/hermes-gateway.service"
+# launchd agents live under the login account's home, which is not necessarily
+# $HOME: profile-mode Hermes repoints HOME, but the agent stays in the real
+# user's Library. Hermes resolves this from the passwd database; `eval echo ~user`
+# is the portable shell equivalent.
+real_home() {
+    local pw_home=""
+    pw_home="$(eval echo "~$(id -un)" 2>/dev/null || true)"
+    if [[ -n "$pw_home" && -d "$pw_home" ]]; then printf '%s\n' "$pw_home"; else printf '%s\n' "$HOME"; fi
+}
+
+# Every gateway service artifact Hermes may have registered. The name is
+# profile-scoped -- `hermes-gateway.service` / `ai.hermes.gateway.plist` for the
+# default profile and a `-<profile>` suffix for the rest -- so these are matched
+# by glob rather than by one fixed name, which would miss profile gateways and
+# the transient `ai.hermes.gateway.restart-once` agent.
+gateway_service_files() {
+    local f
+    case "$(uname -s)" in
+        Darwin)
+            for f in "$(real_home)/Library/LaunchAgents"/ai.hermes.gateway*.plist; do
+                if [[ -e "$f" ]]; then printf '%s\n' "$f"; fi
+            done
+            ;;
+        *)
+            for f in "$HOME/.config/systemd/user"/hermes-gateway*.service \
+                     "$HOME/.config/systemd/user/default.target.wants"/hermes-gateway*.service; do
+                if [[ -e "$f" || -L "$f" ]]; then printf '%s\n' "$f"; fi
+            done
+            ;;
+    esac
+}
+
+# Ask the platform's service manager to let go before the file is deleted.
+release_gateway_service() {
+    local file="$1" label
+    case "$(uname -s)" in
+        Darwin)
+            command -v launchctl >/dev/null 2>&1 || return 0
+            label="$(basename "$file" .plist)"
+            launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 \
+                || launchctl unload "$file" >/dev/null 2>&1 || true
+            ;;
+        *)
+            command -v systemctl >/dev/null 2>&1 || return 0
+            label="$(basename "$file")"
+            systemctl --user disable --now "$label" >/dev/null 2>&1 || true
+            ;;
+    esac
+}
 
 # Hermes' own installer puts two different kinds of entry in ~/.local/bin:
 # wrapper scripts that exec an interpreter inside HERMES_HOME (hermes,
@@ -102,21 +148,28 @@ GATEWAY_UNIT_LINK="$HOME/.config/systemd/user/default.target.wants/hermes-gatewa
 # Both are dead weight once the tree is gone, and both have to be recognised by
 # where they point rather than by name -- but only ever removed when they point
 # into HERMES_HOME, so a separately installed `node` is never touched.
+# Hermes links its command into get_command_link_dir(): $PREFIX/bin on Termux,
+# /usr/local/bin for a root FHS install, ~/.local/bin otherwise -- and drops the
+# vendored node/npm/npx symlinks in that same directory. Check all three; the
+# pointer test below is what actually decides, so scanning a directory we do not
+# own is harmless.
 hermes_launchers() {
-    local bin_dir="$HOME/.local/bin" entry target first_line
-    [[ -d "$bin_dir" ]] || return 0
-    for entry in "$bin_dir"/*; do
-        [[ -e "$entry" || -L "$entry" ]] || continue
-        if [[ -L "$entry" ]]; then
-            target="$(readlink "$entry" || true)"
-            if [[ "$target" == "$HERMES_HOME"/* ]]; then printf '%s\n' "$entry"; fi
-        elif [[ -f "$entry" ]]; then
-            first_line=""
-            read -r first_line < "$entry" 2>/dev/null || first_line=""
-            if [[ "$first_line" == '#!'* ]] && grep -qF -- "$HERMES_HOME/" "$entry" 2>/dev/null; then
-                printf '%s\n' "$entry"
+    local bin_dir entry target first_line
+    for bin_dir in "$HOME/.local/bin" /usr/local/bin ${PREFIX:+"$PREFIX/bin"}; do
+        [[ -d "$bin_dir" ]] || continue
+        for entry in "$bin_dir"/*; do
+            [[ -e "$entry" || -L "$entry" ]] || continue
+            if [[ -L "$entry" ]]; then
+                target="$(readlink "$entry" || true)"
+                if [[ "$target" == "$HERMES_HOME"/* ]]; then printf '%s\n' "$entry"; fi
+            elif [[ -f "$entry" ]]; then
+                first_line=""
+                read -r first_line < "$entry" 2>/dev/null || first_line=""
+                if [[ "$first_line" == '#!'* ]] && grep -qF -- "$HERMES_HOME/" "$entry" 2>/dev/null; then
+                    printf '%s\n' "$entry"
+                fi
             fi
-        fi
+        done
     done
 }
 
@@ -193,9 +246,12 @@ if [[ -n "$HERMES_BIN" ]] && (( ! INCLUDE_HERMES )); then
     printf '  unset   memory.provider in Hermes configuration\n'
 fi
 if (( INCLUDE_HERMES )); then
-    if [[ -e "$GATEWAY_UNIT" ]]; then
-        printf '  remove  %s   [gateway background service]\n' "$GATEWAY_UNIT"
-    fi
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        printf '  remove  %s   [gateway background service]\n' "$unit"
+    done <<EOF
+$(gateway_service_files)
+EOF
     while IFS= read -r launcher; do
         [[ -n "$launcher" ]] || continue
         printf '  remove  %s   [launcher into Hermes]\n' "$launcher"
@@ -375,12 +431,15 @@ if (( INCLUDE_HERMES )); then
             write_note 'No gateway background service was registered'
         fi
     fi
-    # Belt and braces: drop any unit file the CLI left behind.
-    for unit in "$GATEWAY_UNIT" "$GATEWAY_UNIT_LINK"; do
-        if [[ -e "$unit" || -L "$unit" ]]; then
-            if rm -f "$unit"; then write_ok "Removed $unit"; else add_failure "Could not remove $unit"; fi
-        fi
-    done
+    # Belt and braces: drop any service file the CLI left behind, on either
+    # platform, releasing it from the service manager first.
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        release_gateway_service "$unit"
+        if rm -f "$unit"; then write_ok "Removed $unit"; else add_failure "Could not remove $unit"; fi
+    done <<EOF
+$(gateway_service_files)
+EOF
     if command -v systemctl >/dev/null 2>&1; then
         systemctl --user daemon-reload >/dev/null 2>&1 || true
     fi
@@ -448,7 +507,12 @@ done
 if (( ! KEEP_DATA )) && [[ -e "$DATA_DIR" ]]; then LEFTOVERS+=("$DATA_DIR"); fi
 if (( INCLUDE_HERMES )); then
     if [[ -e "$HERMES_HOME" ]]; then LEFTOVERS+=("$HERMES_HOME"); fi
-    if [[ -e "$GATEWAY_UNIT" ]]; then LEFTOVERS+=("$GATEWAY_UNIT"); fi
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        LEFTOVERS+=("$unit")
+    done <<EOF
+$(gateway_service_files)
+EOF
     while IFS= read -r launcher; do
         [[ -n "$launcher" ]] || continue
         LEFTOVERS+=("$launcher")
