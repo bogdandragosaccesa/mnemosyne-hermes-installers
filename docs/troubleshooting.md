@@ -122,11 +122,25 @@ Mnemosyne writes `config.yaml` in the ANSI codepage but reads it back as UTF-8, 
 template's em dash breaks every command. The installer re-encodes the file as UTF-8,
 which preserves the content and silences the warning.
 
-## `--no-embeddings` does nothing
+## `--no-embeddings` still downloads onnxruntime
 
-`mnemosyne-hermes` 0.5.0 declares `mnemosyne-memory[embeddings]` as a hard dependency, so
-pip installs fastembed / onnxruntime / sqlite-vec either way. The flag is kept for
-parity between the two scripts; the Windows script warns when you pass it.
+It cannot avoid that: `mnemosyne-hermes` 0.5.0 declares `mnemosyne-memory[embeddings]` as
+a hard dependency, so pip resolves the extra back in regardless. What the flag does is
+set `MNEMOSYNE_NO_EMBEDDINGS=1`, which turns dense retrieval off at runtime.
+
+If you passed it and now want vectors back, clear the variable and restart:
+
+```bash
+# remove the `export MNEMOSYNE_NO_EMBEDDINGS=1` line from your shell rc file
+unset MNEMOSYNE_NO_EMBEDDINGS
+```
+
+```powershell
+[Environment]::SetEnvironmentVariable('MNEMOSYNE_NO_EMBEDDINGS', $null, 'User')
+```
+
+Memories stored while it was set have no vectors and will not become semantically
+searchable on their own.
 
 ## Getting more detail
 

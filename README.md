@@ -18,6 +18,8 @@ environment for Mnemosyne, registers the memory provider with Hermes, and points
 
 - [Installation](docs/installation.md) — flags, paths, overrides, requirements
 - [Uninstallation](docs/uninstallation.md) — what is removed, what is deliberately kept
+- [Configuration](docs/configuration.md) — Hermes provider keys, `MNEMOSYNE_*` variables,
+  what the installers set
 - [How it works](docs/how-it-works.md) — wrapper mode, the Python-version invariant,
   the gateway, uninstall ordering
 - [Troubleshooting](docs/troubleshooting.md) — silent embedding failures, DLL errors,
@@ -178,17 +180,20 @@ These are forced by the platform, not preferences:
 
 ## Known upstream quirks
 
-**`-NoEmbeddings` / `--no-embeddings` does not do anything.** As of
+**`-NoEmbeddings` / `--no-embeddings` cannot skip the download.** As of
 `mnemosyne-hermes` 0.5.0 that package declares `mnemosyne-memory[embeddings]` as a
 hard dependency, so pip installs fastembed / onnxruntime / sqlite-vec either way.
-The flag is kept for parity; the Windows script warns when you pass it.
+The flag instead sets Mnemosyne's own `MNEMOSYNE_NO_EMBEDDINGS=1`, which disables dense
+retrieval at runtime — memories are stored without vectors and recall falls back to
+keyword/FTS. See [Configuration](docs/configuration.md#embeddings).
 
 **Config encoding.** Mnemosyne writes `<data>\config.yaml` using Python's default
 text encoding — the ANSI codepage on Windows — but always reads it back as UTF-8, so
 the template's em dash makes every command print
 `Failed to inspect legacy provider defaults: 'utf-8' codec can't decode byte 0x97`.
 The installer re-encodes that file as UTF-8, which preserves the content and silences
-the warning.
+the warning. It does so **after** running `hermes memory status` and `mnemosyne stats`,
+because on a fresh install those are what create the file in the first place.
 
 **Long paths.** `onnxruntime` ships module paths around 120 characters deep. With
 `LongPathsEnabled=0` a deeply nested virtual environment makes pip fail partway

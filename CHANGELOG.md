@@ -7,6 +7,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `--no-embeddings` / `-NoEmbeddings` now does something. It cannot skip the download —
+  `mnemosyne-hermes` depends on `mnemosyne-memory[embeddings]` outright — but it sets
+  Mnemosyne's own `MNEMOSYNE_NO_EMBEDDINGS=1`, which disables dense retrieval at runtime.
+  Verified by A/B: with the flag a stored memory gets no `memory_embeddings` row and
+  recall returns `dense_score: 0.0`; without it, one row and `0.913`. The uninstallers
+  clear the variable.
+- [`docs/configuration.md`](docs/configuration.md) — the Hermes `memory.mnemosyne`
+  provider keys, the `MNEMOSYNE_*` variables that matter operationally, which of them
+  these installers set, and where each config file actually lives.
+
 ### Fixed
 
 - **Profile gateways were never removed.** Hermes scopes its gateway service per profile
@@ -25,6 +37,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move. Paths were taken from `hermes_cli/gateway.py`, not guessed.
 - **`run_bounded` lost its bound on macOS.** It only looked for `timeout`; Homebrew's
   coreutils installs it as `gtimeout`, which is now used as a fallback.
+- **The Windows config-encoding workaround never took effect.** It re-encoded
+  `config.yaml` as UTF-8 *before* `hermes memory status` and `mnemosyne stats` ran — and
+  on a fresh install those are what create the file, in the ANSI codepage. The fix was a
+  no-op and every later Mnemosyne command still printed `'utf-8' codec can't decode byte
+  0x97`. It now runs after them as well.
+- **Blob storage survived a full uninstall.** `MNEMOSYNE_BLOB_DIR` can point outside the
+  data directory; it is now removed with it, and cleared as a variable on Windows.
 
 ### Note
 

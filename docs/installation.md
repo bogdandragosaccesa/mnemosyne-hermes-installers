@@ -10,7 +10,7 @@ cd mnemosyne-hermes-installers
 
 | Flag | Effect |
 | --- | --- |
-| `--no-embeddings` | Request `mnemosyne-memory` without the `[embeddings]` extra. Currently has no effect — see [Troubleshooting](troubleshooting.md#no-embeddings-does-nothing). |
+| `--no-embeddings` | Disable dense vector retrieval via `MNEMOSYNE_NO_EMBEDDINGS=1`. Does not skip the download — see [Configuration](configuration.md#embeddings). |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-h`, `--help` | Show usage. |
 
@@ -24,7 +24,7 @@ cd mnemosyne-hermes-installers
 
 | Flag | Effect |
 | --- | --- |
-| `-NoEmbeddings` | As above. The script warns that the flag does nothing. |
+| `-NoEmbeddings` | As above; sets the `MNEMOSYNE_NO_EMBEDDINGS` User environment variable. |
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
 

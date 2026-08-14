@@ -374,8 +374,12 @@ if ($venvPyVersion -ne $hermesPyVersion) {
 if ($NoEmbeddings) {
     $package = 'mnemosyne-memory'
     # mnemosyne-hermes requires mnemosyne-memory[embeddings] outright, so pip
-    # resolves the extra back in regardless of what is requested here.
-    Write-Warn 'mnemosyne-hermes depends on mnemosyne-memory[embeddings]; the vector-search extras will still be installed.'
+    # resolves the extra back in regardless of what is requested here. The only
+    # thing that actually turns dense retrieval off is Mnemosyne's own runtime
+    # switch, so set that rather than leaving the flag doing nothing.
+    Write-Note 'mnemosyne-hermes depends on mnemosyne-memory[embeddings]; the extras are installed regardless.'
+    Set-PersistentEnv -Name 'MNEMOSYNE_NO_EMBEDDINGS' -Value '1'
+    Write-Ok 'Dense vector retrieval disabled via MNEMOSYNE_NO_EMBEDDINGS=1'
 } else {
     $package = 'mnemosyne-memory[embeddings]'
 }
@@ -446,18 +450,21 @@ if (-not $SkipHermesConfiguration) {
 # template's em dash then makes every command print
 # "Failed to inspect legacy provider defaults: 'utf-8' codec can't decode...".
 # Re-encoding the file as UTF-8 keeps the content and silences the warning.
+# Mnemosyne writes the file the first time it runs, which is *after* this point
+# on a fresh install -- so this has to be callable again once the verification
+# commands below have actually created it, or the fix silently does nothing.
 $mnemosyneConfig = Join-Path $mnemosyneHome 'config.yaml'
-if (Test-Path -LiteralPath $mnemosyneConfig) {
-    $bytes = [IO.File]::ReadAllBytes($mnemosyneConfig)
+function Repair-MnemosyneConfigEncoding {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $bytes = [IO.File]::ReadAllBytes($Path)
     $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
-    $needsFix = $false
-    try { [void]$strictUtf8.GetString($bytes) } catch { $needsFix = $true }
-    if ($needsFix) {
-        $text = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage).GetString($bytes)
-        [IO.File]::WriteAllText($mnemosyneConfig, $text, (New-Object Text.UTF8Encoding($false)))
-        Write-Note "Re-encoded $mnemosyneConfig as UTF-8"
-    }
+    try { [void]$strictUtf8.GetString($bytes); return } catch { }
+    $text = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage).GetString($bytes)
+    [IO.File]::WriteAllText($Path, $text, (New-Object Text.UTF8Encoding($false)))
+    Write-Note "Re-encoded $Path as UTF-8"
 }
+Repair-MnemosyneConfigEncoding -Path $mnemosyneConfig
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -474,6 +481,11 @@ Invoke-Native -FilePath $hermesExe -AllowFailure -What 'hermes memory status' -A
 if (Test-Path -LiteralPath $mnemosyneCliExe) {
     Invoke-Native -FilePath $mnemosyneCliExe -AllowFailure -What 'mnemosyne stats' -ArgumentList @('stats')
 }
+
+# Those two commands are what create config.yaml on a fresh install, in the ANSI
+# codepage. Re-encode now that it exists, otherwise every later Mnemosyne
+# command prints "'utf-8' codec can't decode byte 0x97".
+Repair-MnemosyneConfigEncoding -Path $mnemosyneConfig
 
 Write-Host ''
 Write-Note 'Open a new terminal so HERMES_HOME / MNEMOSYNE_HOME are visible everywhere.'

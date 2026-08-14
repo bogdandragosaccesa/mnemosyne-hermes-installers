@@ -153,9 +153,17 @@ if (Test-Path -LiteralPath $profilesDir) {
 }
 
 Add-Target $mnemosyneVenv 'virtual environment'
-if (-not $KeepData) { Add-Target $dataDir 'data directory (memory database)' }
+if (-not $KeepData) {
+    Add-Target $dataDir 'data directory (memory database)'
+    # Blob storage (content-sanitizer output) only lives elsewhere when
+    # MNEMOSYNE_BLOB_DIR points outside the data directory; Add-Target skips it
+    # once it has gone with the tree above.
+    $blobDir = Get-EnvValue 'MNEMOSYNE_BLOB_DIR'
+    if ($blobDir) { Add-Target $blobDir 'blob storage' }
+}
 
-$envVarsToClear = @('MNEMOSYNE_HOME', 'MNEMOSYNE_DATA_DIR', 'MNEMOSYNE_VENV')
+$envVarsToClear = @('MNEMOSYNE_HOME', 'MNEMOSYNE_DATA_DIR', 'MNEMOSYNE_VENV',
+                    'MNEMOSYNE_NO_EMBEDDINGS', 'MNEMOSYNE_BLOB_DIR')
 if ($IncludeHermes) {
     $envVarsToClear += @('HERMES_HOME', 'HERMES_GIT_BASH_PATH')
 }

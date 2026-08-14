@@ -13,7 +13,9 @@
 #   * The memory.provider setting in <HERMES_HOME>/config.yaml and in every profile config
 #   * The Mnemosyne virtual environment (default ~/.mnemosyne-venv)
 #   * The Mnemosyne data directory (default <HERMES_HOME>/mnemosyne)
-#   * The MNEMOSYNE_HOME export the installer appended to your shell rc file
+#   * Blob storage, when MNEMOSYNE_BLOB_DIR points outside the data directory
+#   * The MNEMOSYNE_HOME / MNEMOSYNE_NO_EMBEDDINGS exports the installer
+#     appended to your shell rc file
 #   * mnemosyne packages bootstrapped into Hermes' own venv, if any
 #
 # With --include-hermes it additionally removes Hermes Agent itself: the whole
@@ -179,6 +181,8 @@ hermes_launchers() {
 RC_LINE_HERMES='export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"'
 # shellcheck disable=SC2016
 RC_LINE_MNEMOSYNE='export MNEMOSYNE_HOME="${MNEMOSYNE_HOME:-$HOME/.hermes/mnemosyne}"'
+# Written only when the installer was given --no-embeddings.
+RC_LINE_NO_EMBEDDINGS='export MNEMOSYNE_NO_EMBEDDINGS=1'
 RC_FILES=("$HOME/.profile" "$HOME/.zprofile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile")
 
 # Directories that get deleted outright, as parallel path/label arrays so this
@@ -205,7 +209,15 @@ if [[ -d "$PROFILES_DIR" ]]; then
 fi
 
 add_target "$MNEMOSYNE_VENV" 'virtual environment'
-if (( ! KEEP_DATA )); then add_target "$DATA_DIR" 'data directory (memory database)'; fi
+if (( ! KEEP_DATA )); then
+    add_target "$DATA_DIR" 'data directory (memory database)'
+    # Blob storage (content-sanitizer output) is only somewhere else when
+    # MNEMOSYNE_BLOB_DIR points outside the data directory; add_target skips it
+    # when it has already gone with the tree above.
+    if [[ -n "${MNEMOSYNE_BLOB_DIR:-}" ]]; then
+        add_target "$MNEMOSYNE_BLOB_DIR" 'blob storage'
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Plan
@@ -231,6 +243,7 @@ rc_lines_to_strip() {
     for file in "${RC_FILES[@]}"; do
         [[ -f "$file" ]] || continue
         if grep -qxF -- "$RC_LINE_MNEMOSYNE" "$file"; then printf '%s\t%s\n' "$file" "$RC_LINE_MNEMOSYNE"; fi
+        if grep -qxF -- "$RC_LINE_NO_EMBEDDINGS" "$file"; then printf '%s\t%s\n' "$file" "$RC_LINE_NO_EMBEDDINGS"; fi
         if (( INCLUDE_HERMES )) && grep -qxF -- "$RC_LINE_HERMES" "$file"; then printf '%s\t%s\n' "$file" "$RC_LINE_HERMES"; fi
     done
 }

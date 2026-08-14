@@ -65,8 +65,11 @@ These were unknowns; they are now settled by reading `hermes_cli/gateway.py` and
 
 ## Elsewhere
 
-- [ ] `--no-embeddings` / `-NoEmbeddings` still does nothing, because `mnemosyne-hermes`
-      0.5.0 declares `mnemosyne-memory[embeddings]` as a hard dependency. Either drop the
-      flag or make it install `mnemosyne-memory` with `--no-deps` handling.
 - [ ] No CI. `pre-commit run --all-files` is manual; a workflow running it on push would
       stop regressions reaching a release.
+- [ ] The `memory.mnemosyne` block in Hermes' `config.yaml` is left behind on uninstall.
+      That is deliberate — it is user tuning, not something the installer wrote — but a
+      `--purge-config` flag would be reasonable.
+- [ ] Consider surfacing more of Mnemosyne's configuration as installer flags
+      (`auto_sleep`, `vector_type`, a remote sleep LLM). Everything is settable by hand
+      today; see [docs/configuration.md](docs/configuration.md).

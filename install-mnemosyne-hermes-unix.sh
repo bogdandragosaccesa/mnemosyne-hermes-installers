@@ -5,7 +5,7 @@ NO_EMBEDDINGS=0
 SKIP_HERMES_CONFIGURATION=0
 usage() { cat <<'EOF'
 Usage: install-mnemosyne-hermes-unix.sh [options]
-  --no-embeddings              Install without vector-search extras
+  --no-embeddings              Disable dense vector retrieval (sets MNEMOSYNE_NO_EMBEDDINGS=1)
   --skip-hermes-configuration  Do not change Hermes provider configuration
   -h, --help                   Show help
 EOF
@@ -57,6 +57,7 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 MNEMOSYNE_HOME="${MNEMOSYNE_HOME:-$HERMES_HOME/mnemosyne}"
 MNEMOSYNE_VENV="${MNEMOSYNE_VENV:-$HOME/.mnemosyne-venv}"
 export HERMES_HOME MNEMOSYNE_HOME MNEMOSYNE_VENV
+if (( NO_EMBEDDINGS )); then export MNEMOSYNE_NO_EMBEDDINGS=1; fi
 mkdir -p "$HERMES_HOME" "$MNEMOSYNE_HOME"
 # The single quotes are deliberate: these lines are appended to the rc file
 # verbatim, so the parameter expansions run when a future shell starts.
@@ -65,6 +66,12 @@ persist_env() {
     local rc_file="$1"; touch "$rc_file"
     grep -qxF 'export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"' "$rc_file" || echo 'export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"' >> "$rc_file"
     grep -qxF 'export MNEMOSYNE_HOME="${MNEMOSYNE_HOME:-$HOME/.hermes/mnemosyne}"' "$rc_file" || echo 'export MNEMOSYNE_HOME="${MNEMOSYNE_HOME:-$HOME/.hermes/mnemosyne}"' >> "$rc_file"
+    # pip installs the embedding extras either way -- mnemosyne-hermes depends on
+    # them outright -- so the only thing that actually turns dense retrieval off
+    # is Mnemosyne's own MNEMOSYNE_NO_EMBEDDINGS switch, read at runtime.
+    if (( NO_EMBEDDINGS )); then
+        grep -qxF 'export MNEMOSYNE_NO_EMBEDDINGS=1' "$rc_file" || echo 'export MNEMOSYNE_NO_EMBEDDINGS=1' >> "$rc_file"
+    fi
 }
 case "$(uname -s)" in
     Darwin) persist_env "$HOME/.zprofile" ;;
@@ -135,7 +142,13 @@ Install a Python $HERMES_PY_VERSION interpreter (or uv) and re-run.
 EOF
     exit 1
 fi
-if (( NO_EMBEDDINGS )); then PACKAGE='mnemosyne-memory'; else PACKAGE='mnemosyne-memory[embeddings]'; fi
+if (( NO_EMBEDDINGS )); then
+    PACKAGE='mnemosyne-memory'
+    echo 'Note: mnemosyne-hermes depends on mnemosyne-memory[embeddings], so the extras are'
+    echo '      installed regardless. Dense retrieval is disabled via MNEMOSYNE_NO_EMBEDDINGS=1.'
+else
+    PACKAGE='mnemosyne-memory[embeddings]'
+fi
 "$VENV_PYTHON" -m pip install --upgrade pip
 "$VENV_PYTHON" -m pip install --upgrade "$PACKAGE" mnemosyne-hermes
 # --force is required for re-runs: without it this errors out with "already
