@@ -5,6 +5,34 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- [`sdlc-team/`](sdlc-team/README.md) — an optional companion to the memory installers:
+  nine role profiles (architect, backend-db, devops, frontend, pm, qa, researcher, uiux,
+  writer), each with its own SOUL, each pointed at Mnemosyne, with
+  `install-sdlc-team-unix.sh` and `install-sdlc-team-windows.ps1`. Flags:
+  `--model`/`-Model`, `--only`/`-Only`, `--skip-model`/`-SkipModel`,
+  `--keep-soul`/`-KeepSoul`, `--dry-run`/`-DryRun`. Re-running updates SOUL, model and
+  plugin link in place. `--skip-model` with `--model` fails fast, matching the existing
+  contradictory-flag handling.
+- The scripts close a failure that is silent by construction. A named profile redirects
+  `HERMES_HOME` to its own directory and memory providers are discovered under
+  `$HERMES_HOME/plugins/`, so a profile cloned from a Mnemosyne-configured root inherits
+  `memory.provider: mnemosyne` with no plugin to satisfy it — `memory status` reports
+  `Provider: mnemosyne` next to `Plugin: NOT installed`, and the profile runs with no
+  memory at all rather than erroring. Each profile's `plugins/mnemosyne` is linked back
+  to the single real install (symlink on Unix; a directory junction on Windows, which
+  needs neither Developer Mode nor elevation, falling back to a copy with a warning), and
+  every profile's `memory status` is verified before exit, non-zero if any is not
+  `available`.
+- Both scripts refuse to run when the root profile's `memory.provider` is not
+  `mnemosyne`, and warn when the built-in `MEMORY.md` / `USER.md` store is still on.
+  `hermes profile create --clone` copies `config.yaml` as a file, so the root's memory
+  settings at clone time are what every profile is created with — ordering that is
+  invisible until it is wrong.
+
 ## [1.1.0] - 2026-08-14
 
 ### Added

@@ -24,6 +24,8 @@ environment for Mnemosyne, registers the memory provider with Hermes, and points
   the gateway, uninstall ordering
 - [Troubleshooting](docs/troubleshooting.md) — silent embedding failures, DLL errors,
   leftovers
+- [SDLC team profiles](sdlc-team/README.md) — optional: nine role profiles, each with its
+  own SOUL, all wired to Mnemosyne
 - [Changelog](CHANGELOG.md)
 - [TODO](TODO.md) — outstanding work, chiefly macOS verification
 
