@@ -35,6 +35,11 @@
 .PARAMETER KeepSoul
     Do not overwrite an existing SOUL.md.
 
+.PARAMETER SeparateMemory
+    Give each profile its own Mnemosyne database instead of sharing the root
+    one. Roles then cannot read each other's notes, so the board no longer
+    hands work between them.
+
 .PARAMETER DryRun
     Print what would happen and change nothing.
 
@@ -52,6 +57,7 @@ param(
     [string]   $Prefix = '',
     [switch]   $SkipModel,
     [switch]   $KeepSoul,
+    [switch]   $SeparateMemory,
     [switch]   $DryRun
 )
 
@@ -141,6 +147,9 @@ $RootConfig = Invoke-Hermes 'config' 'path'
 if ($LASTEXITCODE -ne 0) { Write-Error "hermes config path failed: $RootConfig"; exit 1 }
 $HermesRoot = Split-Path -Parent $RootConfig
 $PluginSrc  = Join-Path $HermesRoot 'plugins\mnemosyne'
+# The one real Mnemosyne data root, which every profile is pointed at unless
+# -SeparateMemory was passed. Honour MNEMOSYNE_HOME if the store was relocated.
+$MnemoHome  = if ($env:MNEMOSYNE_HOME) { $env:MNEMOSYNE_HOME } else { Join-Path $HermesRoot 'mnemosyne' }
 
 if (-not (Test-Path -LiteralPath $PluginSrc)) {
     Write-Error @"
@@ -180,11 +189,14 @@ Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrc"
 Write-Host "Model:         $modelLabel"
 if ($Prefix) { Write-Host "Name prefix:   $Prefix" }
+$memLabel = if ($SeparateMemory) { 'separate per profile' } else { "shared bank at $MnemoHome" }
+Write-Host "Memory:        $memLabel"
 Write-Host ''
 
-$created = 0
-$updated = 0
-$copied  = @()
+$created  = 0
+$updated  = 0
+$copied   = @()
+$unshared = @()
 
 foreach ($role in $Profiles.Keys) {
     if (-not (Test-Selected $role)) { continue }
@@ -247,6 +259,9 @@ foreach ($role in $Profiles.Keys) {
 
     if ($DryRun) {
         Write-Host "  would link: $pluginLink -> $PluginSrc"
+        if (-not $SeparateMemory) {
+            Write-Host "  would link: $(Join-Path $profileDir 'mnemosyne') -> $MnemoHome"
+        }
         continue
     }
 
@@ -262,6 +277,36 @@ foreach ($role in $Profiles.Keys) {
         # A copy still loads, but goes stale on the next Mnemosyne upgrade.
         Copy-Item -LiteralPath $PluginSrc -Destination $pluginLink -Recurse -Force
         $copied += $name
+    }
+
+    # The plugin link above shares Mnemosyne's *code*. It does not share its
+    # *data*: the database path resolves from MNEMOSYNE_HOME, which defaults to
+    # $HERMES_HOME\mnemosyne — and a named profile has redirected HERMES_HOME.
+    # So every profile silently writes its own database and no role can read
+    # what another recorded, which defeats a team that hands work between roles.
+    # Like the plugin gap, it fails quietly: `memory status` says "available"
+    # either way. Setting MNEMOSYNE_HOME in the profile's .env is not honoured
+    # for this, so a junction to the one real store is the mechanism.
+    if (-not $SeparateMemory) {
+        $dataLink = Join-Path $profileDir 'mnemosyne'
+        $existing = Get-Item -LiteralPath $dataLink -ErrorAction SilentlyContinue
+        $isLink   = $existing -and $existing.LinkType
+        if ($existing -and -not $isLink) {
+            # A real directory means this profile already has its own memories.
+            # Merging them is not ours to decide, so leave it and say so rather
+            # than deleting somebody's history.
+            Write-Host "  NOTE: $dataLink is a real directory with its own database."
+            Write-Host '        Left as-is - this profile will not share the team bank.'
+            $unshared += $name
+        } else {
+            if ($isLink) { Remove-Item -LiteralPath $dataLink -Force -Recurse }
+            try {
+                New-Item -ItemType Junction -Path $dataLink -Target $MnemoHome -ErrorAction Stop | Out-Null
+            } catch {
+                Write-Warning "Could not link $dataLink to $MnemoHome - $name will use its own memory database."
+                $unshared += $name
+            }
+        }
     }
 }
 
@@ -296,6 +341,15 @@ Could not create a junction for: $($copied -join ', ')
 The plugin was copied instead. A copy works, but a later
 `mnemosyne-hermes install --force` upgrades only the original, so re-run this
 script after upgrading Mnemosyne.
+"@
+}
+
+if ($unshared.Count -gt 0) {
+    Write-Warning @"
+These profiles kept their own Mnemosyne database and will NOT see the team's
+shared memory: $($unshared -join ', ')
+Nothing was deleted; remove or merge each profile's mnemosyne directory and
+re-run to share the team bank.
 "@
 }
 

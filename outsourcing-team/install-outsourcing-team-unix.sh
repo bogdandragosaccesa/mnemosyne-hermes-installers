@@ -12,6 +12,7 @@ SKIP_MODEL=0
 KEEP_SOUL=0
 DRY_RUN=0
 PREFIX=""
+SHARED_DATA=1
 
 usage() { cat <<'EOF'
 Usage: install-outsourcing-team-unix.sh [options]
@@ -22,6 +23,9 @@ Usage: install-outsourcing-team-unix.sh [options]
                      creates os-qa-lead. Use to coexist with another team.
   --skip-model       Leave each profile's model at whatever it inherited
   --keep-soul        Do not overwrite an existing SOUL.md
+  --separate-memory  Give each profile its own Mnemosyne database instead of
+                     sharing the root one. Roles then cannot read each other's
+                     notes, so the board no longer hands work between them.
   --dry-run          Print what would happen and change nothing
   -h, --help         Show help
 
@@ -38,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --prefix) PREFIX="${2:-}"; [[ -n $PREFIX ]] || { echo "--prefix needs a value" >&2; exit 2; }; shift 2 ;;
         --skip-model) SKIP_MODEL=1; shift ;;
         --keep-soul)  KEEP_SOUL=1;  shift ;;
+        --separate-memory) SHARED_DATA=""; shift ;;
         --dry-run)    DRY_RUN=1;    shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -120,6 +125,10 @@ fi
 ROOT_CONFIG="$(hermes config path)"
 HERMES_ROOT="$(dirname "$ROOT_CONFIG")"
 PLUGIN_SRC="$HERMES_ROOT/plugins/mnemosyne"
+# The one real Mnemosyne data root, which every profile will be pointed at
+# unless --separate-memory was passed. Honour MNEMOSYNE_HOME if the user has
+# already relocated the store.
+MNEMO_HOME="${MNEMOSYNE_HOME:-$HERMES_ROOT/mnemosyne}"
 
 if [[ ! -d $PLUGIN_SRC ]]; then
     echo "Mnemosyne plugin not found at $PLUGIN_SRC." >&2
@@ -154,9 +163,10 @@ say "Hermes home:   $HERMES_ROOT"
 say "Mnemosyne:     $PLUGIN_SRC"
 say "Model:         $( ((SKIP_MODEL)) && echo '(unchanged)' || echo "$MODEL" )"
 [[ -n $PREFIX ]] && say "Name prefix:   $PREFIX"
+say "Memory:        $( [[ -n $SHARED_DATA ]] && echo "shared bank at $MNEMO_HOME" || echo 'separate per profile' )"
 say ""
 
-created=0; updated=0
+created=0; updated=0; unshared=""
 for i in "${!NAMES[@]}"; do
     role="${NAMES[$i]}"
     desc="${DESCS[$i]}"
@@ -200,6 +210,33 @@ for i in "${!NAMES[@]}"; do
     # per profile points them back at the one real install.
     run mkdir -p "$profile_dir/plugins"
     run ln -sfn "$PLUGIN_SRC" "$profile_dir/plugins/mnemosyne"
+
+    # The plugin link above shares Mnemosyne's *code*. It does not share its
+    # *data*: the database path resolves from MNEMOSYNE_HOME, which defaults to
+    # $HERMES_HOME/mnemosyne — and a named profile has redirected HERMES_HOME.
+    # So every profile silently writes its own database, and a role cannot read
+    # what another role recorded. That defeats the point of a team that hands
+    # work between roles, and like the plugin gap it fails quietly: `memory
+    # status` reports "available" either way. Point each profile's Mnemosyne
+    # data root at the one real store. (MNEMOSYNE_HOME in the profile's .env is
+    # not honoured for this, so the link is the mechanism.)
+    if [[ -n $SHARED_DATA ]]; then
+        if (( DRY_RUN )); then
+            say "  would link: $profile_dir/mnemosyne -> $MNEMO_HOME"
+        elif [[ -L "$profile_dir/mnemosyne" ]]; then
+            run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
+        elif [[ -d "$profile_dir/mnemosyne" ]]; then
+            # A real directory here means this profile has already accumulated
+            # its own memories. Moving them is not ours to decide, so say so
+            # and leave it alone rather than deleting someone's history.
+            say "  NOTE: $profile_dir/mnemosyne is a real directory with its own"
+            say "        database. Left as-is — this profile will not share the"
+            say "        team bank. Remove or merge it, then re-run, to share."
+            unshared="$unshared $name"
+        else
+            run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
+        fi
+    fi
 done
 
 if (( DRY_RUN )); then
@@ -226,6 +263,12 @@ done
 
 say ""
 say "Created $created, updated $updated."
+if [[ -n $unshared ]]; then
+    say ""
+    say "These profiles kept their own Mnemosyne database and will NOT see the"
+    say "team's shared memory:$unshared"
+    say "Each already had a real mnemosyne/ directory, so nothing was deleted."
+fi
 if (( failed )); then
     say "$failed profile(s) cannot load Mnemosyne — see 'hermes -p <name> memory status'."
     exit 1

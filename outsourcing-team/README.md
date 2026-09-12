@@ -79,6 +79,7 @@ Linux / macOS:
 | `--prefix PREFIX` | Prepend `PREFIX` to every profile name, e.g. `--prefix os-` → `os-qa-lead` |
 | `--skip-model` | Leave each profile's model at whatever it inherited |
 | `--keep-soul` | Do not overwrite an existing `SOUL.md` |
+| `--separate-memory` | Give each profile its own Mnemosyne database instead of the shared one |
 | `--dry-run` | Print the plan and change nothing |
 | `-h`, `--help` | Show usage |
 
@@ -95,6 +96,7 @@ Windows:
 | `-Prefix PREFIX` | As above |
 | `-SkipModel` | As above |
 | `-KeepSoul` | As above |
+| `-SeparateMemory` | As above |
 | `-DryRun` | As above |
 
 `--skip-model` and `--model` are mutually exclusive; passing both is an error rather than a
@@ -114,8 +116,8 @@ side, each with its own board and history.
 ./install-outsourcing-team-unix.sh --prefix acme-
 ```
 
-Note that profiles sharing one Mnemosyne install also share one memory database — see below —
-so use `memory.mnemosyne.profile_isolation` if the engagements must not see each other.
+Profiles created this way still share the one team memory bank. If the two engagements must not
+see each other's notes, add `--separate-memory` so each profile keeps its own database.
 
 ## Why each profile needs its own plugin link
 
@@ -142,11 +144,42 @@ created, the Windows script copies the plugin and says so: a copy loads fine, bu
 `mnemosyne-hermes install --force` upgrades only the original, so re-run this script after
 upgrading Mnemosyne.
 
-Because all eleven link to one install, they share **one** Mnemosyne database. That is the
-intended arrangement for a team that hands work between roles across one engagement: the
-analyst's recorded assumption is the same assumption the QA lead tests against. To isolate them
-instead, set `memory.mnemosyne.profile_isolation: true`, which gives each profile its own
-Mnemosyne bank — see [Configuration](../docs/configuration.md#hermes-provider-keys).
+## The shared memory bank, and the second silent failure
+
+Linking the plugin shares Mnemosyne's **code**. It does not share its **data**, and that
+distinction cost this package a real bug.
+
+Mnemosyne resolves its database from `MNEMOSYNE_HOME`, which defaults to
+`$HERMES_HOME/mnemosyne` — and a named profile has already redirected `HERMES_HOME` to its own
+directory. So every profile quietly gets its *own* database. Both profiles report
+`Status: available`, nothing errors, and the failure only shows up as an agent that cannot
+remember something a sibling wrote:
+
+```text
+business-analyst  → stores ASSUMPTION A-17
+qa-lead           → mnemosyne_recall("A-17") → 0 results
+```
+
+For a team whose whole purpose is handing work between roles — the analyst records an
+assumption, the QA lead tests against it, the engagement lead reports on it — that is fatal and
+invisible. Setting `MNEMOSYNE_HOME` in a profile's `.env` does **not** fix it; that variable is
+not read on this path. Both scripts therefore link each profile's `mnemosyne/` data root to the
+one real store, the same way they link the plugin, and print which bank is in use at the top of
+every run.
+
+Verified end to end: with the link in place, `business-analyst` stores an assumption and both
+`qa-lead` and `solution-architect` recall it verbatim.
+
+If a profile already has a real `mnemosyne/` directory with its own history, neither script
+touches it — it says so, names the profile in a closing warning, and leaves the data alone for
+you to merge or delete. Nothing is ever deleted to force sharing.
+
+`--separate-memory` / `-SeparateMemory` opts out, giving each profile its own database. Use it
+for genuinely independent agents, not for a team: roles then cannot read each other's notes.
+
+> `memory.mnemosyne.profile_isolation: true` is a *different* mechanism (per-profile banks
+> inside one store) and has the same consequence — it also breaks cross-role recall. Leave it
+> `false` for this team.
 
 ## Uninstall
 
