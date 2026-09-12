@@ -9,6 +9,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- [`outsourcing-team/`](outsourcing-team/README.md) — a second optional profile set, for the
+  vendor side of a contract rather than a product team: eleven role profiles
+  (engagement-lead, delivery-manager, business-analyst, domain-consultant,
+  solution-architect, app-engineer, integration-engineer, qa-lead, platform-sre,
+  security-compliance, presales-writer), each with its own SOUL, each pointed at Mnemosyne,
+  with `install-outsourcing-team-unix.sh` and `install-outsourcing-team-windows.ps1`.
+  Where `sdlc-team` owns its code and its risk, these souls do not: risk acceptance belongs
+  to a named client-side owner and a specialist's refusal is escalated rather than overridden
+  internally, scope is contractual so "clarification versus change request" is an explicit
+  job, the estate pre-exists and is only partly visible, and the engagement ends — so
+  handover and the client team's ability to operate the result are deliverables. One profile
+  supplies the industry knowledge (manufacturing, finance, e-commerce, healthcare, public
+  sector) the engineers do not have.
+- `--prefix`/`-Prefix` on the outsourcing-team scripts, prepending a prefix to every profile
+  name so two engagements of the same team can run side by side. `--only`/`-Only` still takes
+  bare role names, unaffected by the prefix, and now fails fast on an unrecognised name
+  instead of completing successfully having created nothing.
 - [`sdlc-team/`](sdlc-team/README.md) — an optional companion to the memory installers:
   nine role profiles (architect, backend-db, devops, frontend, pm, qa, researcher, uiux,
   writer), each with its own SOUL, each pointed at Mnemosyne, with
