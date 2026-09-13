@@ -90,8 +90,8 @@ EOF
 
 Every card carries: the outcome, testable acceptance criteria, the workspace, a budget
 figure, and what to do on completion. Leave `--model` off to inherit the profile default;
-if you do set it, it must be a real model id (see Budget monitoring below). Cards without acceptance criteria come
-back as questions or, worse, as confidently wrong work.
+if you do set it, it must be a real model id (see Budget monitoring below). Cards without
+acceptance criteria come back as questions or, worse, as confidently wrong work.
 
 **Workspace kinds:** `dir:/abs/path` (work in an existing checkout), `worktree:` (isolated
 git worktree — preferred when several cards touch one repo concurrently), `scratch`
@@ -116,6 +116,30 @@ review"). A specialist told only "write tests too" will either do it badly itsel
 Use `--parent` or `kanban_link` so the dependency is real: a parent does not go to `done`
 while children are open, which is what stops a feature being called finished before its
 tests exist.
+
+### A worker's child card defaults to a scratch workspace — fix it
+
+When a specialist raises a sibling card with `kanban_create`, the new card gets
+`workspace_kind='scratch'` **even when the body names the repo path in prose**. The child
+then lands in an empty directory and blocks, reproducing the exact defect above one level
+down. Observed on a live run: the app-engineer's qa-lead child card named
+`/home/bogdan/engagements/os-demo` in its body and still carried `scratch`.
+
+So either tell the parent worker explicitly to pass the workspace, or check the child before
+it dispatches:
+
+```bash
+# after a review request, before the child spawns
+sqlite3 <board.db> "SELECT id,assignee,workspace_kind,workspace_path FROM tasks WHERE status IN ('todo','ready');"
+# fix any code card showing scratch
+sqlite3 <board.db> "UPDATE tasks SET workspace_kind='dir', workspace_path='/abs/repo' WHERE id='<child>';"
+```
+
+### Retiring a superseded card
+
+`hermes kanban unblock` puts the card back in the dispatch queue — on a superseded card that
+means a worker spawns and blocks again on the same defect. To retire one, set its status
+directly and leave a comment recording why, so the evidence survives.
 
 ## Dispatch and monitoring
 
@@ -179,6 +203,43 @@ installed) — that is the right choice for most implementation cards. Change it
 
 Routing everything to the best model is the most common way an unattended run dies at 40%
 completion. Never upgrade a tier to compensate for a vague card — rewrite the card.
+
+**Fable models (`claude-fable-*`) are excluded outright.** Enormous cost, no routing exception.
+
+### Diagnose the failure before you touch the model
+
+A blocked or failed card is not evidence that the model was too small. Classify it from the
+board DB first — a bigger model cannot fix a card defect, it just bills more to fail again:
+
+```bash
+sqlite3 "$(hermes kanban boards show | grep -i board | cut -d: -f2 | xargs -I{} echo ~/.hermes/kanban/boards/{}/kanban.db)" \
+  "SELECT id,status,assignee,consecutive_failures,block_kind,model_override,last_failure_error FROM tasks WHERE status IN ('blocked','todo');"
+# the worker's own words for why it stopped:
+#   SELECT task_id,outcome,summary FROM task_runs ORDER BY id DESC;
+```
+
+| Signal | Diagnosis | Action |
+| --- | --- | --- |
+| `block_kind='needs_input'`, `consecutive_failures=0` | **Card defect.** Missing workspace, repo, credential or acceptance criteria | Fix the card. Never bump the model |
+| Worker names a missing input ("no codebase attached", "scratch dir is empty") | **Card defect** — `workspace_kind=scratch` on a code card | Re-issue with `--workspace dir:/abs/path`. Model is irrelevant |
+| `consecutive_failures>=2`, substantive attempts, output coherent but wrong | **Model may be under-powered** | Bump one tier, or raise `reasoning_effort`, and re-run once |
+| Same failure 3x | **Decomposition is wrong** | Re-plan or hand back. A fourth attempt is not a plan |
+| Finished but routed nothing onward / didn't raise the sibling card | **Card omission**, not model | Spell out "raise a card for X, link it, request review" in the body |
+
+Proof this distinction is real: one board ran the same CSV-export task twice on the *same*
+sonnet-5 default. With `workspace_kind=scratch` the engineer correctly blocked — no repo to
+read. With `workspace_kind=dir:/tmp/os-demo` it shipped the feature, self-reviewed against
+four acceptance criteria, and its qa-lead sibling added nine passing Playwright tests. Model
+held constant; the workspace was the whole difference. Bumping to opus there would have bought
+nothing and cost several times more.
+
+### Reasoning effort is the cheaper lever
+
+`reasoning_effort` (`none|minimal|low|medium|high|xhigh|max`, in each profile's `config.yaml`
+under `agent:`) moves quality without changing model class. Try `high` on the existing tier
+before paying for a tier upgrade. Roles that hold refusal authority or walk through one-way
+doors — engagement-lead, solution-architect, security-compliance — are worth `opus-5` + `high`
+permanently, because the cost of their being wrong is not a rerun.
 
 **The degradation ladder**, in order, when short: cut Could scope → drop model tiers on
 routine work → cut Should scope → narrow Must breadth while keeping what remains fully
