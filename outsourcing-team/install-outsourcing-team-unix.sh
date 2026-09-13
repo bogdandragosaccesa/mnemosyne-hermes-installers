@@ -13,6 +13,10 @@ KEEP_SOUL=0
 DRY_RUN=0
 PREFIX=""
 SHARED_DATA=1
+WIRE_KANBAN=1
+# The profile a human talks to. It gets the orchestration skill and the budget
+# script; every other profile is a worker the dispatcher spawns.
+ENTRY_PROFILE="engagement-lead"
 
 usage() { cat <<'EOF'
 Usage: install-outsourcing-team-unix.sh [options]
@@ -23,6 +27,8 @@ Usage: install-outsourcing-team-unix.sh [options]
                      creates os-qa-lead. Use to coexist with another team.
   --skip-model       Leave each profile's model at whatever it inherited
   --keep-soul        Do not overwrite an existing SOUL.md
+  --no-kanban        Skip enabling the kanban toolset and installing the
+                     orchestration skill on the entry-point profile
   --separate-memory  Give each profile its own Mnemosyne database instead of
                      sharing the root one. Roles then cannot read each other's
                      notes, so the board no longer hands work between them.
@@ -43,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --skip-model) SKIP_MODEL=1; shift ;;
         --keep-soul)  KEEP_SOUL=1;  shift ;;
         --separate-memory) SHARED_DATA=""; shift ;;
+        --no-kanban)       WIRE_KANBAN=""; shift ;;
         --dry-run)    DRY_RUN=1;    shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -237,12 +244,52 @@ for i in "${!NAMES[@]}"; do
             run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
         fi
     fi
+
+    # Kanban is how this team actually works: the entry-point profile writes
+    # cards, the dispatcher spawns the assignee, and a worker raises cards for
+    # siblings (app-engineer asking qa-lead for Playwright e2e tests). Workers
+    # inherit their profile's *CLI* toolsets at dispatch time, and the kanban
+    # toolset ships disabled by default — so without this, every profile
+    # silently lacks kanban_create/kanban_link and cannot delegate onward.
+    if [[ -n $WIRE_KANBAN ]]; then
+        run hermes -p "$name" tools enable kanban --platform cli
+    fi
 done
 
 if (( DRY_RUN )); then
     say ""
+    if [[ -n $WIRE_KANBAN ]]; then
+        say "  would install: running-an-engagement skill + kanban-budget.py"
+        say "                 into the '$PREFIX$ENTRY_PROFILE' profile"
+    fi
     say "Dry run: nothing was changed."
     exit 0
+fi
+
+# The entry point is the profile a human talks to. It gets the orchestration
+# skill (how to decompose, route, tier models and report) and the budget script,
+# because kanban has no native cost tracking. The workers do not need either:
+# they receive a card and do one job.
+if [[ -n $WIRE_KANBAN ]] && selected "$ENTRY_PROFILE"; then
+    entry_dir="$(dirname "$(hermes -p "$PREFIX$ENTRY_PROFILE" config path)")"
+    say ""
+    say "Entry point: $PREFIX$ENTRY_PROFILE"
+    if [[ -d "$SCRIPT_DIR/skills/running-an-engagement" ]]; then
+        mkdir -p "$entry_dir/skills"
+        cp -R "$SCRIPT_DIR/skills/running-an-engagement" "$entry_dir/skills/"
+        say "  skill:  running-an-engagement"
+    fi
+    if [[ -f "$SCRIPT_DIR/scripts/kanban-budget.py" ]]; then
+        mkdir -p "$entry_dir/bin"
+        cp "$SCRIPT_DIR/scripts/kanban-budget.py" "$entry_dir/bin/"
+        chmod +x "$entry_dir/bin/kanban-budget.py"
+        say "  script: bin/kanban-budget.py"
+    fi
+    # The desktop/GUI surface has its own saved toolset selection, separate from
+    # cli. A human drives the entry point from the desktop app, so it needs
+    # kanban there too or it cannot see the board it is supposed to run.
+    hermes -p "$PREFIX$ENTRY_PROFILE" tools enable kanban --platform desktop >/dev/null 2>&1 \
+        && say "  kanban enabled on the desktop surface too"
 fi
 
 say ""

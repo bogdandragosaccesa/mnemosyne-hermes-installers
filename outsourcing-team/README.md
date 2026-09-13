@@ -144,6 +144,61 @@ created, the Windows script copies the plugin and says so: a copy loads fine, bu
 `mnemosyne-hermes install --force` upgrades only the original, so re-run this script after
 upgrading Mnemosyne.
 
+## Running an engagement: the entry point, delegation and budgets
+
+The team is driven through Hermes' built-in kanban. `engagement-lead` is the entry point — the
+profile a human talks to. It decomposes the outcome into cards, assigns specialists, and
+reports; the other ten are workers the dispatcher spawns.
+
+```bash
+hermes kanban boards create acme-portal --name "Acme order portal"
+hermes kanban boards switch acme-portal
+hermes -p engagement-lead chat          # give it the outcome, the owner and the budget
+```
+
+The installer wires three things that make this work:
+
+- **The kanban toolset, on every profile.** It ships disabled by default, and dispatcher-spawned
+  workers inherit their profile's *CLI* toolsets — so without this a worker silently has no
+  `kanban_create`/`kanban_link` and cannot hand work on.
+- **The `running-an-engagement` skill** on the entry point: intake checklist, how to write a
+  card a specialist can execute, routing table, model tiers, the degradation ladder, and the
+  stop conditions.
+- **`bin/kanban-budget.py`** on the entry point, because kanban has no native cost tracking.
+
+`--no-kanban` skips all three.
+
+### Specialists delegate to each other
+
+A worker can raise a card for a sibling rather than doing a job outside its competence. Tell it
+to in the card body, and the chain runs unattended. Verified end to end: given one sentence and
+an $8 budget, `engagement-lead` wrote the brief and an implementation card, `app-engineer` built
+the feature and raised a linked `qa-lead` card for Playwright e2e tests, and QA delivered a
+passing suite — three cards, no human in the loop.
+
+`--parent` / `kanban_link` makes the dependency real: a parent does not reach `done` while
+children are open, which is what stops a feature being called finished before its tests exist.
+
+> **Pass a real model id to `--model`, never a tier word.** `--model mid` fails with
+> `HTTP 404: model: mid`; the worker dies before it can call `kanban_complete` or
+> `kanban_block`, so the dispatcher logs a *protocol violation* and retries until the card
+> blocks. Nothing says "bad model name" until you read the worker's own output. Omit `--model`
+> to inherit the profile default, or clear a bad one with `hermes kanban set-model <id> none`.
+
+### Budgets
+
+```bash
+kanban-budget.py --set-budget 40     # once per board
+kanban-budget.py                     # per-role, per-card, total, % spent
+kanban-budget.py --json              # machine-readable
+```
+
+`tasks.session_id` is NULL for dispatcher-spawned workers, so spend is recovered by correlating
+each run's profile and time window against that profile's own `state.db` sessions. That
+correlation is the one inference in the tool and it is reported as such: sessions it cannot tie
+to a run appear as `Unattributed` rather than being silently dropped, so the total is never
+quietly wrong. Exit codes gate a run — `0` fine, `1` into the closeout reserve, `2` exhausted.
+
 ## The shared memory bank, and the second silent failure
 
 Linking the plugin shares Mnemosyne's **code**. It does not share its **data**, and that
