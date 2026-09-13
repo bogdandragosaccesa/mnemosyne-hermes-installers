@@ -150,6 +150,62 @@ The team is driven through Hermes' built-in kanban. `engagement-lead` is the ent
 profile a human talks to. It decomposes the outcome into cards, assigns specialists, and
 reports; the other ten are workers the dispatcher spawns.
 
+### How the team communicates
+
+You talk to one bot. Everything below it is spawned by the dispatcher and reports back through
+the board.
+
+![Communication flow](docs/communication-diagram.png)
+
+A themed, higher-detail version is in
+[`docs/communication-diagram.html`](docs/communication-diagram.html) — open it in a browser, or
+drop it in a Hermes desktop chat with `::preview{file="..."}`. The source of the diagram below
+is the Mermaid block; GitHub renders it inline.
+
+```mermaid
+flowchart TB
+    H(["<b>You</b> — the only human in the loop<br/>outcome · named client owner · budget"])
+    EL["<b>engagement-lead</b> — THE ENTRY POINT<br/>intake · decompose · route · report<br/><i>skill: running-an-engagement</i>"]
+    BUD["<b>Budget ledger</b> · kanban-budget.py<br/><i>run window ↔ profile state.db</i><br/>exit 0 ok · 1 reserve · 2 over"]
+    BOARD["<b>Kanban board</b> — one per engagement<br/>todo → ready → running → review → done<br/><i>cards: criteria · workspace · budget · links</i>"]
+    DISP["<b>Dispatcher</b> — in the gateway, ~60s<br/><i>claims atomically · pins HERMES_KANBAN_BOARD</i>"]
+    OWNER(["<b>Named client owner</b><br/>the only one who accepts risk"])
+    MEM[("<b>One shared Mnemosyne bank</b><br/>the analyst's assumption is<br/>the one QA tests against")]
+
+    H -- "1 · one sentence + budget" --> EL
+    EL -- "2 · writes cards" --> BOARD
+    BOARD -- "3 · ready card" --> DISP
+    DISP -- "4 · spawns the assignee" --> W
+
+    subgraph W["SPECIALISTS — spawned per card, isolated workspace, kanban toolset on cli"]
+        direction LR
+        BA["business-analyst"] ~~~ SA["solution-architect"] ~~~ AE["app-engineer"] ~~~ QA["qa-lead"] ~~~ SRE["platform-sre"]
+        DC["domain-consultant"] ~~~ IE["integration-engineer"] ~~~ SEC["security-compliance"] ~~~ PW["presales-writer"] ~~~ DM["delivery-manager"]
+        AE -- "5 · peer delegation<br/>kanban_create + kanban_link" --> QA
+    end
+
+    W -- "6 · results, review requests" --> BOARD2["<b>board</b> → review / done<br/><i>parent blocked while a child is open</i>"]
+    BOARD2 -- "7 · ledger: delivered · spent · cut · outstanding" --> EL2["<b>engagement-lead</b> reports to you"]
+    EL2 -.-> BUD
+    W -.->|"refusal: security · data integrity<br/>accessibility · regulation"| EL2
+    EL2 -.->|escalates, never overrides| OWNER
+    W <-.-> MEM
+```
+
+Three things the arrows are load-bearing about:
+
+- **Escalation is one-directional.** A specialist's refusal goes worker → `engagement-lead` →
+  the named client owner. The lead inherited scheduling authority, not the authority to accept
+  risk, so it escalates rather than overrules. That is what makes the team safe unattended.
+- **Peer delegation is the design, not a side effect.** `app-engineer` raising a `qa-lead` card
+  for the e2e suite is a verified path; `kanban_link` makes the dependency real so the parent
+  cannot reach `done` while the child is open.
+- **Every worker must end on `kanban_complete` or `kanban_block`.** Exiting cleanly without one
+  is a protocol violation, gets retried, and ends blocked — which is how a bad `--model` shows
+  up as "spawn failures" rather than "bad model name".
+
+### Starting an engagement
+
 ```bash
 hermes kanban boards create acme-portal --name "Acme order portal"
 hermes kanban boards switch acme-portal

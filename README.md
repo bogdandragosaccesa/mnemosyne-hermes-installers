@@ -27,7 +27,8 @@ environment for Mnemosyne, registers the memory provider with Hermes, and points
 - [SDLC team profiles](sdlc-team/README.md) — optional: nine role profiles, each with its
   own SOUL, all wired to Mnemosyne
 - [Outsourcing team profiles](outsourcing-team/README.md) — optional: eleven role profiles
-  for delivering into a client's estate under contract, each with its own SOUL
+  for delivering into a client's estate under contract, each with its own SOUL, driven from
+  the kanban board through one entry-point profile
 - [Changelog](CHANGELOG.md)
 - [TODO](TODO.md) — outstanding work, chiefly macOS verification
 

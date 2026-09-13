@@ -22,6 +22,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   handover and the client team's ability to operate the result are deliverables. One profile
   supplies the industry knowledge (manufacturing, finance, e-commerce, healthcare, public
   sector) the engineers do not have.
+- Kanban orchestration for `outsourcing-team/`: the installer enables the kanban toolset on
+  every profile (it ships disabled, and dispatcher-spawned workers inherit their profile's
+  *CLI* toolsets — without it a worker silently cannot create or link cards for a sibling),
+  installs a `running-an-engagement` skill and `kanban-budget.py` on the `engagement-lead`
+  entry point, and takes `--no-kanban` to skip all three. `outsourcing-team/docs/` carries the
+  communication diagram; the README renders it inline as Mermaid.
+- `outsourcing-team/scripts/kanban-budget.py`, because kanban has no native cost tracking:
+  `tasks` has no spend column and `tasks.session_id` is NULL for dispatcher-spawned workers.
+  Spend is recovered by correlating each run's profile and time window against that profile's
+  own `state.db` sessions; anything it cannot tie to a run is reported as unattributed rather
+  than dropped. Exit codes gate a run — 0 fine, 1 into the closeout reserve, 2 exhausted.
 - `--prefix`/`-Prefix` on the outsourcing-team scripts, prepending a prefix to every profile
   name so two engagements of the same team can run side by side. `--only`/`-Only` still takes
   bare role names, unaffected by the prefix, and now fails fast on an unrecognised name
