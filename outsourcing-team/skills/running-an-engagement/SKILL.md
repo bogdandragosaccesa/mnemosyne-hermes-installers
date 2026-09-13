@@ -123,7 +123,7 @@ When a specialist raises a sibling card with `kanban_create`, the new card gets
 `workspace_kind='scratch'` **even when the body names the repo path in prose**. The child
 then lands in an empty directory and blocks, reproducing the exact defect above one level
 down. Observed on a live run: the app-engineer's qa-lead child card named
-`/home/bogdan/engagements/os-demo` in its body and still carried `scratch`.
+`/srv/engagements/acme-portal` in its body and still carried `scratch`.
 
 So either tell the parent worker explicitly to pass the workspace, or check the child before
 it dispatches:
