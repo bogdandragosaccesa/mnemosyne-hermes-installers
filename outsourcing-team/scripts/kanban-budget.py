@@ -39,13 +39,25 @@ GRACE_AFTER = 120.0   # ...or outlive its recorded end (final writes, teardown)
 def hermes_root() -> Path:
     """The Hermes home, asked of Hermes rather than assumed to be ~/.hermes."""
     if env := os.environ.get("HERMES_HOME"):
-        return Path(env)
+        # HERMES_HOME is set per-profile by the gateway
+        # (…/.hermes/profiles/<name>), but boards live at the Hermes home root.
+        p = Path(env)
+        if p.parent.name == "profiles":
+            return p.parent.parent
+        return p
     try:
         out = subprocess.run(
             ["hermes", "config", "path"], capture_output=True, text=True, timeout=60
         )
         if out.returncode == 0 and out.stdout.strip():
-            return Path(out.stdout.strip()).parent
+            # `hermes config path` returns the ACTIVE PROFILE's config.yaml
+            # (…/.hermes/profiles/<name>/config.yaml) when a profile is active,
+            # so .parent is the profile dir, not the Hermes home. Boards live at
+            # the home root — climb out of profiles/<name> when we see it.
+            cfg = Path(out.stdout.strip()).parent
+            if cfg.parent.name == "profiles":
+                return cfg.parent.parent
+            return cfg
     except (OSError, subprocess.SubprocessError):
         pass
     return Path.home() / ".hermes"
