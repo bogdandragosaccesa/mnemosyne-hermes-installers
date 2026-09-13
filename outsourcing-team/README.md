@@ -74,7 +74,7 @@ Linux / macOS:
 
 | Flag | Effect |
 | --- | --- |
-| `--model MODEL` | Model to set on each profile (default: `anthropic/claude-sonnet-5`) |
+| `--model MODEL` | Set one model on every profile, overriding the per-role tier table below |
 | `--only a,b,c` | Create only these profiles instead of all eleven |
 | `--prefix PREFIX` | Prepend `PREFIX` to every profile name, e.g. `--prefix os-` → `os-qa-lead` |
 | `--skip-model` | Leave each profile's model at whatever it inherited |
@@ -118,6 +118,46 @@ side, each with its own board and history.
 
 Profiles created this way still share the one team memory bank. If the two engagements must not
 see each other's notes, add `--separate-memory` so each profile keeps its own database.
+
+## What each profile gets
+
+Three things differ per role. The installer applies all of them; `--model` collapses the first
+into one model for every profile, and `--skip-model` leaves models alone entirely.
+
+| Role | Model | Reasoning | Role skill |
+| --- | --- | --- | --- |
+| `engagement-lead` | opus-5 | high | `running-an-engagement` (entry point only) |
+| `solution-architect` | opus-5 | high | `architecture-decisions-and-one-way-doors` |
+| `security-compliance` | opus-5 | high | `threat-modelling-and-controls` |
+| `business-analyst` | opus-5 | medium | `writing-acceptance-criteria` |
+| `domain-consultant` | opus-5 | medium | — |
+| `delivery-manager` | opus-5 | medium | `writing-delivery-cards` |
+| `app-engineer` | sonnet-5 | medium | — |
+| `integration-engineer` | sonnet-5 | medium | `integration-contracts-and-migration` |
+| `qa-lead` | sonnet-5 | medium | — |
+| `platform-sre` | sonnet-5 | medium | — |
+| `presales-writer` | sonnet-5 | medium | — |
+
+The split is about the cost of being wrong, not about seniority. The three frontier-plus-high
+roles hold a boundary: they refuse on security or feasibility grounds, walk through one-way
+doors, and escalate to the client's named owner. When they are wrong it is not a rerun. The
+three frontier-medium roles author cards, and a defective card is the most expensive artefact
+on a board — it produces confident wrong work, or a worker that blocks. The mid tier implements
+against a spec that is already written; one board measured that at roughly $0.65 a card with no
+escalations needed.
+
+Routing everything to the frontier tier is the most common way an unattended run exhausts its
+budget at 40% completion. Fable models are excluded outright and are absent from the script on
+purpose.
+
+The six roles that open a client codebase — `app-engineer`, `solution-architect`,
+`integration-engineer`, `qa-lead`, `platform-sre`, `security-compliance` — also get
+`graft-code-graph`, which builds a local tree-sitter graph of a repo so a worker can find code
+by structure instead of re-exploring it every task. The skill restricts them to the offline
+commands and forbids `graft build --deep` and every `graft brain` subcommand: both send client
+source off the machine, and that authorisation belongs to the client, not to us. Graft itself
+is not installed by this script (`npm install -g @nanonets/graft`); the skill is inert without
+it and says so.
 
 ## Why each profile needs its own plugin link
 

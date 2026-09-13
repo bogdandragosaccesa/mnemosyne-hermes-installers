@@ -7,6 +7,14 @@ set -Eeuo pipefail
 # than erroring out.
 
 MODEL="anthropic/claude-sonnet-5"
+# Tiers used when --model is not given. The table that maps roles onto these
+# lives next to the per-profile config writes, with the reasoning behind it.
+# Fable models are deliberately absent and must not be added: their cost is
+# out of all proportion to the work these profiles do.
+FRONTIER_MODEL="anthropic/claude-opus-5"
+MID_MODEL="anthropic/claude-sonnet-5"
+# Set when the caller passes --model, so one explicit model beats the table.
+MODEL_EXPLICIT=""
 ONLY=""
 SKIP_MODEL=0
 KEEP_SOUL=0
@@ -20,8 +28,10 @@ ENTRY_PROFILE="engagement-lead"
 
 usage() { cat <<'EOF'
 Usage: install-outsourcing-team-unix.sh [options]
-  --model MODEL      Model to set on each profile
-                     (default: anthropic/claude-sonnet-5)
+  --model MODEL      Set this one model on every profile, overriding the
+                     per-role tier table (frontier for the roles that hold a
+                     boundary, mid for implementation). Must be a real model
+                     id, never a tier word like "mid".
   --only a,b,c       Create only these profiles instead of all eleven
   --prefix PREFIX    Prepend PREFIX to every profile name, e.g. --prefix os-
                      creates os-qa-lead. Use to coexist with another team.
@@ -43,7 +53,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)  MODEL="${2:-}";  [[ -n $MODEL  ]] || { echo "--model needs a value"  >&2; exit 2; }; shift 2 ;;
+        --model)  MODEL="${2:-}";  [[ -n $MODEL  ]] || { echo "--model needs a value"  >&2; exit 2; }; MODEL_EXPLICIT=1; shift 2 ;;
         --only)   ONLY="${2:-}";   [[ -n $ONLY   ]] || { echo "--only needs a value"   >&2; exit 2; }; shift 2 ;;
         --prefix) PREFIX="${2:-}"; [[ -n $PREFIX ]] || { echo "--prefix needs a value" >&2; exit 2; }; shift 2 ;;
         --skip-model) SKIP_MODEL=1; shift ;;
@@ -56,7 +66,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if (( SKIP_MODEL )) && [[ "$MODEL" != "anthropic/claude-sonnet-5" ]]; then
+if (( SKIP_MODEL )) && [[ -n $MODEL_EXPLICIT ]]; then
     echo '--skip-model and --model contradict each other: one sets the model, the' >&2
     echo 'other leaves it alone. Pick one.' >&2
     exit 2
@@ -206,7 +216,35 @@ for i in "${!NAMES[@]}"; do
         run cp "$soul" "$profile_dir/SOUL.md"
     fi
 
-    (( SKIP_MODEL )) || run hermes -p "$name" config set model.default "$MODEL"
+    # Model tier per role, not one model for eleven jobs. Routing everything to
+    # the frontier tier is the most common way an unattended run dies at 40%
+    # completion with the budget gone; routing everything to the mid tier puts
+    # one-way doors and refusal decisions on a model that should not be making
+    # them. --model overrides the whole table, --skip-model leaves it alone.
+    #
+    # Frontier + high reasoning: the three roles whose mistakes are not a rerun
+    # — they hold refusal authority, walk through one-way doors, and escalate to
+    # the client's named owner. Frontier at medium: the three that author cards,
+    # because a defective card is the most expensive artefact on the board. Mid:
+    # implementation against a clear spec, which one board measured at ~$0.65 a
+    # card with zero escalations needed.
+    if (( ! SKIP_MODEL )); then
+        if [[ -n $MODEL_EXPLICIT ]]; then
+            role_model="$MODEL"
+            role_effort=""
+        else
+            case "$role" in
+                engagement-lead|solution-architect|security-compliance)
+                    role_model="$FRONTIER_MODEL"; role_effort="high" ;;
+                business-analyst|domain-consultant|delivery-manager)
+                    role_model="$FRONTIER_MODEL"; role_effort="medium" ;;
+                *)
+                    role_model="$MID_MODEL";      role_effort="medium" ;;
+            esac
+        fi
+        run hermes -p "$name" config set model.default "$role_model"
+        [[ -n $role_effort ]] && run hermes -p "$name" config set agent.reasoning_effort "$role_effort"
+    fi
 
     # The gap this script exists to close. A named profile redirects
     # HERMES_HOME to its own directory, and memory providers are discovered
@@ -254,6 +292,41 @@ for i in "${!NAMES[@]}"; do
     if [[ -n $WIRE_KANBAN ]]; then
         run hermes -p "$name" tools enable kanban --platform cli
     fi
+
+    # The role skill: what this specialist is for, in procedural terms. Without
+    # it every profile is a SOUL plus the same generic bundle, and the roles
+    # that hold a boundary have nothing telling them where it is — the
+    # architect has no definition of a one-way door, security-compliance no
+    # statement that its refusal is not ours to override. Keyed by role, so a
+    # profile only carries the one it needs.
+    case "$role" in
+        delivery-manager)      role_skill="writing-delivery-cards" ;;
+        security-compliance)   role_skill="threat-modelling-and-controls" ;;
+        business-analyst)      role_skill="writing-acceptance-criteria" ;;
+        integration-engineer)  role_skill="integration-contracts-and-migration" ;;
+        solution-architect)    role_skill="architecture-decisions-and-one-way-doors" ;;
+        *)                     role_skill="" ;;
+    esac
+    if [[ -n $role_skill && -d "$SCRIPT_DIR/role-skills/$role_skill" ]]; then
+        run mkdir -p "$profile_dir/skills/delivery"
+        run cp -R "$SCRIPT_DIR/role-skills/$role_skill" "$profile_dir/skills/delivery/"
+        say "  skill:  $role_skill"
+    fi
+
+    # Graft reads a repo into a local code graph so an engineer can find code by
+    # structure instead of re-grepping it every task. Only the roles that open a
+    # client codebase get it, and the skill is explicit that --deep and the
+    # brain subcommands are forbidden on an engagement: both move client source
+    # off the machine, and that authorisation belongs to the client's owner.
+    case "$role" in
+        app-engineer|solution-architect|integration-engineer|qa-lead|platform-sre|security-compliance)
+            if [[ -d "$SCRIPT_DIR/role-skills/graft-code-graph" ]]; then
+                run mkdir -p "$profile_dir/skills/delivery"
+                run cp -R "$SCRIPT_DIR/role-skills/graft-code-graph" "$profile_dir/skills/delivery/"
+                say "  skill:  graft-code-graph"
+            fi
+            ;;
+    esac
 done
 
 if (( DRY_RUN )); then
