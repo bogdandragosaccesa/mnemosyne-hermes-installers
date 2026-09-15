@@ -13,3 +13,5 @@ desktop.ini
 # Local scratch
 *.log
 *.bak
+__pycache__/
+*.pyc

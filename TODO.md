@@ -74,3 +74,19 @@ These were unknowns; they are now settled by reading `hermes_cli/gateway.py` and
 - [ ] Consider surfacing more of Mnemosyne's configuration as installer flags
       (`auto_sleep`, `vector_type`, a remote sleep LLM). Everything is settable by hand
       today; see [docs/configuration.md](docs/configuration.md).
+
+## Windows installer parity: per-role tiers and role skills
+
+`install-outsourcing-team-unix.sh` now sets a model tier and `reasoning_effort` per role
+and copies a role skill (plus `graft-code-graph` for the six codebase-facing roles) into
+each profile. `install-outsourcing-team-windows.ps1` still sets one model on every
+profile and copies no role skills.
+
+A Windows install therefore produces a working team with the wrong economics — every
+profile on the mid tier, including the three that hold a refusal boundary — and without
+the procedural skills that tell those roles where their boundary is.
+
+Porting it is mechanical: the same role→tier table, the same role→skill table, and
+`Copy-Item -Recurse` from `role-skills/` into `<profile>/skills/delivery/`. Until that
+lands, a Windows user should run the bash installer under WSL, or set the models by hand
+from the table in `outsourcing-team/README.md`.
