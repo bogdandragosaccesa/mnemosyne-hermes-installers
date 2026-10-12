@@ -112,47 +112,100 @@ esac
 VENV_PYTHON="$MNEMOSYNE_VENV/bin/python"
 MNEMOSYNE_HERMES="$MNEMOSYNE_VENV/bin/mnemosyne-hermes"
 MNEMOSYNE_CLI="$MNEMOSYNE_VENV/bin/mnemosyne"
+py_minor_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true; }
+
 # Current Hermes runs from a managed "store" Python and reports it through its
 # launcher's --print-runtime-command: a JSON argv whose first element is the
 # interpreter that owns the ABI. Older installs kept a venv inside the checkout
-# and do not know the flag. The JSON is read with sed, so only a plain first
-# element is accepted; an escaped one (quote, backslash, non-ASCII) is a miss.
+# and may not know the flag. MNEMOSYNE_HERMES_PYTHON overrides detection (not
+# HERMES_PYTHON, which Hermes' own tooling sets to unrelated interpreters).
 resolve_hermes_python() {
     local out python
-    out="$(run_bounded 60 hermes --print-runtime-command </dev/null 2>/dev/null || true)"
+    if [[ -n "${MNEMOSYNE_HERMES_PYTHON:-}" ]]; then printf '%s\n' "$MNEMOSYNE_HERMES_PYTHON"; return 0; fi
+    out="$(run_bounded 60 hermes --print-runtime-command </dev/null 2>/dev/null | grep '^\[' | head -n 1 || true)"
+    # sed reads a plain first element; an escaped one (quote, backslash,
+    # non-ASCII) needs a real JSON decoder.
     python="$(printf '%s\n' "$out" | sed -n 's/^\["\([^"\\]*\)".*/\1/p')"
+    if [[ -z "$python" && -n "$out" ]] && command -v python3 >/dev/null 2>&1; then
+        python="$(printf '%s\n' "$out" | python3 -c 'import json, sys; print(json.loads(sys.stdin.read())[0])' 2>/dev/null || true)"
+    fi
     if [[ -n "$python" && -x "$python" ]]; then printf '%s\n' "$python"; return 0; fi
     python="$HERMES_HOME/hermes-agent/venv/bin/python"
     if [[ -x "$python" ]]; then printf '%s\n' "$python"; return 0; fi
     return 1
 }
-HERMES_PYTHON="$(resolve_hermes_python || true)"
-
-py_minor_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true; }
 
 # The provider is registered in wrapper mode, so Hermes' own interpreter imports
 # the packages out of this venv's site-packages. Compiled wheels (numpy,
 # onnxruntime) are ABI-locked to one Python minor version, so a venv built
 # against a different one imports far enough to look healthy while silently
 # losing embeddings. Match Hermes' interpreter, and refuse to proceed if we
-# cannot.
+# cannot: guessing a version is exactly how that failure happens.
+HERMES_PYTHON="$(resolve_hermes_python || true)"
 HERMES_PY_VERSION=""
 if [[ -n "$HERMES_PYTHON" ]]; then HERMES_PY_VERSION="$(py_minor_version "$HERMES_PYTHON")"; fi
 if [[ -z "$HERMES_PY_VERSION" ]]; then
-    echo "Warning: could not determine Hermes' Python version; falling back to 3.11." >&2
-    HERMES_PY_VERSION='3.11'
+    cat >&2 <<EOF
+ERROR: could not find the Python interpreter Hermes runs on.
+  Tried: hermes --print-runtime-command, then $HERMES_HOME/hermes-agent/venv/bin/python
+Hermes imports Mnemosyne in-process, so the Mnemosyne environment has to be built for
+Hermes' Python version; a guessed one stores every memory without an embedding.
+Point MNEMOSYNE_HERMES_PYTHON at Hermes' interpreter and re-run, for example:
+  MNEMOSYNE_HERMES_PYTHON=/path/to/python3 $0
+EOF
+    exit 1
 fi
+echo "Hermes runs Python $HERMES_PY_VERSION ($HERMES_PYTHON)"
 
-# Hermes ships its own uv under HERMES_HOME/bin, which is not on PATH. Missing
-# it is what silently downgraded this step to the system python.
+# Install from the official repository's main branch rather than PyPI, which
+# lags it. Both packages come from one commit: mnemosyne-hermes on main requires
+# the mnemosyne-memory version that ships beside it. The commit is pinned in the
+# archive URL, so a re-run picks up whatever main has moved on to. Resolved
+# before the venv is touched, so a failure here leaves an existing install alone.
+MNEMOSYNE_REPO='mnemosyne-oss/mnemosyne'
+GITHUB_AUTH=()
+if [[ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]]; then
+    GITHUB_AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN:-${GH_TOKEN:-}}")
+fi
+COMMIT_RESPONSE="$(curl -sSL -H 'Accept: application/vnd.github.sha' ${GITHUB_AUTH[@]+"${GITHUB_AUTH[@]}"} \
+    -w '\n%{http_code}' "https://api.github.com/repos/$MNEMOSYNE_REPO/commits/main" 2>/dev/null || true)"
+COMMIT_STATUS="${COMMIT_RESPONSE##*$'\n'}"
+MNEMOSYNE_COMMIT="${COMMIT_RESPONSE%$'\n'*}"
+if [[ "$COMMIT_STATUS" != 200 || ! "$MNEMOSYNE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: could not resolve the latest commit of https://github.com/$MNEMOSYNE_REPO (main)." >&2
+    case "$COMMIT_STATUS" in
+        403|429) echo 'GitHub API rate limit reached (60 requests/hour per IP without a token).' >&2
+                 echo 'Wait and re-run, or export GITHUB_TOKEN and re-run.' >&2 ;;
+        000|'') echo 'api.github.com is unreachable; check the network or proxy and re-run.' >&2 ;;
+        *) echo "api.github.com answered HTTP $COMMIT_STATUS; re-run, or export GITHUB_TOKEN if it persists." >&2 ;;
+    esac
+    echo 'The existing Mnemosyne environment was left untouched.' >&2
+    exit 1
+fi
+MNEMOSYNE_ARCHIVE="https://github.com/$MNEMOSYNE_REPO/archive/$MNEMOSYNE_COMMIT.zip"
+
+# Hermes vendors its own uv, which is not on PATH: under tools/uv-<version>-<platform>/
+# (HERMES_RUNTIME_DIR relocates tools/), or bin/ on older installs. Prefer it, newest
+# first, as the Windows installer does. Missing it is what silently downgraded this
+# step to the system python.
 find_uv() {
-    local candidate
+    local candidate tools="${HERMES_RUNTIME_DIR:-$HERMES_HOME/tools}"
+    candidate="$(for c in "$tools"/uv-*/uv; do
+        [[ -x "$c" ]] || continue
+        v="${c##*/uv-}"; printf '%s\t%s\n' "${v%%-*}" "$c"
+    done | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -f2)"
+    if [[ -n "$candidate" ]]; then printf '%s\n' "$candidate"; return 0; fi
+    if [[ -x "$HERMES_HOME/bin/uv" ]]; then printf '%s\n' "$HERMES_HOME/bin/uv"; return 0; fi
     if command -v uv >/dev/null 2>&1; then command -v uv; return 0; fi
-    for candidate in "$HERMES_HOME"/tools/uv-*/uv "$HERMES_HOME/bin/uv" "$HOME/.local/bin/uv" "$HOME/.local/share/uv/uv" "$HOME/.cargo/bin/uv"; do
+    for candidate in "$HOME/.local/bin/uv" "$HOME/.local/share/uv/uv" "$HOME/.cargo/bin/uv"; do
         if [[ -x "$candidate" ]]; then printf '%s\n' "$candidate"; return 0; fi
     done
     return 1
 }
+
+installed_version() { "$VENV_PYTHON" -c "import importlib.metadata as m; print(m.version('$1'))" 2>/dev/null || true; }
+OLD_VERSION=""
+if [[ -x "$VENV_PYTHON" ]]; then OLD_VERSION="$(installed_version mnemosyne-memory)"; fi
 
 # Rebuild the venv when it is broken *or* built against the wrong Python.
 if [[ -e "$MNEMOSYNE_VENV" ]]; then
@@ -162,12 +215,14 @@ if [[ -e "$MNEMOSYNE_VENV" ]]; then
         rm -rf "$MNEMOSYNE_VENV"
     fi
 fi
+VENV_CREATED=0
 if [[ ! -x "$VENV_PYTHON" ]]; then
+    VENV_CREATED=1
     UV_BIN="$(find_uv || true)"
     if [[ -n "$UV_BIN" ]]; then
         # --seed installs pip into the uv-created venv.
         "$UV_BIN" venv "$MNEMOSYNE_VENV" --python "$HERMES_PY_VERSION" --seed
-    elif [[ -n "$HERMES_PYTHON" ]] && "$HERMES_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
+    elif "$HERMES_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
         "$HERMES_PYTHON" -m venv "$MNEMOSYNE_VENV"
     else
         python3 -m venv "$MNEMOSYNE_VENV"
@@ -178,7 +233,7 @@ MNEMOSYNE_PY_VERSION="$(py_minor_version "$VENV_PYTHON")"
 if [[ "$MNEMOSYNE_PY_VERSION" != "$HERMES_PY_VERSION" ]]; then
     cat >&2 <<EOF
 ERROR: Python version mismatch between Hermes and the Mnemosyne environment.
-  Hermes:    $HERMES_PY_VERSION  (${HERMES_PYTHON:-interpreter not found})
+  Hermes:    $HERMES_PY_VERSION  ($HERMES_PYTHON)
   Mnemosyne: ${MNEMOSYNE_PY_VERSION:-unknown}  ($VENV_PYTHON)
 Hermes imports Mnemosyne in-process, so compiled wheels built for
 $MNEMOSYNE_PY_VERSION cannot load under $HERMES_PY_VERSION. Memories would be stored
@@ -187,19 +242,6 @@ Install a Python $HERMES_PY_VERSION interpreter (or uv) and re-run.
 EOF
     exit 1
 fi
-# Install from the official repository's main branch rather than PyPI, which
-# lags it. Both packages come from one commit: mnemosyne-hermes on main requires
-# the mnemosyne-memory version that ships beside it. The commit is pinned in the
-# archive URL, so a re-run picks up whatever main has moved on to.
-MNEMOSYNE_REPO='mnemosyne-oss/mnemosyne'
-MNEMOSYNE_COMMIT="$(curl -fsSL -H 'Accept: application/vnd.github.sha' \
-    "https://api.github.com/repos/$MNEMOSYNE_REPO/commits/main")" || MNEMOSYNE_COMMIT=''
-if [[ ! "$MNEMOSYNE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "ERROR: could not resolve the latest commit of https://github.com/$MNEMOSYNE_REPO (main)." >&2
-    echo 'Check that api.github.com is reachable and re-run.' >&2
-    exit 1
-fi
-MNEMOSYNE_ARCHIVE="https://github.com/$MNEMOSYNE_REPO/archive/$MNEMOSYNE_COMMIT.zip"
 if (( ALL_EXTRAS )); then
     EXTRAS='[all]'
 elif (( NO_EMBEDDINGS )); then
@@ -217,8 +259,17 @@ echo "Installing Mnemosyne from $MNEMOSYNE_REPO main at ${MNEMOSYNE_COMMIT:0:12}
 # pip skips a direct-URL package whose version is already installed, and main
 # keeps one version string across many commits, so --upgrade alone would leave
 # a re-run on the old commit. Force just these two; their dependencies were
-# resolved from this commit's metadata by the line above.
-"$VENV_PYTHON" -m pip install --force-reinstall --no-deps "$MEMORY_SPEC" "$HERMES_SPEC"
+# resolved from this commit's metadata by the line above. A venv created in
+# this run already holds this commit.
+if (( ! VENV_CREATED )); then
+    "$VENV_PYTHON" -m pip install --force-reinstall --no-deps "$MEMORY_SPEC" "$HERMES_SPEC"
+fi
+NEW_VERSION="$(installed_version mnemosyne-memory)"
+if [[ -n "$OLD_VERSION" && "$OLD_VERSION" != "$NEW_VERSION" ]]; then
+    echo "mnemosyne-memory upgraded: $OLD_VERSION -> $NEW_VERSION (commit ${MNEMOSYNE_COMMIT:0:12})"
+else
+    echo "mnemosyne-memory $NEW_VERSION (commit ${MNEMOSYNE_COMMIT:0:12})"
+fi
 # --force is required for re-runs: without it this errors out with "already
 # exists" as soon as the plugin directory is there, which would both break
 # re-running the installer and leave the wrapper pointing at a stale
@@ -227,10 +278,11 @@ echo "Installing Mnemosyne from $MNEMOSYNE_REPO main at ${MNEMOSYNE_COMMIT:0:12}
 
 # `hermes memory status` reports "available" purely from the registration, so it
 # stays green even when the embedding stack cannot load in Hermes' interpreter.
-# Import it the way the wrapper does and say so plainly.
-if (( ! NO_EMBEDDINGS )) && [[ -n "$HERMES_PYTHON" ]]; then
+# Import it the way the wrapper does, in isolated mode (-I) as Hermes launches
+# it, and say so plainly.
+if (( ! NO_EMBEDDINGS )); then
     MNEMOSYNE_SITE="$MNEMOSYNE_VENV/lib/python$HERMES_PY_VERSION/site-packages"
-    if "$HERMES_PYTHON" -c "import sys; sys.path.insert(0, '$MNEMOSYNE_SITE'); import numpy, onnxruntime" >/dev/null 2>&1; then
+    if "$HERMES_PYTHON" -I -c "import sys; sys.path.insert(0, '$MNEMOSYNE_SITE'); import numpy, onnxruntime" >/dev/null 2>&1; then
         echo "Verified: Hermes' interpreter can load the Mnemosyne embedding stack."
     else
         echo 'Warning: Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.' >&2

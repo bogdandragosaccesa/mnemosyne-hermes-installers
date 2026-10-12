@@ -66,8 +66,8 @@ Finding Hermes' interpreter is the other half. Current Hermes has no virtual env
 inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its
 launcher reports that interpreter through `hermes --print-runtime-command`, a JSON array
 whose first element is the interpreter path. The installers ask that first and fall back
-to `HERMES_HOME/hermes-agent/venv` for older installs. When neither answers they warn and
-assume 3.11.
+to `HERMES_HOME/hermes-agent/venv` for older installs. When neither answers they stop
+rather than guess a version, and `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
 
 ## The gateway
 

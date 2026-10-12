@@ -51,8 +51,9 @@ interpreter is `~/.hermes/hermes-agent/venv/bin/python`.
 If they differ, re-run the installer; it rebuilds the environment against Hermes'
 version. Versions before 1.0.0 could produce this silently when `uv` was not on `PATH`,
 and the installers in 1.1.0 and earlier always did on current Hermes, which no longer
-has that venv — look for `could not determine Hermes' Python version` in the installer
-output.
+has that venv. The installers now stop with `could not find the Python interpreter Hermes
+runs on` instead of guessing; set `MNEMOSYNE_HERMES_PYTHON` to Hermes' interpreter if
+detection fails.
 
 ### `onnxruntime` DLL load failed on Windows
 
@@ -119,7 +120,7 @@ and re-run:
 
 ```powershell
 $env:MNEMOSYNE_VENV = 'C:\mnemosyne-venv'
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\install-mnemosyne-hermes-windows.ps1
 ```
 

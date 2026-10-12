@@ -21,13 +21,13 @@ cd mnemosyne-hermes-installers
 ```powershell
 git clone https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers.git
 cd mnemosyne-hermes-installers
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\install-mnemosyne-hermes-windows.ps1
 ```
 
 A fresh Windows client blocks every `.ps1` with "running scripts is disabled on this
 system". `Set-ExecutionPolicy -Scope Process` lifts that for the current PowerShell window
-only and changes no machine or user setting.
+only and changes no machine or user setting; `-Force` skips its confirmation prompt.
 
 Without `git`, which a fresh Windows does not have, download the repository instead:
 
@@ -36,7 +36,7 @@ Invoke-WebRequest -UseBasicParsing -OutFile mhi.zip `
     https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/archive/refs/heads/main.zip
 Expand-Archive mhi.zip -DestinationPath .
 cd mnemosyne-hermes-installers-main
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\install-mnemosyne-hermes-windows.ps1
 ```
 
@@ -144,11 +144,34 @@ mnemosyne-hermes @ https://github.com/mnemosyne-oss/mnemosyne/archive/<sha>.zip#
   version such as `4.0.0b5`. The installer prints the commit it used.
 - **No `git` needed.** pip downloads the archive over HTTPS.
 - **Re-runs.** `main` keeps one version string across many commits, and pip will not
-  reinstall a version it already has, so the installers follow the normal install with
-  a `--force-reinstall --no-deps` of just these two packages. A re-run always ends on the
-  current commit.
-- **Network.** `api.github.com` and `github.com` must be reachable. If the commit cannot
-  be resolved the installer stops before touching the virtual environment's packages.
+  reinstall a version it already has, so for an existing environment the installers follow
+  the normal install with a `--force-reinstall --no-deps` of just these two packages. A
+  re-run always ends on the current commit.
+- **Network.** `api.github.com` and `github.com` must be reachable. The commit is resolved
+  before the virtual environment is touched, so if that fails the existing install is left
+  as it was. Unauthenticated, the GitHub API allows 60 requests an hour per IP; the
+  installers send `GITHUB_TOKEN` (or `GH_TOKEN`) when it is set.
+
+## Upgrading from a PyPI install
+
+An environment installed from PyPI by an older copy of these scripts holds the stable
+`mnemosyne-memory` 3.x. Re-running moves it to the pre-release on `main` and prints the
+change, for example `mnemosyne-memory upgraded: 3.15.1 -> 4.0.0b5`. The new version opens
+the existing memory database and upgrades it in place: an end-to-end run confirmed a memory
+written by 3.15.1 is still recalled under 4.0.0b5. The installers have no downgrade path,
+so back the database up first:
+
+```bash
+~/.mnemosyne-venv/bin/mnemosyne backup
+```
+
+```powershell
+& "$env:USERPROFILE\.mnemosyne-venv\Scripts\mnemosyne.exe" backup
+```
+
+Note that the stable pairing PyPI resolves today, `mnemosyne-memory` 3.15.1 with
+`mnemosyne-hermes` 0.7.2, fails inside Hermes with `cannot import name 'make_write_policy'`,
+so an existing PyPI install of that pairing has no working provider to lose.
 
 ## Paths and overrides
 
@@ -157,6 +180,8 @@ mnemosyne-hermes @ https://github.com/mnemosyne-oss/mnemosyne/archive/<sha>.zip#
 | `HERMES_HOME` | `~/.hermes` | `%LOCALAPPDATA%\hermes` |
 | `MNEMOSYNE_HOME` | `$HERMES_HOME/mnemosyne` | `%HERMES_HOME%\mnemosyne` |
 | `MNEMOSYNE_VENV` | `~/.mnemosyne-venv` | `%USERPROFILE%\.mnemosyne-venv` |
+| `MNEMOSYNE_HERMES_PYTHON` | detected from Hermes | detected from Hermes |
+| `GITHUB_TOKEN` / `GH_TOKEN` | unset | unset |
 
 Export any of these before running to override them. The Unix installer appends
 `HERMES_HOME` and `MNEMOSYNE_HOME` exports to your shell rc file (`~/.zprofile` on macOS,

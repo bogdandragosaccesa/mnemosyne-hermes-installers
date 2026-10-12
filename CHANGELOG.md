@@ -72,6 +72,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   package whose version is already installed, so a `--force-reinstall --no-deps` of the
   two packages follows the normal install; without it a re-run would stay on the old
   commit, because `main` keeps one version string across many commits.
+  **Upgrade note:** an environment installed from PyPI moves from the stable 3.x to the
+  pre-release on `main`, and the memory database is upgraded in place with no downgrade
+  path; run `mnemosyne backup` first. The installers print the change
+  (`mnemosyne-memory upgraded: 3.15.1 -> 4.0.0b5`). See
+  [Upgrading from a PyPI install](docs/installation.md#upgrading-from-a-pypi-install).
+- When Hermes' interpreter cannot be found, the installers now stop instead of assuming
+  Python 3.11, which would have built an environment Hermes cannot load embeddings from.
+  `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly (not `HERMES_PYTHON`, which
+  Hermes' own tooling sets to unrelated interpreters).
+- The upstream commit is resolved before the virtual environment is touched, so a GitHub
+  API failure leaves an existing install working. Rate limiting is reported as such, and
+  `GITHUB_TOKEN` / `GH_TOKEN` are sent when set.
+- The embedding check runs Hermes' interpreter with `-I`, as Hermes launches it, so it no
+  longer passes on the strength of `PYTHONPATH` or user site-packages.
+- Hermes' bundled `uv` is preferred over one on `PATH` on both platforms, the newest
+  version wins when several are present, and `HERMES_RUNTIME_DIR` is honoured.
+- The Windows `hermes --print-runtime-command` call is bounded to 60 seconds, like the
+  Unix one, and only the JSON line of its output is parsed.
+- The Visual C++ runtime step installs the package matching the interpreter's
+  architecture (x64, arm64 or x86), says it may ask for elevation, and quotes Python's
+  actual import error when the stack still does not load.
+- A virtual environment created in the same run skips the redundant `--force-reinstall`.
+- The documented `Set-ExecutionPolicy -Scope Process` lines now pass `-Force`, which skips
+  Windows PowerShell 5.1's confirmation prompt.
 
 ### Fixed
 

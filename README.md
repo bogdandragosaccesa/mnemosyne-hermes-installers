@@ -59,7 +59,7 @@ Linux / macOS:
 Windows:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # this window only
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this window only
 .\install-mnemosyne-hermes-windows.ps1
 ```
 
@@ -78,9 +78,11 @@ agent remembers, and the uninstallers switch it back on so removing Mnemosyne ca
 leave Hermes with no memory at all. See
 [Installation](docs/installation.md#the-built-in-memory-store).
 
-Re-running an installer is safe: it reinstalls Mnemosyne from the current head of `main`,
-re-registers the provider, and rebuilds the virtual environment if it was built against the
-wrong Python.
+Re-running an installer reinstalls Mnemosyne from the current head of `main`, re-registers
+the provider, and rebuilds the virtual environment if it was built against the wrong Python.
+Coming from a PyPI install it moves you onto pre-release code and upgrades the memory
+database in place, so take a backup first — see
+[Upgrading from a PyPI install](docs/installation.md#upgrading-from-a-pypi-install).
 
 ## Uninstall
 
@@ -102,7 +104,7 @@ Linux / macOS:
 Windows:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # this window only
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this window only
 .\uninstall-mnemosyne-hermes-windows.ps1 -DryRun   # preview
 .\uninstall-mnemosyne-hermes-windows.ps1           # prompts before removing
 ```
