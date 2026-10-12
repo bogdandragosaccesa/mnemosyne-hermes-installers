@@ -45,8 +45,9 @@ hermes --print-runtime-command   # JSON; the first element is Hermes' interprete
 ~/.mnemosyne-venv/bin/python --version
 ```
 
-Older Hermes installs do not know `--print-runtime-command`; for those, Hermes'
-interpreter is `~/.hermes/hermes-agent/venv/bin/python`.
+Launchers without `--print-runtime-command` print their Python in `hermes --version`
+(`Python: 3.14.7`); the interpreter is the `.venv` or `venv` in the `Install directory:` it
+names, or `~/.hermes/hermes-agent/venv/bin/python` on old installs.
 
 If they differ, re-run the installer; it rebuilds the environment against Hermes'
 version. Versions before 1.0.0 could produce this silently when `uv` was not on `PATH`,

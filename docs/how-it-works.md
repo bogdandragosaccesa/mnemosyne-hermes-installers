@@ -86,19 +86,25 @@ unregistered gateway therefore hangs forever, and `stop`'s output does not say w
 gateway was running (with a unit installed it reports "Stopped" either way).
 
 So the scripts read gateway state from `HERMES_HOME/gateway_state.json`, which the gateway
-process writes itself under every manager: its `gateway_state` plus its PID. A live PID in
-state `running`, `degraded` or `draining` — Hermes' own up-and-serving set — counts as
-running. The installer registers the service where Hermes allows one (it
-refuses inside containers), then **restarts** a running gateway — `restart` detached,
-judged by a new gateway PID appearing within 90 seconds, so a busy gateway draining its
-turns is reported as in progress rather than failed — or **starts** a stopped one. The
-uninstaller remembers whether a gateway was running, stops it, and at the end starts it
-again only if it was. Starting uses `hermes gateway start`, which goes through systemd
-(user or system scope), launchd or s6; when no manager brings a gateway up within 45
-seconds, the scripts run `hermes gateway run` detached, writing to Hermes' own
-`logs/gateway.log`. Their own steps are logged to
+process writes itself under every manager: its `gateway_state`, PID and start time. Like
+Hermes (`gateway/status.py`), they trust the PID only if it is alive, has the recorded start
+time (Linux), and its arguments are `gateway run` or `gateway restart` — a gateway killed
+outside Hermes leaves `running` behind with a dead PID that may since have been reused. A
+gateway in any state but `stopped` / `startup_failed` counts as **up**; one in `running`,
+`degraded` or `draining` counts as **serving**.
+
+The installer registers the service where Hermes allows one (it refuses inside
+containers), then **restarts** an up gateway — `restart` detached, judged by a new serving
+PID within 90 seconds, so a busy gateway draining its turns is reported as in progress
+rather than failed — or **starts** a stopped one. The uninstaller remembers whether a
+gateway was up, stops it and waits for that process to exit, and at the end brings one back
+only if it was: with `hermes gateway start`, which goes through systemd (user or system
+scope), launchd or s6, or — if the old gateway would not stop — with a restart, since it
+still has the removed provider loaded. When no manager brings a gateway up within 60 seconds
+the scripts run `hermes gateway run` detached (output in Hermes' own `logs/gateway.log`),
+except under s6, where that command only hands back to s6. Their own steps are logged to
 `HERMES_HOME/logs/mnemosyne-installer-gateway.log` (`logs/gateway-restart.log` belongs to
-Hermes' dashboard).
+Hermes' dashboard), or nowhere if that file cannot be written.
 
 Both names are **profile-scoped**, which is why the uninstaller matches them by glob
 rather than by one fixed name:

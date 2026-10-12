@@ -120,15 +120,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   foreground when no service manager owns it. Detecting unit files missed system-scope,
   `XDG_CONFIG_HOME` and s6 gateways; reading `stop`'s message started stopped services
   (it says "Stopped" whenever a unit exists) and left s6 gateways down (`restart` there
-  only signals). Both Unix scripts now read the gateway's own `gateway_state.json` with a
-  live-PID check. The uninstaller brings a gateway back only if one was running, with
-  `hermes gateway start` (systemd, launchd, s6), falling back to a detached
-  `hermes gateway run`; the installer restarts a running gateway and judges success by a
-  new gateway PID, so a busy gateway draining its turns is reported as in progress. The
-  stop is bounded at 120 seconds, above Hermes' own 90-second stop wait. The scripts log
-  to `logs/mnemosyne-installer-gateway.log` (appended, rotated at 1 MB); the previous
-  revision truncated `logs/gateway-restart.log`, which belongs to Hermes' dashboard. Found
-  by an end-to-end run in an `ubuntu:24.04` arm64 container and by review.
+  only signals). Both Unix scripts now read the gateway's own `gateway_state.json` and
+  verify its PID the way Hermes does — alive (`kill -0`, `/proc`; no `ps` needed), same
+  start time on Linux, arguments `gateway run`/`restart` — so a gateway killed outside
+  Hermes, whose dead PID may have been reused, is not mistaken for a running one. Every
+  state but `stopped`/`startup_failed` counts as up. The uninstaller brings a gateway back
+  only if one was up: with `hermes gateway start` (systemd, launchd, s6), falling back to a
+  detached `hermes gateway run` except under s6, or with a restart if the old gateway would
+  not stop; the old PID never counts as "came back". The installer restarts an up gateway
+  and judges success by a new gateway PID, so a busy gateway draining its turns is reported
+  as in progress. The stop is bounded at 120 seconds, above Hermes' own 90-second stop wait.
+  The scripts log to `logs/mnemosyne-installer-gateway.log` (appended, rotated at 1 MB, and
+  skipped rather than fatal when unwritable); an earlier revision truncated
+  `logs/gateway-restart.log`, which belongs to Hermes' dashboard. Found by end-to-end runs
+  in an `ubuntu:24.04` arm64 container, a systemd VM and Hermes' s6 image, and by review.
 - **The Unix installer could not bootstrap Hermes on a minimal system.** Hermes' own
   installer refuses to run without `git`, which container and cloud server images do not
   ship; the installer now installs it first when Hermes is missing.

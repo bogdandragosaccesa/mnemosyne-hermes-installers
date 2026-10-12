@@ -380,7 +380,10 @@ function Invoke-HermesProbe {
             $ErrorActionPreference = 'Continue'
             try { & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null } finally { $ErrorActionPreference = $previous }
             [void]$process.WaitForExit(5000)
-            return @{ TimedOut = $true; ExitCode = $null; Lines = @() }
+            # Keep what it printed before the deadline: `hermes --version` prints its
+            # lines first and then runs an update check that can stall on a slow network.
+            $partial = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
+            return @{ TimedOut = $true; ExitCode = $null; Lines = $partial }
         }
         return @{ TimedOut = $false; ExitCode = $process.ExitCode; Lines = @(Get-Content -LiteralPath $stdout) }
     } finally {
@@ -434,8 +437,8 @@ $hermesPython = Resolve-HermesPython
 $hermesPyVersion = $null
 if ($hermesPython) { $hermesPyVersion = Get-PyMinorVersion -PythonPath $hermesPython }
 if (-not $hermesPyVersion) {
-    throw ("Could not find the Python interpreter Hermes runs on (tried hermes --print-runtime-command, then " +
-        "$hermesHome\hermes-agent\venv). Hermes imports Mnemosyne in-process, so the Mnemosyne environment has " +
+    throw ("Could not find the Python interpreter Hermes runs on (tried hermes --print-runtime-command and " +
+        "hermes --version). Hermes imports Mnemosyne in-process, so the Mnemosyne environment has " +
         "to be built for Hermes' Python version; a guessed one stores every memory without an embedding. " +
         "Set MNEMOSYNE_HERMES_PYTHON to Hermes' python.exe and rerun.")
 }
