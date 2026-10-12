@@ -141,8 +141,10 @@ services may depend on it.
 `hermes gateway install`. With no service registered it silently falls back to running
 the gateway in the **foreground**, where it never returns — which would hang the
 installer before it reached its verification steps. The Unix installer therefore runs
-`hermes gateway install` first, and bounds the restart with `timeout` where that
-command exists.
+`hermes gateway install` first, then runs `hermes gateway restart` detached and waits up
+to 60 seconds: if it returns, a service manager (systemd user or system scope, launchd,
+s6) took it; if it is still running, it *is* the gateway and is left in the background.
+The Unix uninstaller does the same, and only if a gateway was running before it started.
 
 `--include-hermes` reverses this: it runs `hermes gateway uninstall` while the Hermes
 binary still exists, because removing `HERMES_HOME` first would strand the systemd unit

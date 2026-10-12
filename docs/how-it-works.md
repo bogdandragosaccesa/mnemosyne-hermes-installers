@@ -66,11 +66,12 @@ Finding Hermes' interpreter is the other half. Current Hermes has no virtual env
 inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its
 launcher reports that interpreter through `hermes --print-runtime-command`, a JSON array
 whose first element is the interpreter path. The installers ask that first. Only when the
-launcher gives no answer at all — an older Hermes that does not know the flag — do they
-fall back to `HERMES_HOME/hermes-agent/venv`, and they say so when they do; a launcher that
-hangs (60-second bound) or names an interpreter that does not exist is an error, not a
-reason to adopt a leftover venv. When nothing answers they stop rather than guess a
-version, and `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
+launcher gives no answer at all **and** there is no managed Python under `tools/` — an
+older Hermes that does not know the flag — do they fall back to
+`HERMES_HOME/hermes-agent/venv`, and they say so when they do. A launcher that hangs
+(60-second bound), fails on a current install, or names an interpreter that does not
+exist is an error, not a reason to adopt a leftover venv. When nothing answers they stop
+rather than guess a version, and `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
 
 ## The gateway
 
@@ -79,9 +80,13 @@ The two platforms differ enough to matter.
 **Linux/macOS** — `hermes gateway install` registers a systemd user unit or a launchd
 agent. Without that, `hermes gateway restart` falls back to running the gateway in the
 **foreground**, where it never returns. An installer that calls `restart` on an
-unregistered gateway therefore hangs forever. The installer registers the service first,
-and bounds the restart with `timeout`, or `gtimeout` where Homebrew's coreutils provided
-it under that name.
+unregistered gateway therefore hangs forever. The installer registers the service first
+where Hermes allows one (it refuses inside containers), then runs `restart` detached and
+waits 60 seconds. A restart that returns was handled by a service manager — systemd in
+user or system scope, launchd, or s6, all of which Hermes detects itself. One still running
+after 60 seconds is the gateway itself, and is left running in the background with its
+output in `HERMES_HOME/logs/gateway-restart.log`. The uninstaller does the same, and only
+when `hermes gateway stop` reported that a gateway was running.
 
 Both names are **profile-scoped**, which is why the uninstaller matches them by glob
 rather than by one fixed name:

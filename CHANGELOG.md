@@ -96,13 +96,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A virtual environment created in the same run skips the redundant `--force-reinstall`.
 - The documented `Set-ExecutionPolicy -Scope Process` lines now pass `-Force`, which skips
   Windows PowerShell 5.1's confirmation prompt.
-- A `GITHUB_TOKEN` / `GH_TOKEN` that GitHub rejects (401) no longer blocks the install:
-  the installers retry the commit lookup without it. A 403/429 with a token is reported as
-  a token problem rather than the anonymous rate limit, and an HTTP 200 without a commit id
-  (a proxy or captive portal) is named as such.
-- The legacy `hermes-agent/venv` fallback is taken only when the launcher gives no answer,
-  never after a timeout or an unusable answer, and it is announced. An unrunnable
-  `MNEMOSYNE_HERMES_PYTHON` is reported as that, not as a failed detection.
+- A `GITHUB_TOKEN` / `GH_TOKEN` that GitHub answers with 401, 403 or 429 no longer blocks
+  the install: the installers retry the commit lookup without it. An HTTP 200 without a
+  commit id (a proxy or captive portal) is named as such.
+- The legacy `hermes-agent/venv` fallback is taken only when the launcher gives no answer
+  and no managed Python exists under `tools/`, never after a timeout, a failure on a
+  current install, or an unusable answer, and it is announced. Each of those failures now
+  says what happened instead of listing a fallback that was not tried. An unrunnable
+  `MNEMOSYNE_HERMES_PYTHON` is reported as that. Both platforms accept the launcher's JSON
+  line whatever its exit code.
 - Windows: the Visual C++ runtime is chosen from `sysconfig.get_platform()` (the
   interpreter's own build) rather than `platform.machine()` (the CPU); the timeout path's
   `taskkill` can no longer abort the installer under PowerShell 5.1, and the process is
@@ -111,9 +113,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **The Unix uninstaller hung forever without a registered gateway service.** It ran
-  `hermes gateway restart`, which then runs the gateway in the foreground. It now restarts
-  only a registered service, bounded to two minutes. Found by an end-to-end run in an
-  `ubuntu:24.04` arm64 container.
+  `hermes gateway restart`, which then runs the gateway in the foreground. Both Unix
+  scripts now run the restart detached and wait at most 60 seconds: a restart handled by a
+  service manager (systemd user or system scope, launchd, s6) returns; one that is still
+  running is the gateway itself and is left in the background. The uninstaller restarts
+  only a gateway that was running before it started. Found by an end-to-end run in an
+  `ubuntu:24.04` arm64 container; a first fix that looked for unit files missed
+  system-scope, `XDG_CONFIG_HOME` and s6 gateways and left them stopped.
 - **The Unix installer could not bootstrap Hermes on a minimal system.** Hermes' own
   installer refuses to run without `git`, which container and cloud server images do not
   ship; the installer now installs it first when Hermes is missing.

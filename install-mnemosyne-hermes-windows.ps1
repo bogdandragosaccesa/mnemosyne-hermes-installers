@@ -370,6 +370,9 @@ function Resolve-HermesPython {
     $stdout = [IO.Path]::GetTempFileName()
     $stderr = [IO.Path]::GetTempFileName()
     $line = $null
+    $exitCode = $null
+    $hermesHelp = 'Hermes imports Mnemosyne in-process, so the Mnemosyne environment has to be built for ' +
+        "Hermes' Python version. Set MNEMOSYNE_HERMES_PYTHON to Hermes' python.exe and rerun."
     try {
         $process = Start-Process -FilePath $hermesExe -ArgumentList '--print-runtime-command' -NoNewWindow -PassThru `
             -RedirectStandardInput $stdin -RedirectStandardOutput $stdout -RedirectStandardError $stderr
@@ -384,27 +387,29 @@ function Resolve-HermesPython {
             [void]$process.WaitForExit(5000)
             # A launcher that hangs is a current one in trouble, not an old layout:
             # adopting a leftover legacy venv here could pick the wrong Python.
-            Write-Note 'hermes --print-runtime-command did not answer within 60 seconds.'
-            return $null
+            throw "hermes --print-runtime-command did not answer within 60 seconds. $hermesHelp"
         }
-        if ($process.ExitCode -eq 0) {
-            $line = Get-Content -LiteralPath $stdout | Where-Object { $_.StartsWith('[') } | Select-Object -First 1
-        }
+        $exitCode = $process.ExitCode
+        # Accept the JSON line whatever the exit code; the Unix installer does the same.
+        $line = Get-Content -LiteralPath $stdout | Where-Object { $_.StartsWith('[') } | Select-Object -First 1
     } finally {
         Remove-Item -LiteralPath $stdin, $stdout, $stderr -Force -ErrorAction SilentlyContinue
     }
     if ($line) {
-        try {
-            $python = @(($line | ConvertFrom-Json))[0]
-            if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
-        } catch {
-            Write-Note "hermes --print-runtime-command returned no usable JSON: $($_.Exception.Message)"
-            return $null
-        }
-        Write-Note "hermes --print-runtime-command named an interpreter that does not exist: $line"
-        return $null
+        $python = $null
+        try { $python = @(($line | ConvertFrom-Json))[0] } catch { $python = $null }
+        if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
+        throw "hermes --print-runtime-command named an interpreter that is not usable: $line. $hermesHelp"
     }
-    # No answer at all: an older Hermes without the flag, with its venv in the checkout.
+    # A managed interpreter under tools\ proves a current Hermes: its launcher
+    # failing is a fault to report, not a sign of the old venv layout.
+    $managed = Get-ChildItem -Path (Join-Path $hermesTools 'python-*\python.exe') -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($managed) {
+        throw ("hermes --print-runtime-command failed (exit $exitCode) on a current Hermes install (managed Python " +
+            "found at $($managed.FullName)); not falling back to the legacy venv. $hermesHelp")
+    }
+    # No answer and no managed Python: an older Hermes, with its venv in the checkout.
     $legacy = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
     if (Test-Path -LiteralPath $legacy -PathType Leaf) {
         Write-Note "hermes --print-runtime-command gave no interpreter; using the legacy venv $legacy"
@@ -449,19 +454,19 @@ function Get-MainCommit {
 }
 $githubToken = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
 $commit = Get-MainCommit -Token $githubToken
-if ($commit.Status -eq 401 -and $githubToken) {
-    # An expired token, or one for another host, must not block a public repo.
-    Write-Note 'GitHub rejected the token in GITHUB_TOKEN/GH_TOKEN; retrying without it.'
+if ($commit.Status -in @(401, 403, 429) -and $githubToken) {
+    # An expired or rate-limited token, or one for another host, must not block a
+    # public repo when the anonymous allowance would do.
+    Write-Note "GitHub answered HTTP $($commit.Status) to the token in GITHUB_TOKEN/GH_TOKEN; retrying without it."
     $githubToken = $null
     $commit = Get-MainCommit -Token $null
 }
 $mnemosyneCommit = $commit.Sha
 if ($mnemosyneCommit -notmatch '^[0-9a-f]{40}$') {
     $commitStatus = $commit.Status
-    $hint = if (($commitStatus -eq 403 -or $commitStatus -eq 429) -and $githubToken) {
-        "GitHub answered HTTP $commitStatus to the token in GITHUB_TOKEN/GH_TOKEN (rate limit or missing access). Unset it, or wait, and rerun."
-    } elseif ($commitStatus -eq 403 -or $commitStatus -eq 429) {
-        'GitHub API rate limit reached (60 requests/hour per IP without a token). Wait and rerun, or set GITHUB_TOKEN and rerun.'
+    # A token, if any, was already dropped and the anonymous retry hit this.
+    $hint = if ($commitStatus -eq 403 -or $commitStatus -eq 429) {
+        'GitHub API rate limit reached (60 requests/hour per IP without a token). Wait and rerun, or set a working GITHUB_TOKEN and rerun.'
     } elseif ($null -eq $commitStatus) {
         'api.github.com is unreachable; check the network or proxy and rerun.'
     } elseif ($commitStatus -eq 200) {

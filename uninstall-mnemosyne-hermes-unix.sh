@@ -71,6 +71,31 @@ run_bounded() {
     elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
     else "$@"; fi
 }
+
+# `hermes gateway restart` hands off to whatever service manager owns the gateway
+# (systemd user or system scope, launchd, s6) and returns. With none it runs the
+# gateway in the foreground and never returns, and Hermes' own detection of that
+# is broader than anything a script can glob for. So run it detached and give it
+# 60 seconds: if it returned, a manager took it; if it is still running, it is
+# the gateway itself and stays in the background. Sets GATEWAY_BG_PID; returns
+# 0 restarted, 200 running in the background, other = failed.
+GATEWAY_BG_PID=''
+restart_gateway_detached() {
+    local log="$1" pid waited=0 rc=0
+    shift
+    mkdir -p "$(dirname "$log")"
+    nohup "$@" gateway restart </dev/null >"$log" 2>&1 &
+    pid=$!
+    while (( waited < 60 )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" || rc=$?
+            return "$rc"
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    GATEWAY_BG_PID="$pid"
+    return 200
+}
 write_step() { printf '%s==> %s%s\n' "$C_STEP" "$1" "$C_OFF"; }
 write_ok()   { printf '%s  - %s%s\n' "$C_OK"   "$1" "$C_OFF"; }
 write_note() { printf '%s  . %s%s\n' "$C_NOTE" "$1" "$C_OFF"; }
@@ -308,11 +333,19 @@ fi
 
 write_step 'Stopping running processes...'
 
+# Remember whether a gateway was up, so the restart below brings back exactly
+# that and never starts one the user did not have. Hermes says "No gateway
+# running" / "No gateway processes found" when there was nothing; any other
+# answer (a stopped unit, an s6 dispatch, a wording this script does not know)
+# counts as running, because restarting is the safe side of that guess.
+GATEWAY_WAS_RUNNING=0
 if [[ -n "$HERMES_BIN" ]]; then
-    if "$HERMES_BIN" gateway stop >/dev/null 2>&1; then
-        write_ok 'Gateway stopped'
-    else
+    stop_output="$(run_bounded 60 "$HERMES_BIN" gateway stop </dev/null 2>&1 || true)"
+    if printf '%s\n' "$stop_output" | grep -qE 'No gateway (running|processes found)'; then
         write_note 'Gateway was not running'
+    else
+        GATEWAY_WAS_RUNNING=1
+        write_ok 'Gateway stopped'
     fi
 fi
 
@@ -518,16 +551,16 @@ if (( ! stripped_any )); then write_note 'No installer-written exports found'; f
 
 if (( ! INCLUDE_HERMES )) && [[ -n "$HERMES_BIN" ]]; then
     write_step 'Restarting the Hermes gateway...'
-    # Without a registered service `hermes gateway restart` falls back to running
-    # the gateway in the foreground and never returns, which hung this script.
-    # Restart only a registered service, and bound even that.
-    if [[ -z "$(gateway_service_files)" ]]; then
-        write_note 'No gateway background service is registered, so there is nothing to restart.'
-        write_note 'If you run the gateway by hand, start it again with: hermes gateway run'
-    elif run_bounded 120 "$HERMES_BIN" gateway restart </dev/null >/dev/null 2>&1; then
-        write_ok 'Gateway restarted'
+    if (( ! GATEWAY_WAS_RUNNING )); then
+        write_note 'No gateway was running before the uninstall, so none is started.'
     else
-        write_warn 'Gateway did not restart. Run: hermes gateway restart'
+        gateway_log="$HERMES_HOME/logs/gateway-restart.log"
+        rc=0; restart_gateway_detached "$gateway_log" "$HERMES_BIN" || rc=$?
+        case "$rc" in
+            0) write_ok 'Gateway restarted' ;;
+            200) write_ok "Gateway running in the background (PID $GATEWAY_BG_PID, log $gateway_log)" ;;
+            *) write_warn "Gateway did not restart (exit $rc; see $gateway_log). Run: hermes gateway restart" ;;
+        esac
     fi
 fi
 

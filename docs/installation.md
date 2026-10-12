@@ -151,7 +151,8 @@ mnemosyne-hermes @ https://github.com/mnemosyne-oss/mnemosyne/archive/<sha>.zip#
   before the virtual environment is touched, so if that fails the existing install is left
   as it was. Unauthenticated, the GitHub API allows 60 requests an hour per IP; the
   installers send `GITHUB_TOKEN` (or `GH_TOKEN`) when it is set, and retry without it if
-  GitHub rejects it, so a stale or foreign token cannot block the install.
+  GitHub answers 401, 403 or 429, so a stale, rate-limited or foreign token cannot block
+  the install.
 
 ## Upgrading from a PyPI install
 

@@ -48,6 +48,30 @@ run_bounded() {
     elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
     else "$@"; fi
 }
+# `hermes gateway restart` hands off to whatever service manager owns the gateway
+# (systemd user or system scope, launchd, s6) and returns. With none it runs the
+# gateway in the foreground and never returns, and Hermes' own detection of that
+# is broader than anything a script can glob for. So run it detached and give it
+# 60 seconds: if it returned, a manager took it; if it is still running, it is
+# the gateway itself and stays in the background. Sets GATEWAY_BG_PID; returns
+# 0 restarted, 200 running in the background, other = failed.
+GATEWAY_BG_PID=''
+restart_gateway_detached() {
+    local log="$1" pid waited=0 rc=0
+    shift
+    mkdir -p "$(dirname "$log")"
+    nohup "$@" gateway restart </dev/null >"$log" 2>&1 &
+    pid=$!
+    while (( waited < 60 )); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" || rc=$?
+            return "$rc"
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    GATEWAY_BG_PID="$pid"
+    return 200
+}
 install_system_package() {
     local package="$1"
     if command -v apt-get >/dev/null 2>&1; then
@@ -127,15 +151,16 @@ resolve_hermes_python() {
             printf '%s\n' "$MNEMOSYNE_HERMES_PYTHON"; return 0
         fi
         echo "ERROR: MNEMOSYNE_HERMES_PYTHON=$MNEMOSYNE_HERMES_PYTHON is not a runnable Python interpreter." >&2
-        return 1
+        return 2
     fi
     raw="$(run_bounded 60 hermes --print-runtime-command </dev/null 2>/dev/null)" || rc=$?
     if (( rc == 124 )); then
         # A launcher that hangs is a current one in trouble, not an old layout:
         # adopting a leftover legacy venv here could pick the wrong Python.
-        echo 'hermes --print-runtime-command did not answer within 60 seconds.' >&2
-        return 1
+        echo 'ERROR: hermes --print-runtime-command did not answer within 60 seconds.' >&2
+        return 2
     fi
+    # Accept the JSON line whatever the exit code; the Windows installer does the same.
     out="$(printf '%s\n' "$raw" | grep '^\[' | head -n 1 || true)"
     if [[ -n "$out" ]]; then
         # sed reads a plain first element; an escaped one (quote, backslash,
@@ -145,10 +170,19 @@ resolve_hermes_python() {
             python="$(printf '%s\n' "$out" | python3 -c 'import json, sys; print(json.loads(sys.stdin.read())[0])' 2>/dev/null || true)"
         fi
         if [[ -n "$python" && -x "$python" ]]; then printf '%s\n' "$python"; return 0; fi
-        echo "hermes --print-runtime-command named an interpreter that is not runnable: $out" >&2
-        return 1
+        echo "ERROR: hermes --print-runtime-command named an interpreter that is not runnable: $out" >&2
+        return 2
     fi
-    # No answer at all: an older Hermes without the flag, with its venv in the checkout.
+    # A managed interpreter under tools/ proves a current Hermes: its launcher
+    # failing is a fault to report, not a sign of the old venv layout.
+    for python in "${HERMES_RUNTIME_DIR:-$HERMES_HOME/tools}"/python-*/bin/python3; do
+        if [[ -x "$python" ]]; then
+            echo "ERROR: hermes --print-runtime-command failed (exit $rc) on a current Hermes install" >&2
+            echo "       (managed Python found under ${python%/bin/python3}); not falling back to the legacy venv." >&2
+            return 2
+        fi
+    done
+    # No answer and no managed Python: an older Hermes, with its venv in the checkout.
     python="$HERMES_HOME/hermes-agent/venv/bin/python"
     if [[ -x "$python" ]]; then
         echo "Note: hermes --print-runtime-command gave no interpreter; using the legacy venv $python" >&2
@@ -163,11 +197,13 @@ resolve_hermes_python() {
 # against a different one imports far enough to look healthy while silently
 # losing embeddings. Match Hermes' interpreter, and refuse to proceed if we
 # cannot: guessing a version is exactly how that failure happens.
-HERMES_PYTHON="$(resolve_hermes_python || true)"
+# resolve_hermes_python returns 2 when it has already said why.
+RESOLVE_RC=0
+HERMES_PYTHON="$(resolve_hermes_python)" || RESOLVE_RC=$?
 HERMES_PY_VERSION=""
 if [[ -n "$HERMES_PYTHON" ]]; then HERMES_PY_VERSION="$(py_minor_version "$HERMES_PYTHON")"; fi
 if [[ -z "$HERMES_PY_VERSION" ]]; then
-    if [[ -z "${MNEMOSYNE_HERMES_PYTHON:-}" ]]; then
+    if (( RESOLVE_RC != 2 )); then
         cat >&2 <<EOF
 ERROR: could not find the Python interpreter Hermes runs on.
   Tried: hermes --print-runtime-command, then $HERMES_HOME/hermes-agent/venv/bin/python
@@ -199,9 +235,10 @@ fetch_commit() {
 }
 COMMIT_RESPONSE="$(fetch_commit "$GITHUB_TOKEN_VALUE")"
 COMMIT_STATUS="${COMMIT_RESPONSE##*$'\n'}"
-if [[ "$COMMIT_STATUS" == 401 && -n "$GITHUB_TOKEN_VALUE" ]]; then
-    # An expired token, or one for another host, must not block a public repo.
-    echo 'Note: GitHub rejected the token in GITHUB_TOKEN/GH_TOKEN; retrying without it.' >&2
+if [[ "$COMMIT_STATUS" =~ ^(401|403|429)$ && -n "$GITHUB_TOKEN_VALUE" ]]; then
+    # An expired or rate-limited token, or one for another host, must not block a
+    # public repo when the anonymous allowance would do.
+    echo "Note: GitHub answered HTTP $COMMIT_STATUS to the token in GITHUB_TOKEN/GH_TOKEN; retrying without it." >&2
     GITHUB_TOKEN_VALUE=''
     COMMIT_RESPONSE="$(fetch_commit '')"
     COMMIT_STATUS="${COMMIT_RESPONSE##*$'\n'}"
@@ -211,13 +248,9 @@ if [[ "$COMMIT_STATUS" != 200 || ! "$MNEMOSYNE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; the
     echo "ERROR: could not resolve the latest commit of https://github.com/$MNEMOSYNE_REPO (main)." >&2
     case "$COMMIT_STATUS" in
         403|429)
-            if [[ -n "$GITHUB_TOKEN_VALUE" ]]; then
-                echo "GitHub answered HTTP $COMMIT_STATUS to the token in GITHUB_TOKEN/GH_TOKEN (rate limit or" >&2
-                echo 'missing access). Unset it, or wait, and re-run.' >&2
-            else
-                echo 'GitHub API rate limit reached (60 requests/hour per IP without a token).' >&2
-                echo 'Wait and re-run, or export GITHUB_TOKEN and re-run.' >&2
-            fi ;;
+            # A token, if any, was already dropped and the anonymous retry hit this.
+            echo 'GitHub API rate limit reached (60 requests/hour per IP without a token).' >&2
+            echo 'Wait and re-run, or export a working GITHUB_TOKEN and re-run.' >&2 ;;
         000|'') echo 'api.github.com is unreachable; check the network or proxy and re-run.' >&2 ;;
         200) echo 'api.github.com answered, but not with a commit id; a proxy or captive portal may be' >&2
              echo 'intercepting HTTPS. Check the network and re-run.' >&2 ;;
@@ -350,12 +383,17 @@ if (( ! SKIP_HERMES_CONFIGURATION )); then
             else echo 'Run: sudo loginctl enable-linger '"$(id -un)" >&2; fi
         fi
     fi
-    # With no background service registered, `hermes gateway restart` falls back
-    # to running the gateway in the foreground and never returns, which hangs
-    # the installer before it reaches its verification steps. Registering the
-    # service first makes restart a real, bounded service restart.
+    # With no background service registered (containers refuse one), restart runs
+    # the gateway in the foreground; registering the service first makes it a real
+    # service restart where that is possible, and the detached restart covers the rest.
     hermes gateway install || echo 'Could not install the gateway service. Run: hermes gateway install' >&2
-    run_bounded 300 hermes gateway restart || echo 'Gateway restart was not completed. Run: hermes gateway restart' >&2
+    GATEWAY_LOG="$HERMES_HOME/logs/gateway-restart.log"
+    rc=0; restart_gateway_detached "$GATEWAY_LOG" hermes || rc=$?
+    case "$rc" in
+        0) echo 'Gateway restarted.' ;;
+        200) echo "No gateway service manager took the restart; the gateway is running in the background (PID $GATEWAY_BG_PID, log $GATEWAY_LOG)." ;;
+        *) echo "Gateway restart failed (exit $rc; see $GATEWAY_LOG). Run: hermes gateway restart" >&2 ;;
+    esac
 fi
 printf '\nInstallation complete.\nHermes home:    %s\nMnemosyne data: %s\n' "$HERMES_HOME" "$MNEMOSYNE_HOME"
 hermes memory status
