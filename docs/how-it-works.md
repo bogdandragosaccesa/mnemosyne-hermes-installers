@@ -57,9 +57,10 @@ interpreter, build against that, rebuild an environment built against anything e
 abort if a mismatch remains, and then prove the result by importing `numpy` and
 `onnxruntime` through Hermes' interpreter.
 
-Note that `uv` is easy to miss. Hermes vendors its own at `HERMES_HOME/bin`, which is on
-`PATH` on Windows but **not** on Unix. Missing it is what silently downgraded the Unix
-installer to the system Python.
+Note that `uv` is easy to miss. Hermes vendors its own under `HERMES_HOME/tools/uv-*`
+(`HERMES_HOME/bin` on older installs), which is not on `PATH`. Missing it is what silently
+downgraded the Unix installer to the system Python, and on Windows it made the installer
+fetch a second uv from winget.
 
 Finding Hermes' interpreter is the other half. Current Hermes has no virtual environment
 inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its

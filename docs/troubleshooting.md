@@ -61,8 +61,11 @@ ImportError: DLL load failed while importing onnxruntime_pybind11_state:
 A dynamic link library (DLL) initialization routine failed.
 ```
 
-The Visual C++ runtime is too old. `onnxruntime` needs a recent x64 redistributable, and
-some Windows Server images ship 14.29 (2019-era), which is not enough. Check and fix:
+or, on a machine with no runtime at all, `The specified module could not be found.`
+
+The Visual C++ runtime is missing or too old. A fresh Windows 11 has none, and some Windows
+Server images ship 14.29 (2019-era), which is not enough. The installer installs it through
+winget when it sees this error; if that failed (it needs elevation), check and fix:
 
 ```powershell
 (Get-Item "$env:WINDIR\System32\vcruntime140.dll").VersionInfo.FileVersion
@@ -116,6 +119,7 @@ and re-run:
 
 ```powershell
 $env:MNEMOSYNE_VENV = 'C:\mnemosyne-venv'
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install-mnemosyne-hermes-windows.ps1
 ```
 

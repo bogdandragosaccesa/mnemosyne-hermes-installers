@@ -148,7 +148,7 @@ fi
 find_uv() {
     local candidate
     if command -v uv >/dev/null 2>&1; then command -v uv; return 0; fi
-    for candidate in "$HERMES_HOME/bin/uv" "$HOME/.local/bin/uv" "$HOME/.local/share/uv/uv" "$HOME/.cargo/bin/uv"; do
+    for candidate in "$HERMES_HOME"/tools/uv-*/uv "$HERMES_HOME/bin/uv" "$HOME/.local/bin/uv" "$HOME/.local/share/uv/uv" "$HOME/.cargo/bin/uv"; do
         if [[ -x "$candidate" ]]; then printf '%s\n' "$candidate"; return 0; fi
     done
     return 1

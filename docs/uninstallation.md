@@ -24,6 +24,7 @@ remove, then verify and exit non-zero if anything survived.
 ## Windows
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # this window only
 .\uninstall-mnemosyne-hermes-windows.ps1 -DryRun   # preview, changes nothing
 .\uninstall-mnemosyne-hermes-windows.ps1           # prompts before removing
 ```

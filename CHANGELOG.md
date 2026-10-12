@@ -84,6 +84,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ask the launcher (`hermes --print-runtime-command`) for its interpreter and keep the
   old venv path as a fallback for older installs. The Windows bootstrap also looks for a
   freshly installed `hermes` in `HERMES_HOME\bin`, where current Hermes publishes it.
+- **The Windows installer always aborted under Windows PowerShell 5.1.** It read Python
+  versions with `python -c 'print("%d.%d" % ...)'`, and Windows PowerShell 5.1 strips
+  embedded double quotes from native arguments, so Python got a syntax error and every
+  version read came back empty — Hermes' as well as the venv's — ending in
+  `Python version mismatch: Hermes runs 3.11 but the Mnemosyne environment is .`. The probe
+  now uses single quotes only. PowerShell 7.3+ passes the quotes through, which hid this.
+  Found by an end-to-end run on a fresh Windows 11 25H2 VM.
+- **Hermes' vendored `uv` was missed.** Current Hermes keeps it under
+  `HERMES_HOME/tools/uv-<version>-<platform>/`, not `HERMES_HOME/bin`, so the Windows
+  installer fetched a second `uv` from winget. Both installers now look there first.
+- **The documented Windows commands failed on a fresh machine.** A Windows client's default
+  execution policy refuses every `.ps1`; the docs now start each block with
+  `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, and show a ZIP download for
+  machines without `git`.
+- **On a fresh Windows, embeddings never loaded.** A fresh Windows 11 has no Visual C++
+  runtime, so `onnxruntime` failed with `DLL load failed` inside Hermes and every memory was
+  stored without a vector; the installer only warned. It had worked by accident while the
+  installer was fetching `uv` from winget, whose package depends on the runtime. The
+  installer now installs `Microsoft.VCRedist.2015+.x64` through winget when the import fails
+  that way, then checks again.
 
 ## [1.1.0] - 2026-08-14
 

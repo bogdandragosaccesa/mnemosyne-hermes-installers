@@ -118,13 +118,15 @@ function Invoke-Native {
 # Reads "3.11" from an interpreter, or $null if it cannot be run. Redirecting a
 # native command's stderr under $ErrorActionPreference='Stop' turns ordinary
 # output into a terminating error, so drop to 'Continue' for the probe.
+# Windows PowerShell 5.1 strips embedded double quotes from native arguments,
+# so the Python code passed to -c must use single quotes only.
 function Get-PyMinorVersion {
     param([Parameter(Mandatory)][string]$PythonPath)
     if (-not (Test-Path -LiteralPath $PythonPath)) { return $null }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $PythonPath -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>$null
+        $out = & $PythonPath -c 'import sys; print(''%d.%d'' % sys.version_info[:2])' 2>$null
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -300,10 +302,13 @@ if (-not $longPathsEnabled -and $mnemosyneVenv.Length -gt 80) {
 
 Write-Step 'Resolving a Python toolchain...'
 
-# Hermes vendors its own uv; prefer that over anything on PATH.
+# Hermes vendors its own uv; prefer that over anything on PATH. Current Hermes
+# keeps it under tools\uv-<version>-<platform>\, older installs under bin\.
 $uvExe = $null
-$hermesUv = Join-Path $hermesHome 'bin\uv.exe'
-if (Test-Path -LiteralPath $hermesUv) { $uvExe = $hermesUv } else { $uvExe = Get-CommandPath 'uv.exe' }
+$hermesUv = @(Get-ChildItem -Path (Join-Path $hermesHome 'tools\uv-*\uv.exe') -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending | Select-Object -ExpandProperty FullName) + @(Join-Path $hermesHome 'bin\uv.exe') |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($hermesUv) { $uvExe = $hermesUv } else { $uvExe = Get-CommandPath 'uv.exe' }
 
 $pythonExe = $null
 if (-not $uvExe) {
@@ -502,12 +507,30 @@ Invoke-Native -FilePath $mnemosyneHermesExe -What 'mnemosyne-hermes install' -Ar
 # Import it the way the wrapper does and report what actually happens.
 if (-not $NoEmbeddings -and $hermesPython) {
     $site = Join-Path $mnemosyneVenv 'Lib\site-packages'
-    $previousEA = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & $hermesPython -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 | Out-Null
-    $embedProbe = $LASTEXITCODE
-    $ErrorActionPreference = $previousEA
-    if ($embedProbe -eq 0) {
+    function Test-EmbeddingStack {
+        $previousEA = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & $hermesPython -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 |
+                ForEach-Object { "$_" }
+            return @{ Ok = ($LASTEXITCODE -eq 0); Output = ($out -join "`n") }
+        } finally {
+            $ErrorActionPreference = $previousEA
+        }
+    }
+    $embed = Test-EmbeddingStack
+    # onnxruntime links against the Visual C++ runtime, which a fresh Windows does
+    # not ship. Installing it is the fix for both a missing and an outdated one.
+    if (-not $embed.Ok -and $embed.Output -match 'DLL load failed') {
+        Write-Note 'onnxruntime cannot load its DLLs; installing the Visual C++ runtime it links against.'
+        try {
+            Install-WingetPackage -Id 'Microsoft.VCRedist.2015+.x64' -DisplayName 'the Microsoft Visual C++ runtime (x64)'
+            $embed = Test-EmbeddingStack
+        } catch {
+            Write-Warn "Could not install the Visual C++ runtime: $($_.Exception.Message)"
+        }
+    }
+    if ($embed.Ok) {
         Write-Ok "Verified: Hermes' interpreter can load the Mnemosyne embedding stack."
     } else {
         Write-Warn 'Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.'

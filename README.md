@@ -59,6 +59,7 @@ Linux / macOS:
 Windows:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # this window only
 .\install-mnemosyne-hermes-windows.ps1
 ```
 
@@ -101,6 +102,7 @@ Linux / macOS:
 Windows:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass   # this window only
 .\uninstall-mnemosyne-hermes-windows.ps1 -DryRun   # preview
 .\uninstall-mnemosyne-hermes-windows.ps1           # prompts before removing
 ```
@@ -161,17 +163,19 @@ Both installers therefore:
 
 - read the version from Hermes' own interpreter and build the Mnemosyne venv against
   **that** version rather than a hardcoded one;
-- look for `uv` where Hermes vendors it (`HERMES_HOME/bin`) as well as on `PATH` —
-  missing it is what silently downgraded the Unix script to the system Python;
+- look for `uv` where Hermes vendors it (`HERMES_HOME/tools/uv-*`, or `HERMES_HOME/bin` on
+  older installs) as well as on `PATH` — missing it is what silently downgraded the Unix
+  script to the system Python;
 - rebuild an existing venv that was built against the wrong version;
 - abort with an explanation if the versions still differ;
 - after registering the provider, import `numpy` and `onnxruntime` through Hermes'
   interpreter and report whether the embedding stack actually loads.
 
 If you see `Hermes cannot import numpy/onnxruntime`, memories will be stored without
-embeddings. On Windows the usual cause is not a version mismatch but an outdated Visual
-C++ runtime — `onnxruntime` then fails with `DLL load failed ... initialization routine
-failed`. Fix it with:
+embeddings. On Windows the usual cause is not a version mismatch but a missing or outdated
+Visual C++ runtime — `onnxruntime` then fails with `DLL load failed`. A fresh Windows 11
+ships none, so when the import fails that way the installer installs it through winget
+and checks again. If that is refused (it needs elevation), install it yourself:
 
 ```powershell
 winget install --id Microsoft.VCRedist.2015+.x64

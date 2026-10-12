@@ -21,6 +21,22 @@ cd mnemosyne-hermes-installers
 ```powershell
 git clone https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers.git
 cd mnemosyne-hermes-installers
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\install-mnemosyne-hermes-windows.ps1
+```
+
+A fresh Windows client blocks every `.ps1` with "running scripts is disabled on this
+system". `Set-ExecutionPolicy -Scope Process` lifts that for the current PowerShell window
+only and changes no machine or user setting.
+
+Without `git`, which a fresh Windows does not have, download the repository instead:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing -OutFile mhi.zip `
+    https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/archive/refs/heads/main.zip
+Expand-Archive mhi.zip -DestinationPath .
+cd mnemosyne-hermes-installers-main
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install-mnemosyne-hermes-windows.ps1
 ```
 
