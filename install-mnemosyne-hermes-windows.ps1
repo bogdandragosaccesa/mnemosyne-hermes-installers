@@ -32,9 +32,10 @@
     consolidation, plus the MCP and sync extras.
 
     llama-cpp-python is compiled from source, so this takes several minutes.
-    Measured on mnemosyne-memory 3.15.1 it adds roughly 120 MB, not the ~1.5 GB
-    upstream quotes, and it does not pull in sentence-transformers or torch. The
-    GGUF model is fetched later, on the first sleep consolidation.
+    Measured on mnemosyne-memory 3.15.1 from PyPI (before these installers moved
+    to upstream main) it added roughly 120 MB, not the ~1.5 GB upstream quotes,
+    and it did not pull in sentence-transformers or torch. The GGUF model is
+    fetched later, on the first sleep consolidation.
 
 .PARAMETER DisableBuiltinMemory
     Turn off Hermes' built-in MEMORY.md / USER.md store, which upstream
@@ -118,13 +119,15 @@ function Invoke-Native {
 # Reads "3.11" from an interpreter, or $null if it cannot be run. Redirecting a
 # native command's stderr under $ErrorActionPreference='Stop' turns ordinary
 # output into a terminating error, so drop to 'Continue' for the probe.
+# Windows PowerShell 5.1 strips embedded double quotes from native arguments,
+# so the Python code passed to -c must use single quotes only.
 function Get-PyMinorVersion {
     param([Parameter(Mandatory)][string]$PythonPath)
     if (-not (Test-Path -LiteralPath $PythonPath)) { return $null }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $PythonPath -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>$null
+        $out = & $PythonPath -c 'import sys; print(''%d.%d'' % sys.version_info[:2])' 2>$null
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -240,14 +243,14 @@ if (-not (Test-Command 'hermes')) {
         Remove-Item -LiteralPath $bootstrap -Force -ErrorAction SilentlyContinue
     }
     Update-SessionPath
-    # The installer adds <HERMES_HOME>\hermes-agent\bin to the User PATH, but a
-    # freshly written value is not always visible yet; look there directly too.
+    # The installer adds its bin directory to the User PATH, but a freshly
+    # written value is not always visible yet; look there directly too.
     if (-not (Test-Command 'hermes')) {
         $candidateHome = $env:HERMES_HOME
         if (-not $candidateHome) { $candidateHome = Join-Path $env:LOCALAPPDATA 'hermes' }
-        foreach ($rel in @('hermes-agent\bin', 'hermes-agent\venv\Scripts')) {
+        foreach ($rel in @('bin', 'hermes-agent\bin', 'hermes-agent\venv\Scripts')) {
             $probe = Join-Path $candidateHome $rel
-            if (Test-Path -LiteralPath (Join-Path $probe 'hermes.exe')) {
+            if ((Test-Path -LiteralPath (Join-Path $probe 'hermes.exe')) -or (Test-Path -LiteralPath (Join-Path $probe 'hermes.cmd'))) {
                 $env:Path = "$probe;$env:Path"
                 break
             }
@@ -300,10 +303,20 @@ if (-not $longPathsEnabled -and $mnemosyneVenv.Length -gt 80) {
 
 Write-Step 'Resolving a Python toolchain...'
 
-# Hermes vendors its own uv; prefer that over anything on PATH.
+# Hermes vendors its own uv; prefer that over anything on PATH. Current Hermes
+# keeps it under tools\uv-<version>-<platform>\ (HERMES_RUNTIME_DIR relocates
+# tools\), older installs under bin\. Newest version first, compared as versions.
 $uvExe = $null
-$hermesUv = Join-Path $hermesHome 'bin\uv.exe'
-if (Test-Path -LiteralPath $hermesUv) { $uvExe = $hermesUv } else { $uvExe = Get-CommandPath 'uv.exe' }
+$hermesTools = if ($env:HERMES_RUNTIME_DIR) { $env:HERMES_RUNTIME_DIR } else { Join-Path $hermesHome 'tools' }
+$toolsUv = @(Get-ChildItem -Path (Join-Path $hermesTools 'uv-*\uv.exe') -ErrorAction SilentlyContinue |
+    Sort-Object -Descending -Property {
+        $parsed = $null
+        if ($_.Directory.Name -match '^uv-(\d+(?:\.\d+)+)') { [void][version]::TryParse($Matches[1], [ref]$parsed) }
+        $parsed
+    } | Select-Object -ExpandProperty FullName)
+$hermesUv = $toolsUv + @(Join-Path $hermesHome 'bin\uv.exe') |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($hermesUv) { $uvExe = $hermesUv } else { $uvExe = Get-CommandPath 'uv.exe' }
 
 $pythonExe = $null
 if (-not $uvExe) {
@@ -340,14 +353,159 @@ $mnemosyneCliExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne.exe'
 # version, and a mismatch fails quietly: the provider still registers and
 # keyword recall still works, but embeddings never load, so memories are stored
 # without vectors and semantic recall can never match them.
-$hermesVenvPython = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
-$hermesPyVersion = Get-PyMinorVersion -PythonPath $hermesVenvPython
-if (-not $hermesPyVersion) {
-    Write-Warn "Could not determine Hermes' Python version; falling back to 3.11."
-    $hermesPyVersion = '3.11'
-} else {
-    Write-Ok "Hermes runs Python $hermesPyVersion; matching it."
+#
+# Current Hermes runs from a managed "store" Python and reports it through its
+# launcher's --print-runtime-command: a JSON argv whose first element is the
+# interpreter that owns the ABI. The JSON is ASCII (Python escapes non-ASCII
+# paths), so the console code page cannot mangle it. Launchers without the flag
+# still answer `hermes --version`, which prints the running Python ("Python:
+# 3.14.7") and "Install directory:"; a venv there is used only if its version is
+# the one Hermes reports. Both calls are bounded and get an empty stdin.
+# MNEMOSYNE_HERMES_PYTHON overrides detection (not HERMES_PYTHON, which Hermes'
+# own tooling sets to unrelated interpreters).
+function Invoke-HermesProbe {
+    param([Parameter(Mandatory)][string]$Argument)
+    $stdin = [IO.Path]::GetTempFileName()
+    $stdout = [IO.Path]::GetTempFileName()
+    $stderr = [IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process -FilePath $hermesExe -ArgumentList $Argument -NoNewWindow -PassThru `
+            -RedirectStandardInput $stdin -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        # Touching Handle keeps ExitCode readable after exit (a Start-Process quirk).
+        $null = $process.Handle
+        if (-not $process.WaitForExit(60000)) {
+            # Native stderr under 'Stop' is a terminating error in PS 5.1, and
+            # taskkill reports children that already exited on stderr.
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null } finally { $ErrorActionPreference = $previous }
+            [void]$process.WaitForExit(5000)
+            # Keep what it printed before the deadline: `hermes --version` prints its
+            # lines first and then runs an update check that can stall on a slow network.
+            $partial = @(Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue)
+            return @{ TimedOut = $true; ExitCode = $null; Lines = $partial }
+        }
+        return @{ TimedOut = $false; ExitCode = $process.ExitCode; Lines = @(Get-Content -LiteralPath $stdout) }
+    } finally {
+        Remove-Item -LiteralPath $stdin, $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    }
 }
+function Resolve-HermesPython {
+    $hermesHelp = 'Hermes imports Mnemosyne in-process, so the Mnemosyne environment has to be built for ' +
+        "Hermes' Python version. Set MNEMOSYNE_HERMES_PYTHON to Hermes' python.exe and rerun."
+    if ($env:MNEMOSYNE_HERMES_PYTHON) {
+        if (Get-PyMinorVersion -PythonPath $env:MNEMOSYNE_HERMES_PYTHON) { return $env:MNEMOSYNE_HERMES_PYTHON }
+        throw "MNEMOSYNE_HERMES_PYTHON=$($env:MNEMOSYNE_HERMES_PYTHON) is not a runnable Python interpreter. Point it at Hermes' python.exe and rerun."
+    }
+    $probe = Invoke-HermesProbe -Argument '--print-runtime-command'
+    if ($probe.TimedOut) {
+        # A launcher that hangs is a current one in trouble, not an old layout.
+        throw "hermes --print-runtime-command did not answer within 60 seconds. $hermesHelp"
+    }
+    # Accept the JSON line whatever the exit code; the Unix installer does the same.
+    $line = $probe.Lines | Where-Object { $_.StartsWith('[') } | Select-Object -First 1
+    if ($line) {
+        $python = $null
+        try { $python = @(($line | ConvertFrom-Json))[0] } catch { $python = $null }
+        if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
+        throw "hermes --print-runtime-command named an interpreter that is not usable: $line. $hermesHelp"
+    }
+    $version = Invoke-HermesProbe -Argument '--version'
+    $want = $null; $dir = $null
+    foreach ($text in $version.Lines) {
+        if (-not $want -and $text -match '^Python: (\d+\.\d+)') { $want = $Matches[1] }
+        if (-not $dir -and $text -match '^Install directory: (.+)$') { $dir = $Matches[1].Trim() }
+    }
+    if (-not $want) {
+        throw "Neither hermes --print-runtime-command (exit $($probe.ExitCode)) nor hermes --version named Hermes' Python. $hermesHelp"
+    }
+    $candidates = @()
+    if ($dir) { $candidates += (Join-Path $dir '.venv\Scripts\python.exe'), (Join-Path $dir 'venv\Scripts\python.exe') }
+    $candidates += Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
+    foreach ($python in $candidates) {
+        if ((Test-Path -LiteralPath $python -PathType Leaf) -and (Get-PyMinorVersion -PythonPath $python) -eq $want) {
+            Write-Note "This Hermes has no --print-runtime-command; using $python, which matches the Python $want Hermes reports."
+            return $python
+        }
+    }
+    throw ("Hermes reports Python $want (install directory $dir), but no Python $want interpreter was found in its " +
+        ".venv or venv; a different version would store memories without embeddings. $hermesHelp")
+}
+# Refuse rather than guess: a guessed version is exactly how memories end up
+# stored without embeddings.
+$hermesPython = Resolve-HermesPython
+$hermesPyVersion = $null
+if ($hermesPython) { $hermesPyVersion = Get-PyMinorVersion -PythonPath $hermesPython }
+if (-not $hermesPyVersion) {
+    throw ("Could not find the Python interpreter Hermes runs on (tried hermes --print-runtime-command and " +
+        "hermes --version). Hermes imports Mnemosyne in-process, so the Mnemosyne environment has " +
+        "to be built for Hermes' Python version; a guessed one stores every memory without an embedding. " +
+        "Set MNEMOSYNE_HERMES_PYTHON to Hermes' python.exe and rerun.")
+}
+Write-Ok "Hermes runs Python $hermesPyVersion ($hermesPython); matching it."
+
+# Install from the official repository's main branch rather than PyPI, which
+# lags it. Both packages come from one commit: mnemosyne-hermes on main requires
+# the mnemosyne-memory version that ships beside it. The commit is pinned in the
+# archive URL, so a re-run picks up whatever main has moved on to. Resolved
+# before the venv is touched, so a failure here leaves an existing install alone.
+$mnemosyneRepo = 'mnemosyne-oss/mnemosyne'
+# Returns @{ Sha; Status }: Status is the HTTP status, or $null when unreachable.
+function Get-MainCommit {
+    param([string]$Token)
+    $headers = @{}
+    if ($Token) { $headers['Authorization'] = "Bearer $Token" }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$mnemosyneRepo/commits/main" -Headers $headers
+        return @{ Sha = [string]$response.sha; Status = 200 }
+    } catch {
+        $status = $null
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+        Write-Note "GitHub API request failed: $($_.Exception.Message)"
+        return @{ Sha = ''; Status = $status }
+    }
+}
+$githubToken = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
+$commit = Get-MainCommit -Token $githubToken
+if ($commit.Status -in @(401, 403, 429) -and $githubToken) {
+    # An expired or rate-limited token, or one for another host, must not block a
+    # public repo when the anonymous allowance would do.
+    Write-Note "GitHub answered HTTP $($commit.Status) to the token in GITHUB_TOKEN/GH_TOKEN; retrying without it."
+    $githubToken = $null
+    $commit = Get-MainCommit -Token $null
+}
+$mnemosyneCommit = $commit.Sha
+if ($mnemosyneCommit -notmatch '^[0-9a-f]{40}$') {
+    $commitStatus = $commit.Status
+    # A token, if any, was already dropped and the anonymous retry hit this.
+    $hint = if ($commitStatus -eq 403 -or $commitStatus -eq 429) {
+        'GitHub API rate limit reached (60 requests/hour per IP without a token). Wait and rerun, or set a working GITHUB_TOKEN and rerun.'
+    } elseif ($null -eq $commitStatus) {
+        'api.github.com is unreachable; check the network or proxy and rerun.'
+    } elseif ($commitStatus -eq 200) {
+        'api.github.com answered, but not with a commit id; a proxy or captive portal may be intercepting HTTPS. Check the network and rerun.'
+    } else {
+        "api.github.com answered HTTP $commitStatus; rerun later."
+    }
+    throw "Could not resolve the latest commit of https://github.com/$mnemosyneRepo (main). $hint The existing Mnemosyne environment was left untouched."
+}
+$mnemosyneArchive = "https://github.com/$mnemosyneRepo/archive/$mnemosyneCommit.zip"
+
+function Get-InstalledVersion {
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not (Test-Path -LiteralPath $venvPython)) { return $null }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $venvPython -c "import importlib.metadata as m; print(m.version('$Name'))" 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return ([string]($out | Select-Object -First 1)).Trim()
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+$oldVersion = Get-InstalledVersion -Name 'mnemosyne-memory'
 
 # Mirror the Unix script: a venv that exists but has no working python/pip, or
 # was built against a different Python, is rebuilt rather than patched.
@@ -374,8 +532,10 @@ if ((Test-Path -LiteralPath $mnemosyneVenv) -and (Test-Path -LiteralPath $venvPy
     Remove-Item -LiteralPath $mnemosyneVenv -Recurse -Force
 }
 
+$venvCreated = $false
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Step "Creating virtual environment at $mnemosyneVenv ..."
+    $venvCreated = $true
     if ($uvExe) {
         # --seed installs pip into the uv-created venv.
         Invoke-Native -FilePath $uvExe -What 'uv venv' -ArgumentList @('venv', $mnemosyneVenv, '--python', $hermesPyVersion, '--seed')
@@ -395,10 +555,10 @@ if ($venvPyVersion -ne $hermesPyVersion) {
 }
 
 if ($All) {
-    $package = 'mnemosyne-memory[all]'
+    $extras = '[all]'
     Write-Note 'Installing the [all] profile; llama-cpp-python compiles from source, so this takes a few minutes.'
 } elseif ($NoEmbeddings) {
-    $package = 'mnemosyne-memory'
+    $extras = ''
     # mnemosyne-hermes requires mnemosyne-memory[embeddings] outright, so pip
     # resolves the extra back in regardless of what is requested here. The only
     # thing that actually turns dense retrieval off is Mnemosyne's own runtime
@@ -407,7 +567,7 @@ if ($All) {
     Set-PersistentEnv -Name 'MNEMOSYNE_NO_EMBEDDINGS' -Value '1'
     Write-Ok 'Dense vector retrieval disabled via MNEMOSYNE_NO_EMBEDDINGS=1'
 } else {
-    $package = 'mnemosyne-memory[embeddings]'
+    $extras = '[embeddings]'
     # The flag is declarative: omitting it has to undo a previous -NoEmbeddings
     # run, or one flagged install would leave dense retrieval off forever.
     if ([Environment]::GetEnvironmentVariable('MNEMOSYNE_NO_EMBEDDINGS', 'User')) {
@@ -417,12 +577,30 @@ if ($All) {
     }
 }
 
-Write-Step 'Installing packages...'
+$memorySpec = "mnemosyne-memory$extras @ $mnemosyneArchive"
+$hermesSpec = "mnemosyne-hermes @ $mnemosyneArchive#subdirectory=integrations/hermes"
+
+Write-Step "Installing packages from $mnemosyneRepo main at $($mnemosyneCommit.Substring(0, 12))..."
 Invoke-Native -FilePath $venvPython -What 'pip install --upgrade pip' -ArgumentList @(
     '-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check', '--quiet', 'pip')
-Write-Note "Installing $package and mnemosyne-hermes (this can take a few minutes)..."
-Invoke-Native -FilePath $venvPython -What "pip install $package mnemosyne-hermes" -ArgumentList @(
-    '-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check', $package, 'mnemosyne-hermes')
+Write-Note "Installing mnemosyne-memory$extras and mnemosyne-hermes (this can take a few minutes)..."
+Invoke-Native -FilePath $venvPython -What "pip install mnemosyne-memory$extras mnemosyne-hermes" -ArgumentList @(
+    '-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check', $memorySpec, $hermesSpec)
+# pip skips a direct-URL package whose version is already installed, and main
+# keeps one version string across many commits, so --upgrade alone would leave
+# a re-run on the old commit. Force just these two; their dependencies were
+# resolved from this commit's metadata by the call above. A venv created in
+# this run already holds this commit.
+if (-not $venvCreated) {
+    Invoke-Native -FilePath $venvPython -What 'pip install --force-reinstall --no-deps mnemosyne-memory mnemosyne-hermes' -ArgumentList @(
+        '-m', 'pip', 'install', '--force-reinstall', '--no-deps', '--disable-pip-version-check', $memorySpec, $hermesSpec)
+}
+$newVersion = Get-InstalledVersion -Name 'mnemosyne-memory'
+if ($oldVersion -and $oldVersion -ne $newVersion) {
+    Write-Ok "mnemosyne-memory upgraded: $oldVersion -> $newVersion (commit $($mnemosyneCommit.Substring(0, 12)))"
+} else {
+    Write-Ok "mnemosyne-memory $newVersion (commit $($mnemosyneCommit.Substring(0, 12)))"
+}
 
 if (-not (Test-Path -LiteralPath $mnemosyneHermesExe)) { throw "mnemosyne-hermes was not installed at $mnemosyneHermesExe." }
 
@@ -445,21 +623,66 @@ Invoke-Native -FilePath $mnemosyneHermesExe -What 'mnemosyne-hermes install' -Ar
 
 # `hermes memory status` reports "available" from the registration alone, so it
 # stays green even when the embedding stack cannot load in Hermes' interpreter.
-# Import it the way the wrapper does and report what actually happens.
-if (-not $NoEmbeddings -and (Test-Path -LiteralPath $hermesVenvPython)) {
+# Import it the way the wrapper does, in isolated mode (-I) as Hermes launches
+# it, and report what actually happens.
+if (-not $NoEmbeddings) {
     $site = Join-Path $mnemosyneVenv 'Lib\site-packages'
-    $previousEA = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & $hermesVenvPython -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 | Out-Null
-    $embedProbe = $LASTEXITCODE
-    $ErrorActionPreference = $previousEA
-    if ($embedProbe -eq 0) {
+    function Test-EmbeddingStack {
+        $previousEA = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & $hermesPython -I -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 |
+                ForEach-Object { "$_" }
+            return @{ Ok = ($LASTEXITCODE -eq 0); Output = ($out -join "`n") }
+        } finally {
+            $ErrorActionPreference = $previousEA
+        }
+    }
+    $embed = Test-EmbeddingStack
+    # onnxruntime links against the Visual C++ runtime, which a fresh Windows does
+    # not ship. Installing it is the fix for both a missing and an outdated one,
+    # and the package has to match the interpreter's architecture.
+    $vcRedistId = 'Microsoft.VCRedist.2015+.x64'
+    $vcRedistCurrent = $false
+    if (-not $embed.Ok -and $embed.Output -match 'DLL load failed') {
+        # sysconfig names the interpreter's own build (win-amd64 / win-arm64 / win32);
+        # platform.machine() names the CPU, which differs under emulation.
+        $previousEA = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $pyPlatform = ([string](& $hermesPython -I -c 'import sysconfig; print(sysconfig.get_platform())' 2>$null |
+                Select-Object -First 1)).Trim()
+        } finally {
+            $ErrorActionPreference = $previousEA
+        }
+        $vcRedistId = switch ($pyPlatform) {
+            'win-arm64' { 'Microsoft.VCRedist.2015+.arm64' }
+            'win32' { 'Microsoft.VCRedist.2015+.x86' }
+            default { 'Microsoft.VCRedist.2015+.x64' }
+        }
+        Write-Note "onnxruntime cannot load its DLLs; installing the Visual C++ runtime it links against ($vcRedistId). This may ask for elevation."
+        try {
+            Install-WingetPackage -Id $vcRedistId -DisplayName "the Microsoft Visual C++ runtime ($pyPlatform)"
+            $vcRedistCurrent = ($script:LastNativeExit -eq -1978335189)
+            $embed = Test-EmbeddingStack
+        } catch {
+            Write-Warn "Could not install the Visual C++ runtime: $($_.Exception.Message)"
+        }
+    }
+    if ($embed.Ok) {
         Write-Ok "Verified: Hermes' interpreter can load the Mnemosyne embedding stack."
     } else {
         Write-Warn 'Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.'
         Write-Warn '  Memories will be stored without embeddings; semantic recall will not match.'
-        Write-Warn '  On Windows this is usually an outdated Visual C++ runtime. Install the'
-        Write-Warn '  latest x64 build:  winget install --id Microsoft.VCRedist.2015+.x64'
+        $reason = @($embed.Output -split "`n" | Where-Object { $_.Trim() }) | Select-Object -Last 1
+        if ($reason) { Write-Warn "  Python reported: $($reason.Trim())" }
+        if ($vcRedistCurrent) {
+            Write-Warn '  The Visual C++ runtime is already current, so the cause lies elsewhere;'
+            Write-Warn '  see docs/troubleshooting.md.'
+        } else {
+            Write-Warn '  On Windows this is usually a missing or outdated Visual C++ runtime:'
+            Write-Warn "    winget install --id $vcRedistId"
+        }
     }
 }
 

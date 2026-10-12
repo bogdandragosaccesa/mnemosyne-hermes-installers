@@ -1,6 +1,6 @@
 # Mnemosyne + Hermes installers
 
-Install and uninstall scripts for the [Mnemosyne](https://pypi.org/project/mnemosyne-memory/)
+Install and uninstall scripts for the [Mnemosyne](https://github.com/mnemosyne-oss/mnemosyne)
 memory provider on [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
 | Script | Platform |
@@ -13,6 +13,11 @@ memory provider on [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 Every installer bootstraps Hermes itself when it is missing, creates a dedicated virtual
 environment for Mnemosyne, registers the memory provider with Hermes, and points
 `memory.provider` at it. The Windows scripts are a port of the Unix ones.
+
+Mnemosyne is installed from the head of `main` in the official repository,
+[`mnemosyne-oss/mnemosyne`](https://github.com/mnemosyne-oss/mnemosyne), not from PyPI,
+which lags it. That is pre-release code, and two installs on different days can get
+different commits. See [Installation](docs/installation.md#where-mnemosyne-comes-from).
 
 ## Documentation
 
@@ -54,6 +59,7 @@ Linux / macOS:
 Windows:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this window only
 .\install-mnemosyne-hermes-windows.ps1
 ```
 
@@ -72,8 +78,11 @@ agent remembers, and the uninstallers switch it back on so removing Mnemosyne ca
 leave Hermes with no memory at all. See
 [Installation](docs/installation.md#the-built-in-memory-store).
 
-Re-running an installer is safe: it upgrades the packages in place, re-registers the
-provider, and rebuilds the virtual environment if it was built against the wrong Python.
+Re-running an installer reinstalls Mnemosyne from the current head of `main`, re-registers
+the provider, and rebuilds the virtual environment if it was built against the wrong Python.
+Coming from a PyPI install it moves you onto pre-release code and upgrades the memory
+database in place, so take a backup first — see
+[Upgrading from a PyPI install](docs/installation.md#upgrading-from-a-pypi-install).
 
 ## Uninstall
 
@@ -95,6 +104,7 @@ Linux / macOS:
 Windows:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this window only
 .\uninstall-mnemosyne-hermes-windows.ps1 -DryRun   # preview
 .\uninstall-mnemosyne-hermes-windows.ps1           # prompts before removing
 ```
@@ -130,9 +140,11 @@ services may depend on it.
 `hermes gateway restart` only restarts a service that has been registered with
 `hermes gateway install`. With no service registered it silently falls back to running
 the gateway in the **foreground**, where it never returns — which would hang the
-installer before it reached its verification steps. The Unix installer therefore runs
-`hermes gateway install` first, and bounds the restart with `timeout` where that
-command exists.
+installer before it reached its verification steps. The Unix scripts therefore never
+wait on it: they read whether a gateway is running from the state file the gateway
+itself writes, restart or start it in the background, and check that a gateway came up.
+The uninstaller brings back a gateway only if one was running when it started. See
+[How it works](docs/how-it-works.md#the-gateway).
 
 `--include-hermes` reverses this: it runs `hermes gateway uninstall` while the Hermes
 binary still exists, because removing `HERMES_HOME` first would strand the systemd unit
@@ -155,17 +167,19 @@ Both installers therefore:
 
 - read the version from Hermes' own interpreter and build the Mnemosyne venv against
   **that** version rather than a hardcoded one;
-- look for `uv` where Hermes vendors it (`HERMES_HOME/bin`) as well as on `PATH` —
-  missing it is what silently downgraded the Unix script to the system Python;
+- look for `uv` where Hermes vendors it (`HERMES_HOME/tools/uv-*`, or `HERMES_HOME/bin` on
+  older installs) as well as on `PATH` — missing it is what silently downgraded the Unix
+  script to the system Python;
 - rebuild an existing venv that was built against the wrong version;
 - abort with an explanation if the versions still differ;
 - after registering the provider, import `numpy` and `onnxruntime` through Hermes'
   interpreter and report whether the embedding stack actually loads.
 
 If you see `Hermes cannot import numpy/onnxruntime`, memories will be stored without
-embeddings. On Windows the usual cause is not a version mismatch but an outdated Visual
-C++ runtime — `onnxruntime` then fails with `DLL load failed ... initialization routine
-failed`. Fix it with:
+embeddings. On Windows the usual cause is not a version mismatch but a missing or outdated
+Visual C++ runtime — `onnxruntime` then fails with `DLL load failed`. A fresh Windows 11
+ships none, so when the import fails that way the installer installs it through winget
+and checks again. If that is refused (it needs elevation), install it yourself:
 
 ```powershell
 winget install --id Microsoft.VCRedist.2015+.x64
@@ -224,7 +238,8 @@ venv path is long; set `MNEMOSYNE_VENV` to something shorter if you hit it.
 Linux / macOS:
 
 - bash (the scripts are written for bash 3.2, so stock macOS works)
-- `sudo` rights, if `curl` or the Python `venv` module still need installing
+- `sudo` rights, if `curl`, `git` (needed by Hermes' own installer when Hermes is missing)
+  or the Python `venv` module still need installing
 
 Windows:
 

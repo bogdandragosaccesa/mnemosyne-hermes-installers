@@ -40,12 +40,21 @@ Hermes imports Mnemosyne in-process, so the two must run the same Python minor v
 see [How it works](how-it-works.md#why-the-python-version-has-to-match). Check:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python --version
+hermes --print-runtime-command   # JSON; the first element is Hermes' interpreter
+<that interpreter> --version
 ~/.mnemosyne-venv/bin/python --version
 ```
 
+Launchers without `--print-runtime-command` print their Python in `hermes --version`
+(`Python: 3.14.7`); the interpreter is the `.venv` or `venv` in the `Install directory:` it
+names, or `~/.hermes/hermes-agent/venv/bin/python` on old installs.
+
 If they differ, re-run the installer; it rebuilds the environment against Hermes'
-version. Versions before 1.0.0 could produce this silently when `uv` was not on `PATH`.
+version. Versions before 1.0.0 could produce this silently when `uv` was not on `PATH`,
+and the installers in 1.1.0 and earlier always did on current Hermes, which no longer
+has that venv. The installers now stop with `could not find the Python interpreter Hermes
+runs on` instead of guessing; set `MNEMOSYNE_HERMES_PYTHON` to Hermes' interpreter if
+detection fails.
 
 ### `onnxruntime` DLL load failed on Windows
 
@@ -54,8 +63,11 @@ ImportError: DLL load failed while importing onnxruntime_pybind11_state:
 A dynamic link library (DLL) initialization routine failed.
 ```
 
-The Visual C++ runtime is too old. `onnxruntime` needs a recent x64 redistributable, and
-some Windows Server images ship 14.29 (2019-era), which is not enough. Check and fix:
+or, on a machine with no runtime at all, `The specified module could not be found.`
+
+The Visual C++ runtime is missing or too old. A fresh Windows 11 has none, and some Windows
+Server images ship 14.29 (2019-era), which is not enough. The installer installs it through
+winget when it sees this error; if that failed (it needs elevation), check and fix:
 
 ```powershell
 (Get-Item "$env:WINDIR\System32\vcruntime140.dll").VersionInfo.FileVersion
@@ -74,6 +86,15 @@ registering the service first. If you hit it on an older copy:
 ```bash
 hermes gateway install     # then re-run the installer
 ```
+
+The Unix **uninstaller** had the same hang at "Restarting the Hermes gateway..." when no
+gateway service was registered, for example after installing with
+`--skip-hermes-configuration`. Neither script waits on `hermes gateway restart` any more:
+they read the gateway's own `gateway_state.json`, start or restart it in the background and
+check that a gateway came up, logging their steps to
+`HERMES_HOME/logs/mnemosyne-installer-gateway.log`. The uninstaller brings the gateway back
+only if one was running when it started. If a gateway does not come back, look there and
+in `HERMES_HOME/logs/gateway.log`, then run `hermes gateway start`.
 
 ## `mnemosyne-hermes install` fails with "already exists"
 
@@ -109,6 +130,7 @@ and re-run:
 
 ```powershell
 $env:MNEMOSYNE_VENV = 'C:\mnemosyne-venv'
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\install-mnemosyne-hermes-windows.ps1
 ```
 

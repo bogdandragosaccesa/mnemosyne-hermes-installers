@@ -57,9 +57,23 @@ interpreter, build against that, rebuild an environment built against anything e
 abort if a mismatch remains, and then prove the result by importing `numpy` and
 `onnxruntime` through Hermes' interpreter.
 
-Note that `uv` is easy to miss. Hermes vendors its own at `HERMES_HOME/bin`, which is on
-`PATH` on Windows but **not** on Unix. Missing it is what silently downgraded the Unix
-installer to the system Python.
+Note that `uv` is easy to miss. Hermes vendors its own under `HERMES_HOME/tools/uv-*`
+(`HERMES_HOME/bin` on older installs), which is not on `PATH`. Missing it is what silently
+downgraded the Unix installer to the system Python, and on Windows it made the installer
+fetch a second uv from winget.
+
+Finding Hermes' interpreter is the other half. Current Hermes has no virtual environment
+inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its
+launcher reports that interpreter through `hermes --print-runtime-command`, a JSON array
+whose first element is the interpreter path. The installers ask that first. Launchers
+without the flag — older installs, and the official Docker image, which runs Hermes from
+`/opt/hermes/.venv` — still answer `hermes --version`, which prints the Python Hermes runs
+(`Python: 3.14.7`) and its `Install directory:`. The installers then use the `.venv` or
+`venv` there, or the old `HERMES_HOME/hermes-agent/venv`, **only if its version is the one
+Hermes reports**, and say so; a leftover venv of another version is never adopted. A
+launcher that hangs (60-second bound) or names an interpreter that does not exist is an
+error. When nothing answers they stop rather than guess a version, and
+`MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
 
 ## The gateway
 
@@ -68,9 +82,29 @@ The two platforms differ enough to matter.
 **Linux/macOS** — `hermes gateway install` registers a systemd user unit or a launchd
 agent. Without that, `hermes gateway restart` falls back to running the gateway in the
 **foreground**, where it never returns. An installer that calls `restart` on an
-unregistered gateway therefore hangs forever. The installer registers the service first,
-and bounds the restart with `timeout`, or `gtimeout` where Homebrew's coreutils provided
-it under that name.
+unregistered gateway therefore hangs forever, and `stop`'s output does not say whether a
+gateway was running (with a unit installed it reports "Stopped" either way).
+
+So the scripts read gateway state from `HERMES_HOME/gateway_state.json`, which the gateway
+process writes itself under every manager: its `gateway_state`, PID and start time. Like
+Hermes (`gateway/status.py`), they trust the PID only if it is alive, has the recorded start
+time (Linux), and its arguments are `gateway run` or `gateway restart` — a gateway killed
+outside Hermes leaves `running` behind with a dead PID that may since have been reused. A
+gateway in any state but `stopped` / `startup_failed` counts as **up**; one in `running`,
+`degraded` or `draining` counts as **serving**.
+
+The installer registers the service where Hermes allows one (it refuses inside
+containers), then **restarts** an up gateway — `restart` detached, judged by a new serving
+PID within 90 seconds, so a busy gateway draining its turns is reported as in progress
+rather than failed — or **starts** a stopped one. The uninstaller remembers whether a
+gateway was up, stops it and waits for that process to exit, and at the end brings one back
+only if it was: with `hermes gateway start`, which goes through systemd (user or system
+scope), launchd or s6, or — if the old gateway would not stop — with a restart, since it
+still has the removed provider loaded. When no manager brings a gateway up within 60 seconds
+the scripts run `hermes gateway run` detached (output in Hermes' own `logs/gateway.log`),
+except under s6, where that command only hands back to s6. Their own steps are logged to
+`HERMES_HOME/logs/mnemosyne-installer-gateway.log` (`logs/gateway-restart.log` belongs to
+Hermes' dashboard), or nowhere if that file cannot be written.
 
 Both names are **profile-scoped**, which is why the uninstaller matches them by glob
 rather than by one fixed name:

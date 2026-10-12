@@ -61,6 +61,112 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   settings at clone time are what every profile is created with — ordering that is
   invisible until it is wrong.
 
+### Changed
+
+- Mnemosyne is installed from the head of `main` in
+  [`mnemosyne-oss/mnemosyne`](https://github.com/mnemosyne-oss/mnemosyne) instead of from
+  PyPI. The installers resolve the commit through the GitHub API and install
+  `mnemosyne-memory` and `mnemosyne-hermes` from that commit's source archive, so both
+  packages always come from the same commit (`mnemosyne-hermes` on `main` requires the
+  matching `mnemosyne-memory`, which PyPI may not have yet). pip skips a direct-URL
+  package whose version is already installed, so a `--force-reinstall --no-deps` of the
+  two packages follows the normal install; without it a re-run would stay on the old
+  commit, because `main` keeps one version string across many commits.
+  **Upgrade note:** an environment installed from PyPI moves from the stable 3.x to the
+  pre-release on `main`, and the memory database is upgraded in place with no downgrade
+  path; run `mnemosyne backup` first. The installers print the change
+  (`mnemosyne-memory upgraded: 3.15.1 -> 4.0.0b5`). See
+  [Upgrading from a PyPI install](docs/installation.md#upgrading-from-a-pypi-install).
+- When Hermes' interpreter cannot be found, the installers now stop instead of assuming
+  Python 3.11, which would have built an environment Hermes cannot load embeddings from.
+  `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly (not `HERMES_PYTHON`, which
+  Hermes' own tooling sets to unrelated interpreters).
+- The upstream commit is resolved before the virtual environment is touched, so a GitHub
+  API failure leaves an existing install working. Rate limiting is reported as such, and
+  `GITHUB_TOKEN` / `GH_TOKEN` are sent when set.
+- The embedding check runs Hermes' interpreter with `-I`, as Hermes launches it, so it no
+  longer passes on the strength of `PYTHONPATH` or user site-packages.
+- Hermes' bundled `uv` is preferred over one on `PATH` on both platforms, the newest
+  version wins when several are present, and `HERMES_RUNTIME_DIR` is honoured.
+- The Windows `hermes --print-runtime-command` call is bounded to 60 seconds, like the
+  Unix one, and only the JSON line of its output is parsed.
+- The Visual C++ runtime step installs the package matching the interpreter's
+  architecture (x64, arm64 or x86), says it may ask for elevation, and quotes Python's
+  actual import error when the stack still does not load.
+- A virtual environment created in the same run skips the redundant `--force-reinstall`.
+- The documented `Set-ExecutionPolicy -Scope Process` lines now pass `-Force`, which skips
+  Windows PowerShell 5.1's confirmation prompt.
+- A `GITHUB_TOKEN` / `GH_TOKEN` that GitHub answers with 401, 403 or 429 no longer blocks
+  the install: the installers retry the commit lookup without it. An HTTP 200 without a
+  commit id (a proxy or captive portal) is named as such.
+- Launchers without `--print-runtime-command` — older installs and the official Docker
+  image (`nousresearch/hermes-agent`, which runs Hermes from `/opt/hermes/.venv`) — are
+  handled through `hermes --version`, which reports the Python Hermes runs and its install
+  directory: a `.venv`/`venv` there, or the old `hermes-agent/venv`, is used only if its
+  version matches what Hermes reports, and that is announced. Before, the Docker image could
+  not be installed into at all, and a leftover venv could be adopted unchecked. A timeout or
+  an unusable answer is an error, each failure says what happened, an unrunnable
+  `MNEMOSYNE_HERMES_PYTHON` is reported as that, and both platforms accept the launcher's
+  JSON line whatever its exit code.
+- Windows: the Visual C++ runtime is chosen from `sysconfig.get_platform()` (the
+  interpreter's own build) rather than `platform.machine()` (the CPU); the timeout path's
+  `taskkill` can no longer abort the installer under PowerShell 5.1, and the process is
+  reaped before its temp files are deleted.
+
+### Fixed
+
+- **The Unix uninstaller hung forever without a registered gateway service, and the first
+  two fixes for it mishandled gateways.** `hermes gateway restart` runs the gateway in the
+  foreground when no service manager owns it. Detecting unit files missed system-scope,
+  `XDG_CONFIG_HOME` and s6 gateways; reading `stop`'s message started stopped services
+  (it says "Stopped" whenever a unit exists) and left s6 gateways down (`restart` there
+  only signals). Both Unix scripts now read the gateway's own `gateway_state.json` and
+  verify its PID the way Hermes does — alive (`kill -0`, `/proc`; no `ps` needed), same
+  start time on Linux, arguments `gateway run`/`restart` — so a gateway killed outside
+  Hermes, whose dead PID may have been reused, is not mistaken for a running one. Every
+  state but `stopped`/`startup_failed` counts as up. The uninstaller brings a gateway back
+  only if one was up: with `hermes gateway start` (systemd, launchd, s6), falling back to a
+  detached `hermes gateway run` except under s6, or with a restart if the old gateway would
+  not stop; the old PID never counts as "came back". The installer restarts an up gateway
+  and judges success by a new gateway PID, so a busy gateway draining its turns is reported
+  as in progress. The stop is bounded at 120 seconds, above Hermes' own 90-second stop wait.
+  The scripts log to `logs/mnemosyne-installer-gateway.log` (appended, rotated at 1 MB, and
+  skipped rather than fatal when unwritable); an earlier revision truncated
+  `logs/gateway-restart.log`, which belongs to Hermes' dashboard. Found by end-to-end runs
+  in an `ubuntu:24.04` arm64 container, a systemd VM and Hermes' s6 image, and by review.
+- **The Unix installer could not bootstrap Hermes on a minimal system.** Hermes' own
+  installer refuses to run without `git`, which container and cloud server images do not
+  ship; the installer now installs it first when Hermes is missing.
+- **On current Hermes the virtual environment was built against the wrong Python.** The
+  installers read Hermes' version from `HERMES_HOME/hermes-agent/venv`, which current
+  Hermes no longer creates — it runs from a managed interpreter under `HERMES_HOME/tools`.
+  They warned `could not determine Hermes' Python version`, fell back to 3.11 and built
+  the environment for that while Hermes ran 3.14, so `numpy` / `onnxruntime` could not
+  load in-process and every memory was stored without an embedding. The installers now
+  ask the launcher (`hermes --print-runtime-command`) for its interpreter and keep the
+  old venv path as a fallback for older installs. The Windows bootstrap also looks for a
+  freshly installed `hermes` in `HERMES_HOME\bin`, where current Hermes publishes it.
+- **The Windows installer always aborted under Windows PowerShell 5.1.** It read Python
+  versions with `python -c 'print("%d.%d" % ...)'`, and Windows PowerShell 5.1 strips
+  embedded double quotes from native arguments, so Python got a syntax error and every
+  version read came back empty — Hermes' as well as the venv's — ending in
+  `Python version mismatch: Hermes runs 3.11 but the Mnemosyne environment is .`. The probe
+  now uses single quotes only. PowerShell 7.3+ passes the quotes through, which hid this.
+  Found by an end-to-end run on a fresh Windows 11 25H2 VM.
+- **Hermes' vendored `uv` was missed.** Current Hermes keeps it under
+  `HERMES_HOME/tools/uv-<version>-<platform>/`, not `HERMES_HOME/bin`, so the Windows
+  installer fetched a second `uv` from winget. Both installers now look there first.
+- **The documented Windows commands failed on a fresh machine.** A Windows client's default
+  execution policy refuses every `.ps1`; the docs now start each block with
+  `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, and show a ZIP download for
+  machines without `git`.
+- **On a fresh Windows, embeddings never loaded.** A fresh Windows 11 has no Visual C++
+  runtime, so `onnxruntime` failed with `DLL load failed` inside Hermes and every memory was
+  stored without a vector; the installer only warned. It had worked by accident while the
+  installer was fetching `uv` from winget, whose package depends on the runtime. The
+  installer now installs `Microsoft.VCRedist.2015+.x64` through winget when the import fails
+  that way, then checks again.
+
 ## [1.1.0] - 2026-08-14
 
 ### Added
