@@ -1,6 +1,6 @@
 # Mnemosyne + Hermes installers
 
-Install and uninstall scripts for the [Mnemosyne](https://pypi.org/project/mnemosyne-memory/)
+Install and uninstall scripts for the [Mnemosyne](https://github.com/mnemosyne-oss/mnemosyne)
 memory provider on [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
 | Script | Platform |
@@ -13,6 +13,11 @@ memory provider on [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 Every installer bootstraps Hermes itself when it is missing, creates a dedicated virtual
 environment for Mnemosyne, registers the memory provider with Hermes, and points
 `memory.provider` at it. The Windows scripts are a port of the Unix ones.
+
+Mnemosyne is installed from the head of `main` in the official repository,
+[`mnemosyne-oss/mnemosyne`](https://github.com/mnemosyne-oss/mnemosyne), not from PyPI,
+which lags it. That is pre-release code, and two installs on different days can get
+different commits. See [Installation](docs/installation.md#where-mnemosyne-comes-from).
 
 ## Documentation
 
@@ -72,8 +77,9 @@ agent remembers, and the uninstallers switch it back on so removing Mnemosyne ca
 leave Hermes with no memory at all. See
 [Installation](docs/installation.md#the-built-in-memory-store).
 
-Re-running an installer is safe: it upgrades the packages in place, re-registers the
-provider, and rebuilds the virtual environment if it was built against the wrong Python.
+Re-running an installer is safe: it reinstalls Mnemosyne from the current head of `main`,
+re-registers the provider, and rebuilds the virtual environment if it was built against the
+wrong Python.
 
 ## Uninstall
 

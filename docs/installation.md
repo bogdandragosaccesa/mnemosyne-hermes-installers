@@ -97,15 +97,42 @@ tool surface down with it.
 2. Resolves a Python interpreter matching the one Hermes runs — see
    [How it works](how-it-works.md#why-the-python-version-has-to-match).
 3. Creates a dedicated virtual environment (default `~/.mnemosyne-venv`).
-4. Installs `mnemosyne-memory[embeddings]` and `mnemosyne-hermes` into it.
+4. Installs `mnemosyne-memory[embeddings]` and `mnemosyne-hermes` into it, both from the
+   current head of `main` in the official repository — see
+   [below](#where-mnemosyne-comes-from).
 5. Registers the provider with Hermes in `wrapper` mode.
 6. Imports `numpy` and `onnxruntime` through Hermes' interpreter and reports whether the
    embedding stack loads.
 7. Sets `memory.provider` to `mnemosyne` and restarts the gateway.
 8. Prints `hermes memory status` and `mnemosyne stats`.
 
-Re-running is safe. Packages are upgraded in place, the provider is re-registered, and a
-virtual environment built against the wrong Python is rebuilt.
+Re-running is safe. Mnemosyne is reinstalled from whatever `main` is at that moment, the
+provider is re-registered, and a virtual environment built against the wrong Python is
+rebuilt.
+
+## Where Mnemosyne comes from
+
+The installers do not use PyPI. They ask the GitHub API for the commit at the head of
+`main` in [`mnemosyne-oss/mnemosyne`](https://github.com/mnemosyne-oss/mnemosyne) and
+install both packages from that commit's source archive:
+
+```text
+mnemosyne-memory[embeddings] @ https://github.com/mnemosyne-oss/mnemosyne/archive/<sha>.zip
+mnemosyne-hermes @ https://github.com/mnemosyne-oss/mnemosyne/archive/<sha>.zip#subdirectory=integrations/hermes
+```
+
+- **Why not PyPI.** PyPI lags `main`, and `mnemosyne-hermes` on `main` requires the
+  `mnemosyne-memory` version released alongside it, which may not be on PyPI yet.
+  Installing both from one commit keeps them consistent.
+- **What you get.** Whatever `main` was when the installer ran — usually a pre-release
+  version such as `4.0.0b5`. The installer prints the commit it used.
+- **No `git` needed.** pip downloads the archive over HTTPS.
+- **Re-runs.** `main` keeps one version string across many commits, and pip will not
+  reinstall a version it already has, so the installers follow the normal install with
+  a `--force-reinstall --no-deps` of just these two packages. A re-run always ends on the
+  current commit.
+- **Network.** `api.github.com` and `github.com` must be reachable. If the commit cannot
+  be resolved the installer stops before touching the virtual environment's packages.
 
 ## Paths and overrides
 

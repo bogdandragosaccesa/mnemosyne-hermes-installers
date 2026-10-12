@@ -61,6 +61,13 @@ Note that `uv` is easy to miss. Hermes vendors its own at `HERMES_HOME/bin`, whi
 `PATH` on Windows but **not** on Unix. Missing it is what silently downgraded the Unix
 installer to the system Python.
 
+Finding Hermes' interpreter is the other half. Current Hermes has no virtual environment
+inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its
+launcher reports that interpreter through `hermes --print-runtime-command`, a JSON array
+whose first element is the interpreter path. The installers ask that first and fall back
+to `HERMES_HOME/hermes-agent/venv` for older installs. When neither answers they warn and
+assume 3.11.
+
 ## The gateway
 
 The two platforms differ enough to matter.

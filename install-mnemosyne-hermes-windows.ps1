@@ -240,14 +240,14 @@ if (-not (Test-Command 'hermes')) {
         Remove-Item -LiteralPath $bootstrap -Force -ErrorAction SilentlyContinue
     }
     Update-SessionPath
-    # The installer adds <HERMES_HOME>\hermes-agent\bin to the User PATH, but a
-    # freshly written value is not always visible yet; look there directly too.
+    # The installer adds its bin directory to the User PATH, but a freshly
+    # written value is not always visible yet; look there directly too.
     if (-not (Test-Command 'hermes')) {
         $candidateHome = $env:HERMES_HOME
         if (-not $candidateHome) { $candidateHome = Join-Path $env:LOCALAPPDATA 'hermes' }
-        foreach ($rel in @('hermes-agent\bin', 'hermes-agent\venv\Scripts')) {
+        foreach ($rel in @('bin', 'hermes-agent\bin', 'hermes-agent\venv\Scripts')) {
             $probe = Join-Path $candidateHome $rel
-            if (Test-Path -LiteralPath (Join-Path $probe 'hermes.exe')) {
+            if ((Test-Path -LiteralPath (Join-Path $probe 'hermes.exe')) -or (Test-Path -LiteralPath (Join-Path $probe 'hermes.cmd'))) {
                 $env:Path = "$probe;$env:Path"
                 break
             }
@@ -340,13 +340,41 @@ $mnemosyneCliExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne.exe'
 # version, and a mismatch fails quietly: the provider still registers and
 # keyword recall still works, but embeddings never load, so memories are stored
 # without vectors and semantic recall can never match them.
-$hermesVenvPython = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
-$hermesPyVersion = Get-PyMinorVersion -PythonPath $hermesVenvPython
+#
+# Current Hermes runs from a managed "store" Python and reports it through its
+# launcher's --print-runtime-command: a JSON argv whose first element is the
+# interpreter that owns the ABI. Older installs kept a venv inside the checkout
+# and do not know the flag. The JSON is ASCII (Python escapes non-ASCII paths),
+# so the console code page cannot mangle it.
+function Resolve-HermesPython {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = $null | & $hermesExe --print-runtime-command 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -eq 0 -and $out) {
+        try {
+            $python = @((($out -join "`n") | ConvertFrom-Json))[0]
+            if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
+        } catch {
+            Write-Note "hermes --print-runtime-command returned no usable JSON: $($_.Exception.Message)"
+        }
+    }
+    $legacy = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $legacy -PathType Leaf) { return $legacy }
+    return $null
+}
+$hermesPython = Resolve-HermesPython
+$hermesPyVersion = $null
+if ($hermesPython) { $hermesPyVersion = Get-PyMinorVersion -PythonPath $hermesPython }
 if (-not $hermesPyVersion) {
     Write-Warn "Could not determine Hermes' Python version; falling back to 3.11."
     $hermesPyVersion = '3.11'
 } else {
-    Write-Ok "Hermes runs Python $hermesPyVersion; matching it."
+    Write-Ok "Hermes runs Python $hermesPyVersion ($hermesPython); matching it."
 }
 
 # Mirror the Unix script: a venv that exists but has no working python/pip, or
@@ -394,11 +422,28 @@ if ($venvPyVersion -ne $hermesPyVersion) {
         "stored without embeddings. Install a Python $hermesPyVersion interpreter (or uv) and rerun.")
 }
 
+# Install from the official repository's main branch rather than PyPI, which
+# lags it. Both packages come from one commit: mnemosyne-hermes on main requires
+# the mnemosyne-memory version that ships beside it. The commit is pinned in the
+# archive URL, so a re-run picks up whatever main has moved on to.
+$mnemosyneRepo = 'mnemosyne-oss/mnemosyne'
+$mnemosyneCommit = ''
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $mnemosyneCommit = [string](Invoke-RestMethod -Uri "https://api.github.com/repos/$mnemosyneRepo/commits/main").sha
+} catch {
+    Write-Warn "GitHub API request failed: $($_.Exception.Message)"
+}
+if ($mnemosyneCommit -notmatch '^[0-9a-f]{40}$') {
+    throw "Could not resolve the latest commit of https://github.com/$mnemosyneRepo (main). Check that api.github.com is reachable and rerun."
+}
+$mnemosyneArchive = "https://github.com/$mnemosyneRepo/archive/$mnemosyneCommit.zip"
+
 if ($All) {
-    $package = 'mnemosyne-memory[all]'
+    $extras = '[all]'
     Write-Note 'Installing the [all] profile; llama-cpp-python compiles from source, so this takes a few minutes.'
 } elseif ($NoEmbeddings) {
-    $package = 'mnemosyne-memory'
+    $extras = ''
     # mnemosyne-hermes requires mnemosyne-memory[embeddings] outright, so pip
     # resolves the extra back in regardless of what is requested here. The only
     # thing that actually turns dense retrieval off is Mnemosyne's own runtime
@@ -407,7 +452,7 @@ if ($All) {
     Set-PersistentEnv -Name 'MNEMOSYNE_NO_EMBEDDINGS' -Value '1'
     Write-Ok 'Dense vector retrieval disabled via MNEMOSYNE_NO_EMBEDDINGS=1'
 } else {
-    $package = 'mnemosyne-memory[embeddings]'
+    $extras = '[embeddings]'
     # The flag is declarative: omitting it has to undo a previous -NoEmbeddings
     # run, or one flagged install would leave dense retrieval off forever.
     if ([Environment]::GetEnvironmentVariable('MNEMOSYNE_NO_EMBEDDINGS', 'User')) {
@@ -417,12 +462,21 @@ if ($All) {
     }
 }
 
-Write-Step 'Installing packages...'
+$memorySpec = "mnemosyne-memory$extras @ $mnemosyneArchive"
+$hermesSpec = "mnemosyne-hermes @ $mnemosyneArchive#subdirectory=integrations/hermes"
+
+Write-Step "Installing packages from $mnemosyneRepo main at $($mnemosyneCommit.Substring(0, 12))..."
 Invoke-Native -FilePath $venvPython -What 'pip install --upgrade pip' -ArgumentList @(
     '-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check', '--quiet', 'pip')
-Write-Note "Installing $package and mnemosyne-hermes (this can take a few minutes)..."
-Invoke-Native -FilePath $venvPython -What "pip install $package mnemosyne-hermes" -ArgumentList @(
-    '-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check', $package, 'mnemosyne-hermes')
+Write-Note "Installing mnemosyne-memory$extras and mnemosyne-hermes (this can take a few minutes)..."
+Invoke-Native -FilePath $venvPython -What "pip install mnemosyne-memory$extras mnemosyne-hermes" -ArgumentList @(
+    '-m', 'pip', 'install', '--upgrade', '--disable-pip-version-check', $memorySpec, $hermesSpec)
+# pip skips a direct-URL package whose version is already installed, and main
+# keeps one version string across many commits, so --upgrade alone would leave
+# a re-run on the old commit. Force just these two; their dependencies were
+# resolved from this commit's metadata by the call above.
+Invoke-Native -FilePath $venvPython -What 'pip install --force-reinstall mnemosyne-memory mnemosyne-hermes' -ArgumentList @(
+    '-m', 'pip', 'install', '--force-reinstall', '--no-deps', '--disable-pip-version-check', $memorySpec, $hermesSpec)
 
 if (-not (Test-Path -LiteralPath $mnemosyneHermesExe)) { throw "mnemosyne-hermes was not installed at $mnemosyneHermesExe." }
 
@@ -446,11 +500,11 @@ Invoke-Native -FilePath $mnemosyneHermesExe -What 'mnemosyne-hermes install' -Ar
 # `hermes memory status` reports "available" from the registration alone, so it
 # stays green even when the embedding stack cannot load in Hermes' interpreter.
 # Import it the way the wrapper does and report what actually happens.
-if (-not $NoEmbeddings -and (Test-Path -LiteralPath $hermesVenvPython)) {
+if (-not $NoEmbeddings -and $hermesPython) {
     $site = Join-Path $mnemosyneVenv 'Lib\site-packages'
     $previousEA = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & $hermesVenvPython -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 | Out-Null
+    & $hermesPython -c "import sys; sys.path.insert(0, r'$site'); import numpy, onnxruntime" 2>&1 | Out-Null
     $embedProbe = $LASTEXITCODE
     $ErrorActionPreference = $previousEA
     if ($embedProbe -eq 0) {

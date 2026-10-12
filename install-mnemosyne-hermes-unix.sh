@@ -112,7 +112,21 @@ esac
 VENV_PYTHON="$MNEMOSYNE_VENV/bin/python"
 MNEMOSYNE_HERMES="$MNEMOSYNE_VENV/bin/mnemosyne-hermes"
 MNEMOSYNE_CLI="$MNEMOSYNE_VENV/bin/mnemosyne"
-HERMES_VENV_PYTHON="$HERMES_HOME/hermes-agent/venv/bin/python"
+# Current Hermes runs from a managed "store" Python and reports it through its
+# launcher's --print-runtime-command: a JSON argv whose first element is the
+# interpreter that owns the ABI. Older installs kept a venv inside the checkout
+# and do not know the flag. The JSON is read with sed, so only a plain first
+# element is accepted; an escaped one (quote, backslash, non-ASCII) is a miss.
+resolve_hermes_python() {
+    local out python
+    out="$(run_bounded 60 hermes --print-runtime-command </dev/null 2>/dev/null || true)"
+    python="$(printf '%s\n' "$out" | sed -n 's/^\["\([^"\\]*\)".*/\1/p')"
+    if [[ -n "$python" && -x "$python" ]]; then printf '%s\n' "$python"; return 0; fi
+    python="$HERMES_HOME/hermes-agent/venv/bin/python"
+    if [[ -x "$python" ]]; then printf '%s\n' "$python"; return 0; fi
+    return 1
+}
+HERMES_PYTHON="$(resolve_hermes_python || true)"
 
 py_minor_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true; }
 
@@ -123,7 +137,7 @@ py_minor_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])'
 # losing embeddings. Match Hermes' interpreter, and refuse to proceed if we
 # cannot.
 HERMES_PY_VERSION=""
-if [[ -x "$HERMES_VENV_PYTHON" ]]; then HERMES_PY_VERSION="$(py_minor_version "$HERMES_VENV_PYTHON")"; fi
+if [[ -n "$HERMES_PYTHON" ]]; then HERMES_PY_VERSION="$(py_minor_version "$HERMES_PYTHON")"; fi
 if [[ -z "$HERMES_PY_VERSION" ]]; then
     echo "Warning: could not determine Hermes' Python version; falling back to 3.11." >&2
     HERMES_PY_VERSION='3.11'
@@ -153,8 +167,8 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
     if [[ -n "$UV_BIN" ]]; then
         # --seed installs pip into the uv-created venv.
         "$UV_BIN" venv "$MNEMOSYNE_VENV" --python "$HERMES_PY_VERSION" --seed
-    elif [[ -x "$HERMES_VENV_PYTHON" ]] && "$HERMES_VENV_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
-        "$HERMES_VENV_PYTHON" -m venv "$MNEMOSYNE_VENV"
+    elif [[ -n "$HERMES_PYTHON" ]] && "$HERMES_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
+        "$HERMES_PYTHON" -m venv "$MNEMOSYNE_VENV"
     else
         python3 -m venv "$MNEMOSYNE_VENV"
     fi
@@ -164,7 +178,7 @@ MNEMOSYNE_PY_VERSION="$(py_minor_version "$VENV_PYTHON")"
 if [[ "$MNEMOSYNE_PY_VERSION" != "$HERMES_PY_VERSION" ]]; then
     cat >&2 <<EOF
 ERROR: Python version mismatch between Hermes and the Mnemosyne environment.
-  Hermes:    $HERMES_PY_VERSION  ($HERMES_VENV_PYTHON)
+  Hermes:    $HERMES_PY_VERSION  (${HERMES_PYTHON:-interpreter not found})
   Mnemosyne: ${MNEMOSYNE_PY_VERSION:-unknown}  ($VENV_PYTHON)
 Hermes imports Mnemosyne in-process, so compiled wheels built for
 $MNEMOSYNE_PY_VERSION cannot load under $HERMES_PY_VERSION. Memories would be stored
@@ -173,17 +187,38 @@ Install a Python $HERMES_PY_VERSION interpreter (or uv) and re-run.
 EOF
     exit 1
 fi
+# Install from the official repository's main branch rather than PyPI, which
+# lags it. Both packages come from one commit: mnemosyne-hermes on main requires
+# the mnemosyne-memory version that ships beside it. The commit is pinned in the
+# archive URL, so a re-run picks up whatever main has moved on to.
+MNEMOSYNE_REPO='mnemosyne-oss/mnemosyne'
+MNEMOSYNE_COMMIT="$(curl -fsSL -H 'Accept: application/vnd.github.sha' \
+    "https://api.github.com/repos/$MNEMOSYNE_REPO/commits/main")" || MNEMOSYNE_COMMIT=''
+if [[ ! "$MNEMOSYNE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: could not resolve the latest commit of https://github.com/$MNEMOSYNE_REPO (main)." >&2
+    echo 'Check that api.github.com is reachable and re-run.' >&2
+    exit 1
+fi
+MNEMOSYNE_ARCHIVE="https://github.com/$MNEMOSYNE_REPO/archive/$MNEMOSYNE_COMMIT.zip"
 if (( ALL_EXTRAS )); then
-    PACKAGE='mnemosyne-memory[all]'
+    EXTRAS='[all]'
 elif (( NO_EMBEDDINGS )); then
-    PACKAGE='mnemosyne-memory'
+    EXTRAS=''
     echo 'Note: mnemosyne-hermes depends on mnemosyne-memory[embeddings], so the extras are'
     echo '      installed regardless. Dense retrieval is disabled via MNEMOSYNE_NO_EMBEDDINGS=1.'
 else
-    PACKAGE='mnemosyne-memory[embeddings]'
+    EXTRAS='[embeddings]'
 fi
+MEMORY_SPEC="mnemosyne-memory$EXTRAS @ $MNEMOSYNE_ARCHIVE"
+HERMES_SPEC="mnemosyne-hermes @ $MNEMOSYNE_ARCHIVE#subdirectory=integrations/hermes"
+echo "Installing Mnemosyne from $MNEMOSYNE_REPO main at ${MNEMOSYNE_COMMIT:0:12}"
 "$VENV_PYTHON" -m pip install --upgrade pip
-"$VENV_PYTHON" -m pip install --upgrade "$PACKAGE" mnemosyne-hermes
+"$VENV_PYTHON" -m pip install --upgrade "$MEMORY_SPEC" "$HERMES_SPEC"
+# pip skips a direct-URL package whose version is already installed, and main
+# keeps one version string across many commits, so --upgrade alone would leave
+# a re-run on the old commit. Force just these two; their dependencies were
+# resolved from this commit's metadata by the line above.
+"$VENV_PYTHON" -m pip install --force-reinstall --no-deps "$MEMORY_SPEC" "$HERMES_SPEC"
 # --force is required for re-runs: without it this errors out with "already
 # exists" as soon as the plugin directory is there, which would both break
 # re-running the installer and leave the wrapper pointing at a stale
@@ -193,9 +228,9 @@ fi
 # `hermes memory status` reports "available" purely from the registration, so it
 # stays green even when the embedding stack cannot load in Hermes' interpreter.
 # Import it the way the wrapper does and say so plainly.
-if (( ! NO_EMBEDDINGS )) && [[ -x "$HERMES_VENV_PYTHON" ]]; then
+if (( ! NO_EMBEDDINGS )) && [[ -n "$HERMES_PYTHON" ]]; then
     MNEMOSYNE_SITE="$MNEMOSYNE_VENV/lib/python$HERMES_PY_VERSION/site-packages"
-    if "$HERMES_VENV_PYTHON" -c "import sys; sys.path.insert(0, '$MNEMOSYNE_SITE'); import numpy, onnxruntime" >/dev/null 2>&1; then
+    if "$HERMES_PYTHON" -c "import sys; sys.path.insert(0, '$MNEMOSYNE_SITE'); import numpy, onnxruntime" >/dev/null 2>&1; then
         echo "Verified: Hermes' interpreter can load the Mnemosyne embedding stack."
     else
         echo 'Warning: Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.' >&2

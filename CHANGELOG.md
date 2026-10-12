@@ -61,6 +61,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   settings at clone time are what every profile is created with — ordering that is
   invisible until it is wrong.
 
+### Changed
+
+- Mnemosyne is installed from the head of `main` in
+  [`mnemosyne-oss/mnemosyne`](https://github.com/mnemosyne-oss/mnemosyne) instead of from
+  PyPI. The installers resolve the commit through the GitHub API and install
+  `mnemosyne-memory` and `mnemosyne-hermes` from that commit's source archive, so both
+  packages always come from the same commit (`mnemosyne-hermes` on `main` requires the
+  matching `mnemosyne-memory`, which PyPI may not have yet). pip skips a direct-URL
+  package whose version is already installed, so a `--force-reinstall --no-deps` of the
+  two packages follows the normal install; without it a re-run would stay on the old
+  commit, because `main` keeps one version string across many commits.
+
+### Fixed
+
+- **On current Hermes the virtual environment was built against the wrong Python.** The
+  installers read Hermes' version from `HERMES_HOME/hermes-agent/venv`, which current
+  Hermes no longer creates — it runs from a managed interpreter under `HERMES_HOME/tools`.
+  They warned `could not determine Hermes' Python version`, fell back to 3.11 and built
+  the environment for that while Hermes ran 3.14, so `numpy` / `onnxruntime` could not
+  load in-process and every memory was stored without an embedding. The installers now
+  ask the launcher (`hermes --print-runtime-command`) for its interpreter and keep the
+  old venv path as a fallback for older installs. The Windows bootstrap also looks for a
+  freshly installed `hermes` in `HERMES_HOME\bin`, where current Hermes publishes it.
+
 ## [1.1.0] - 2026-08-14
 
 ### Added

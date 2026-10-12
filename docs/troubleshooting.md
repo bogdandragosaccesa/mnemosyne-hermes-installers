@@ -40,12 +40,19 @@ Hermes imports Mnemosyne in-process, so the two must run the same Python minor v
 see [How it works](how-it-works.md#why-the-python-version-has-to-match). Check:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python --version
+hermes --print-runtime-command   # JSON; the first element is Hermes' interpreter
+<that interpreter> --version
 ~/.mnemosyne-venv/bin/python --version
 ```
 
+Older Hermes installs do not know `--print-runtime-command`; for those, Hermes'
+interpreter is `~/.hermes/hermes-agent/venv/bin/python`.
+
 If they differ, re-run the installer; it rebuilds the environment against Hermes'
-version. Versions before 1.0.0 could produce this silently when `uv` was not on `PATH`.
+version. Versions before 1.0.0 could produce this silently when `uv` was not on `PATH`,
+and the installers in 1.1.0 and earlier always did on current Hermes, which no longer
+has that venv — look for `could not determine Hermes' Python version` in the installer
+output.
 
 ### `onnxruntime` DLL load failed on Windows
 
