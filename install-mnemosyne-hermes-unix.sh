@@ -48,29 +48,77 @@ run_bounded() {
     elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
     else "$@"; fi
 }
-# `hermes gateway restart` hands off to whatever service manager owns the gateway
-# (systemd user or system scope, launchd, s6) and returns. With none it runs the
-# gateway in the foreground and never returns, and Hermes' own detection of that
-# is broader than anything a script can glob for. So run it detached and give it
-# 60 seconds: if it returned, a manager took it; if it is still running, it is
-# the gateway itself and stays in the background. Sets GATEWAY_BG_PID; returns
-# 0 restarted, 200 running in the background, other = failed.
-GATEWAY_BG_PID=''
-restart_gateway_detached() {
-    local log="$1" pid waited=0 rc=0
-    shift
-    mkdir -p "$(dirname "$log")"
-    nohup "$@" gateway restart </dev/null >"$log" 2>&1 &
-    pid=$!
-    while (( waited < 60 )); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" || rc=$?
-            return "$rc"
-        fi
+# Gateway state comes from HERMES_HOME/gateway_state.json, which the gateway
+# process itself writes under every manager (systemd in either scope, launchd,
+# s6, a manual run): its "gateway_state" plus its own pid. A live pid in state
+# running, degraded or draining (Hermes' own set of up-and-serving states) is the
+# test for "running"; the wording `hermes gateway stop` prints is not a contract
+# (with a unit installed it says "Stopped" even when nothing ran).
+gateway_running_pid() {
+    local f="$HERMES_HOME/gateway_state.json" pid
+    [[ -f "$f" ]] || return 1
+    grep -qE '"gateway_state": *"(running|degraded|draining)"' "$f" || return 1
+    pid="$(grep -oE '"pid": *[0-9]+' "$f" | head -n 1 | grep -oE '[0-9]+$' || true)"
+    if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then printf '%s\n' "$pid"; return 0; fi
+    return 1
+}
+# Waits up to $1 seconds for a running gateway whose pid is not $2; prints its pid.
+wait_for_gateway() {
+    local secs="$1" old="${2:-}" waited=0 pid
+    while (( waited < secs )); do
+        pid="$(gateway_running_pid || true)"
+        if [[ -n "$pid" && "$pid" != "$old" ]]; then printf '%s\n' "$pid"; return 0; fi
         sleep 1; waited=$((waited + 1))
     done
-    GATEWAY_BG_PID="$pid"
-    return 200
+    return 1
+}
+# Our own log: Hermes' dashboard already owns logs/gateway-restart.log. Appended
+# to, and rotated once it passes 1 MB.
+gateway_log() { printf '%s\n' "$HERMES_HOME/logs/mnemosyne-installer-gateway.log"; }
+gateway_log_section() {
+    local log; log="$(gateway_log)"
+    mkdir -p "$(dirname "$log")"
+    if [[ -f "$log" ]] && (( $(wc -c <"$log") > 1048576 )); then mv -f "$log" "$log.1"; fi
+    printf '=== %s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$log"
+}
+# Brings a stopped gateway up. `hermes gateway start` goes through whatever
+# manages it (systemd, launchd, s6 -u); when nothing does, the gateway itself is
+# run detached, its output going to Hermes' own logs/gateway.log. A manager that
+# is merely slow can still win that race (s6 runs `gateway run --replace`), so who
+# runs the gateway is read from its pid, not assumed. Sets GATEWAY_PID and
+# GATEWAY_HOW; returns non-zero when no gateway came up.
+GATEWAY_PID=''; GATEWAY_HOW=''
+start_gateway() {
+    local hermes_cmd="$1" run_pid
+    gateway_log_section 'hermes gateway start'
+    run_bounded 120 "$hermes_cmd" gateway start </dev/null >>"$(gateway_log)" 2>&1 || true
+    if GATEWAY_PID="$(wait_for_gateway 60)"; then GATEWAY_HOW='by its service manager'; return 0; fi
+    gateway_log_section 'hermes gateway run (detached; output in logs/gateway.log)'
+    nohup "$hermes_cmd" gateway run </dev/null >/dev/null 2>&1 &
+    run_pid=$!
+    if GATEWAY_PID="$(wait_for_gateway 60)"; then
+        if [[ "$GATEWAY_PID" == "$run_pid" ]]; then GATEWAY_HOW='in the background (no service manager)'
+        else GATEWAY_HOW='by its service manager'; fi
+        return 0
+    fi
+    return 1
+}
+# Restarts a running gateway so it picks up new configuration. `hermes gateway
+# restart` hands off to the manager, or with none stops the gateway and runs it in
+# the foreground; detached either way, and judged by a new gateway pid rather than
+# by when the command returns (a busy gateway drains its turns first). Returns 0
+# with GATEWAY_PID set, 200 while the restart is still in progress, else failed.
+restart_gateway() {
+    local hermes_cmd="$1" old cli rc=0
+    old="$(gateway_running_pid || true)"
+    gateway_log_section 'hermes gateway restart (detached)'
+    nohup "$hermes_cmd" gateway restart </dev/null >>"$(gateway_log)" 2>&1 &
+    cli=$!
+    if GATEWAY_PID="$(wait_for_gateway 90 "$old")"; then return 0; fi
+    if kill -0 "$cli" 2>/dev/null; then return 200; fi
+    wait "$cli" || rc=$?
+    if (( rc == 0 )); then rc=3; fi
+    return "$rc"
 }
 install_system_package() {
     local package="$1"
@@ -140,12 +188,15 @@ py_minor_version() { "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])'
 
 # Current Hermes runs from a managed "store" Python and reports it through its
 # launcher's --print-runtime-command: a JSON argv whose first element is the
-# interpreter that owns the ABI. Older installs kept a venv inside the checkout
-# and may not know the flag. MNEMOSYNE_HERMES_PYTHON overrides detection (not
-# HERMES_PYTHON, which Hermes' own tooling sets to unrelated interpreters).
-# Notices go to stderr: the function's stdout is the result.
+# interpreter that owns the ABI. Launchers without the flag (older installs, the
+# official Docker image) still answer `hermes --version`, which prints the
+# running Python ("Python: 3.14.7") and "Install directory:"; a venv there is used
+# only if its version is the one Hermes reports. MNEMOSYNE_HERMES_PYTHON
+# overrides detection (not HERMES_PYTHON, which Hermes' own tooling sets to
+# unrelated interpreters). Notices go to stderr: the function's stdout is the
+# result. Returns 2 when it has already said why it failed.
 resolve_hermes_python() {
-    local raw out python rc=0
+    local raw out python rc=0 version want dir
     if [[ -n "${MNEMOSYNE_HERMES_PYTHON:-}" ]]; then
         if [[ -x "$MNEMOSYNE_HERMES_PYTHON" && -n "$(py_minor_version "$MNEMOSYNE_HERMES_PYTHON")" ]]; then
             printf '%s\n' "$MNEMOSYNE_HERMES_PYTHON"; return 0
@@ -155,8 +206,7 @@ resolve_hermes_python() {
     fi
     raw="$(run_bounded 60 hermes --print-runtime-command </dev/null 2>/dev/null)" || rc=$?
     if (( rc == 124 )); then
-        # A launcher that hangs is a current one in trouble, not an old layout:
-        # adopting a leftover legacy venv here could pick the wrong Python.
+        # A launcher that hangs is a current one in trouble, not an old layout.
         echo 'ERROR: hermes --print-runtime-command did not answer within 60 seconds.' >&2
         return 2
     fi
@@ -173,22 +223,22 @@ resolve_hermes_python() {
         echo "ERROR: hermes --print-runtime-command named an interpreter that is not runnable: $out" >&2
         return 2
     fi
-    # A managed interpreter under tools/ proves a current Hermes: its launcher
-    # failing is a fault to report, not a sign of the old venv layout.
-    for python in "${HERMES_RUNTIME_DIR:-$HERMES_HOME/tools}"/python-*/bin/python3; do
-        if [[ -x "$python" ]]; then
-            echo "ERROR: hermes --print-runtime-command failed (exit $rc) on a current Hermes install" >&2
-            echo "       (managed Python found under ${python%/bin/python3}); not falling back to the legacy venv." >&2
-            return 2
+    version="$(run_bounded 60 hermes --version </dev/null 2>/dev/null || true)"
+    want="$(printf '%s\n' "$version" | sed -n 's/^Python: \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)"
+    dir="$(printf '%s\n' "$version" | sed -n 's/^Install directory: //p' | head -n 1)"
+    if [[ -z "$want" ]]; then
+        echo "ERROR: neither hermes --print-runtime-command (exit $rc) nor hermes --version named Hermes' Python." >&2
+        return 2
+    fi
+    for python in ${dir:+"$dir/.venv/bin/python" "$dir/venv/bin/python"} "$HERMES_HOME/hermes-agent/venv/bin/python"; do
+        if [[ -x "$python" && "$(py_minor_version "$python")" == "$want" ]]; then
+            echo "Note: this Hermes has no --print-runtime-command; using $python, which matches the Python $want Hermes reports." >&2
+            printf '%s\n' "$python"; return 0
         fi
     done
-    # No answer and no managed Python: an older Hermes, with its venv in the checkout.
-    python="$HERMES_HOME/hermes-agent/venv/bin/python"
-    if [[ -x "$python" ]]; then
-        echo "Note: hermes --print-runtime-command gave no interpreter; using the legacy venv $python" >&2
-        printf '%s\n' "$python"; return 0
-    fi
-    return 1
+    echo "ERROR: Hermes reports Python $want (install directory ${dir:-unknown}), but no Python $want interpreter" >&2
+    echo "       was found in its .venv or venv; a different version would store memories without embeddings." >&2
+    return 2
 }
 
 # The provider is registered in wrapper mode, so Hermes' own interpreter imports
@@ -204,10 +254,7 @@ HERMES_PY_VERSION=""
 if [[ -n "$HERMES_PYTHON" ]]; then HERMES_PY_VERSION="$(py_minor_version "$HERMES_PYTHON")"; fi
 if [[ -z "$HERMES_PY_VERSION" ]]; then
     if (( RESOLVE_RC != 2 )); then
-        cat >&2 <<EOF
-ERROR: could not find the Python interpreter Hermes runs on.
-  Tried: hermes --print-runtime-command, then $HERMES_HOME/hermes-agent/venv/bin/python
-EOF
+        echo 'ERROR: could not find the Python interpreter Hermes runs on.' >&2
     fi
     cat >&2 <<EOF
 Hermes imports Mnemosyne in-process, so the Mnemosyne environment has to be built for
@@ -383,17 +430,22 @@ if (( ! SKIP_HERMES_CONFIGURATION )); then
             else echo 'Run: sudo loginctl enable-linger '"$(id -un)" >&2; fi
         fi
     fi
-    # With no background service registered (containers refuse one), restart runs
-    # the gateway in the foreground; registering the service first makes it a real
-    # service restart where that is possible, and the detached restart covers the rest.
+    # Register the service where Hermes allows one (it refuses inside containers),
+    # then make sure the gateway runs with the new provider: restart a running one,
+    # start a stopped one.
     hermes gateway install || echo 'Could not install the gateway service. Run: hermes gateway install' >&2
-    GATEWAY_LOG="$HERMES_HOME/logs/gateway-restart.log"
-    rc=0; restart_gateway_detached "$GATEWAY_LOG" hermes || rc=$?
-    case "$rc" in
-        0) echo 'Gateway restarted.' ;;
-        200) echo "No gateway service manager took the restart; the gateway is running in the background (PID $GATEWAY_BG_PID, log $GATEWAY_LOG)." ;;
-        *) echo "Gateway restart failed (exit $rc; see $GATEWAY_LOG). Run: hermes gateway restart" >&2 ;;
-    esac
+    if gateway_running_pid >/dev/null; then
+        rc=0; restart_gateway hermes || rc=$?
+        case "$rc" in
+            0) echo "Gateway restarted (PID $GATEWAY_PID)." ;;
+            200) echo "Gateway restart still in progress after 90 s (a busy gateway finishes its turns first); see $(gateway_log)." ;;
+            *) echo "Gateway restart failed (exit $rc; see $(gateway_log)). Run: hermes gateway restart" >&2 ;;
+        esac
+    elif start_gateway hermes; then
+        echo "Gateway started $GATEWAY_HOW (PID $GATEWAY_PID)."
+    else
+        echo "Gateway did not start; see $(gateway_log) and $HERMES_HOME/logs/gateway.log. Run: hermes gateway start" >&2
+    fi
 fi
 printf '\nInstallation complete.\nHermes home:    %s\nMnemosyne data: %s\n' "$HERMES_HOME" "$MNEMOSYNE_HOME"
 hermes memory status

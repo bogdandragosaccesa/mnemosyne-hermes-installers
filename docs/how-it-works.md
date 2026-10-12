@@ -65,13 +65,15 @@ fetch a second uv from winget.
 Finding Hermes' interpreter is the other half. Current Hermes has no virtual environment
 inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its
 launcher reports that interpreter through `hermes --print-runtime-command`, a JSON array
-whose first element is the interpreter path. The installers ask that first. Only when the
-launcher gives no answer at all **and** there is no managed Python under `tools/` — an
-older Hermes that does not know the flag — do they fall back to
-`HERMES_HOME/hermes-agent/venv`, and they say so when they do. A launcher that hangs
-(60-second bound), fails on a current install, or names an interpreter that does not
-exist is an error, not a reason to adopt a leftover venv. When nothing answers they stop
-rather than guess a version, and `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
+whose first element is the interpreter path. The installers ask that first. Launchers
+without the flag — older installs, and the official Docker image, which runs Hermes from
+`/opt/hermes/.venv` — still answer `hermes --version`, which prints the Python Hermes runs
+(`Python: 3.14.7`) and its `Install directory:`. The installers then use the `.venv` or
+`venv` there, or the old `HERMES_HOME/hermes-agent/venv`, **only if its version is the one
+Hermes reports**, and say so; a leftover venv of another version is never adopted. A
+launcher that hangs (60-second bound) or names an interpreter that does not exist is an
+error. When nothing answers they stop rather than guess a version, and
+`MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
 
 ## The gateway
 
@@ -80,13 +82,23 @@ The two platforms differ enough to matter.
 **Linux/macOS** — `hermes gateway install` registers a systemd user unit or a launchd
 agent. Without that, `hermes gateway restart` falls back to running the gateway in the
 **foreground**, where it never returns. An installer that calls `restart` on an
-unregistered gateway therefore hangs forever. The installer registers the service first
-where Hermes allows one (it refuses inside containers), then runs `restart` detached and
-waits 60 seconds. A restart that returns was handled by a service manager — systemd in
-user or system scope, launchd, or s6, all of which Hermes detects itself. One still running
-after 60 seconds is the gateway itself, and is left running in the background with its
-output in `HERMES_HOME/logs/gateway-restart.log`. The uninstaller does the same, and only
-when `hermes gateway stop` reported that a gateway was running.
+unregistered gateway therefore hangs forever, and `stop`'s output does not say whether a
+gateway was running (with a unit installed it reports "Stopped" either way).
+
+So the scripts read gateway state from `HERMES_HOME/gateway_state.json`, which the gateway
+process writes itself under every manager: its `gateway_state` plus its PID. A live PID in
+state `running`, `degraded` or `draining` — Hermes' own up-and-serving set — counts as
+running. The installer registers the service where Hermes allows one (it
+refuses inside containers), then **restarts** a running gateway — `restart` detached,
+judged by a new gateway PID appearing within 90 seconds, so a busy gateway draining its
+turns is reported as in progress rather than failed — or **starts** a stopped one. The
+uninstaller remembers whether a gateway was running, stops it, and at the end starts it
+again only if it was. Starting uses `hermes gateway start`, which goes through systemd
+(user or system scope), launchd or s6; when no manager brings a gateway up within 45
+seconds, the scripts run `hermes gateway run` detached, writing to Hermes' own
+`logs/gateway.log`. Their own steps are logged to
+`HERMES_HOME/logs/mnemosyne-installer-gateway.log` (`logs/gateway-restart.log` belongs to
+Hermes' dashboard).
 
 Both names are **profile-scoped**, which is why the uninstaller matches them by glob
 rather than by one fixed name:

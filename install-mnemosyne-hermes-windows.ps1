@@ -357,24 +357,19 @@ $mnemosyneCliExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne.exe'
 # Current Hermes runs from a managed "store" Python and reports it through its
 # launcher's --print-runtime-command: a JSON argv whose first element is the
 # interpreter that owns the ABI. The JSON is ASCII (Python escapes non-ASCII
-# paths), so the console code page cannot mangle it. Older installs kept a venv
-# inside the checkout and may not reject the flag, so the call is bounded and
-# gets an empty stdin. MNEMOSYNE_HERMES_PYTHON overrides detection (not
-# HERMES_PYTHON, which Hermes' own tooling sets to unrelated interpreters).
-function Resolve-HermesPython {
-    if ($env:MNEMOSYNE_HERMES_PYTHON) {
-        if (Get-PyMinorVersion -PythonPath $env:MNEMOSYNE_HERMES_PYTHON) { return $env:MNEMOSYNE_HERMES_PYTHON }
-        throw "MNEMOSYNE_HERMES_PYTHON=$($env:MNEMOSYNE_HERMES_PYTHON) is not a runnable Python interpreter. Point it at Hermes' python.exe and rerun."
-    }
+# paths), so the console code page cannot mangle it. Launchers without the flag
+# still answer `hermes --version`, which prints the running Python ("Python:
+# 3.14.7") and "Install directory:"; a venv there is used only if its version is
+# the one Hermes reports. Both calls are bounded and get an empty stdin.
+# MNEMOSYNE_HERMES_PYTHON overrides detection (not HERMES_PYTHON, which Hermes'
+# own tooling sets to unrelated interpreters).
+function Invoke-HermesProbe {
+    param([Parameter(Mandatory)][string]$Argument)
     $stdin = [IO.Path]::GetTempFileName()
     $stdout = [IO.Path]::GetTempFileName()
     $stderr = [IO.Path]::GetTempFileName()
-    $line = $null
-    $exitCode = $null
-    $hermesHelp = 'Hermes imports Mnemosyne in-process, so the Mnemosyne environment has to be built for ' +
-        "Hermes' Python version. Set MNEMOSYNE_HERMES_PYTHON to Hermes' python.exe and rerun."
     try {
-        $process = Start-Process -FilePath $hermesExe -ArgumentList '--print-runtime-command' -NoNewWindow -PassThru `
+        $process = Start-Process -FilePath $hermesExe -ArgumentList $Argument -NoNewWindow -PassThru `
             -RedirectStandardInput $stdin -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         # Touching Handle keeps ExitCode readable after exit (a Start-Process quirk).
         $null = $process.Handle
@@ -385,37 +380,53 @@ function Resolve-HermesPython {
             $ErrorActionPreference = 'Continue'
             try { & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null } finally { $ErrorActionPreference = $previous }
             [void]$process.WaitForExit(5000)
-            # A launcher that hangs is a current one in trouble, not an old layout:
-            # adopting a leftover legacy venv here could pick the wrong Python.
-            throw "hermes --print-runtime-command did not answer within 60 seconds. $hermesHelp"
+            return @{ TimedOut = $true; ExitCode = $null; Lines = @() }
         }
-        $exitCode = $process.ExitCode
-        # Accept the JSON line whatever the exit code; the Unix installer does the same.
-        $line = Get-Content -LiteralPath $stdout | Where-Object { $_.StartsWith('[') } | Select-Object -First 1
+        return @{ TimedOut = $false; ExitCode = $process.ExitCode; Lines = @(Get-Content -LiteralPath $stdout) }
     } finally {
         Remove-Item -LiteralPath $stdin, $stdout, $stderr -Force -ErrorAction SilentlyContinue
     }
+}
+function Resolve-HermesPython {
+    $hermesHelp = 'Hermes imports Mnemosyne in-process, so the Mnemosyne environment has to be built for ' +
+        "Hermes' Python version. Set MNEMOSYNE_HERMES_PYTHON to Hermes' python.exe and rerun."
+    if ($env:MNEMOSYNE_HERMES_PYTHON) {
+        if (Get-PyMinorVersion -PythonPath $env:MNEMOSYNE_HERMES_PYTHON) { return $env:MNEMOSYNE_HERMES_PYTHON }
+        throw "MNEMOSYNE_HERMES_PYTHON=$($env:MNEMOSYNE_HERMES_PYTHON) is not a runnable Python interpreter. Point it at Hermes' python.exe and rerun."
+    }
+    $probe = Invoke-HermesProbe -Argument '--print-runtime-command'
+    if ($probe.TimedOut) {
+        # A launcher that hangs is a current one in trouble, not an old layout.
+        throw "hermes --print-runtime-command did not answer within 60 seconds. $hermesHelp"
+    }
+    # Accept the JSON line whatever the exit code; the Unix installer does the same.
+    $line = $probe.Lines | Where-Object { $_.StartsWith('[') } | Select-Object -First 1
     if ($line) {
         $python = $null
         try { $python = @(($line | ConvertFrom-Json))[0] } catch { $python = $null }
         if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
         throw "hermes --print-runtime-command named an interpreter that is not usable: $line. $hermesHelp"
     }
-    # A managed interpreter under tools\ proves a current Hermes: its launcher
-    # failing is a fault to report, not a sign of the old venv layout.
-    $managed = Get-ChildItem -Path (Join-Path $hermesTools 'python-*\python.exe') -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($managed) {
-        throw ("hermes --print-runtime-command failed (exit $exitCode) on a current Hermes install (managed Python " +
-            "found at $($managed.FullName)); not falling back to the legacy venv. $hermesHelp")
+    $version = Invoke-HermesProbe -Argument '--version'
+    $want = $null; $dir = $null
+    foreach ($text in $version.Lines) {
+        if (-not $want -and $text -match '^Python: (\d+\.\d+)') { $want = $Matches[1] }
+        if (-not $dir -and $text -match '^Install directory: (.+)$') { $dir = $Matches[1].Trim() }
     }
-    # No answer and no managed Python: an older Hermes, with its venv in the checkout.
-    $legacy = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
-    if (Test-Path -LiteralPath $legacy -PathType Leaf) {
-        Write-Note "hermes --print-runtime-command gave no interpreter; using the legacy venv $legacy"
-        return $legacy
+    if (-not $want) {
+        throw "Neither hermes --print-runtime-command (exit $($probe.ExitCode)) nor hermes --version named Hermes' Python. $hermesHelp"
     }
-    return $null
+    $candidates = @()
+    if ($dir) { $candidates += (Join-Path $dir '.venv\Scripts\python.exe'), (Join-Path $dir 'venv\Scripts\python.exe') }
+    $candidates += Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
+    foreach ($python in $candidates) {
+        if ((Test-Path -LiteralPath $python -PathType Leaf) -and (Get-PyMinorVersion -PythonPath $python) -eq $want) {
+            Write-Note "This Hermes has no --print-runtime-command; using $python, which matches the Python $want Hermes reports."
+            return $python
+        }
+    }
+    throw ("Hermes reports Python $want (install directory $dir), but no Python $want interpreter was found in its " +
+        ".venv or venv; a different version would store memories without embeddings. $hermesHelp")
 }
 # Refuse rather than guess: a guessed version is exactly how memories end up
 # stored without embeddings.

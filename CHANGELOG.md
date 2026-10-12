@@ -99,12 +99,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A `GITHUB_TOKEN` / `GH_TOKEN` that GitHub answers with 401, 403 or 429 no longer blocks
   the install: the installers retry the commit lookup without it. An HTTP 200 without a
   commit id (a proxy or captive portal) is named as such.
-- The legacy `hermes-agent/venv` fallback is taken only when the launcher gives no answer
-  and no managed Python exists under `tools/`, never after a timeout, a failure on a
-  current install, or an unusable answer, and it is announced. Each of those failures now
-  says what happened instead of listing a fallback that was not tried. An unrunnable
-  `MNEMOSYNE_HERMES_PYTHON` is reported as that. Both platforms accept the launcher's JSON
-  line whatever its exit code.
+- Launchers without `--print-runtime-command` — older installs and the official Docker
+  image (`nousresearch/hermes-agent`, which runs Hermes from `/opt/hermes/.venv`) — are
+  handled through `hermes --version`, which reports the Python Hermes runs and its install
+  directory: a `.venv`/`venv` there, or the old `hermes-agent/venv`, is used only if its
+  version matches what Hermes reports, and that is announced. Before, the Docker image could
+  not be installed into at all, and a leftover venv could be adopted unchecked. A timeout or
+  an unusable answer is an error, each failure says what happened, an unrunnable
+  `MNEMOSYNE_HERMES_PYTHON` is reported as that, and both platforms accept the launcher's
+  JSON line whatever its exit code.
 - Windows: the Visual C++ runtime is chosen from `sysconfig.get_platform()` (the
   interpreter's own build) rather than `platform.machine()` (the CPU); the timeout path's
   `taskkill` can no longer abort the installer under PowerShell 5.1, and the process is
@@ -112,14 +115,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **The Unix uninstaller hung forever without a registered gateway service.** It ran
-  `hermes gateway restart`, which then runs the gateway in the foreground. Both Unix
-  scripts now run the restart detached and wait at most 60 seconds: a restart handled by a
-  service manager (systemd user or system scope, launchd, s6) returns; one that is still
-  running is the gateway itself and is left in the background. The uninstaller restarts
-  only a gateway that was running before it started. Found by an end-to-end run in an
-  `ubuntu:24.04` arm64 container; a first fix that looked for unit files missed
-  system-scope, `XDG_CONFIG_HOME` and s6 gateways and left them stopped.
+- **The Unix uninstaller hung forever without a registered gateway service, and the first
+  two fixes for it mishandled gateways.** `hermes gateway restart` runs the gateway in the
+  foreground when no service manager owns it. Detecting unit files missed system-scope,
+  `XDG_CONFIG_HOME` and s6 gateways; reading `stop`'s message started stopped services
+  (it says "Stopped" whenever a unit exists) and left s6 gateways down (`restart` there
+  only signals). Both Unix scripts now read the gateway's own `gateway_state.json` with a
+  live-PID check. The uninstaller brings a gateway back only if one was running, with
+  `hermes gateway start` (systemd, launchd, s6), falling back to a detached
+  `hermes gateway run`; the installer restarts a running gateway and judges success by a
+  new gateway PID, so a busy gateway draining its turns is reported as in progress. The
+  stop is bounded at 120 seconds, above Hermes' own 90-second stop wait. The scripts log
+  to `logs/mnemosyne-installer-gateway.log` (appended, rotated at 1 MB); the previous
+  revision truncated `logs/gateway-restart.log`, which belongs to Hermes' dashboard. Found
+  by an end-to-end run in an `ubuntu:24.04` arm64 container and by review.
 - **The Unix installer could not bootstrap Hermes on a minimal system.** Hermes' own
   installer refuses to run without `git`, which container and cloud server images do not
   ship; the installer now installs it first when Hermes is missing.

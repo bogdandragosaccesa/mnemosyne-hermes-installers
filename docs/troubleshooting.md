@@ -88,10 +88,12 @@ hermes gateway install     # then re-run the installer
 
 The Unix **uninstaller** had the same hang at "Restarting the Hermes gateway..." when no
 gateway service was registered, for example after installing with
-`--skip-hermes-configuration`. Both scripts now run the restart detached and wait at most
-60 seconds; a gateway with no service manager is left running in the background (its
-output goes to `HERMES_HOME/logs/gateway-restart.log`). The uninstaller restarts the
-gateway only if one was running when it started.
+`--skip-hermes-configuration`. Neither script waits on `hermes gateway restart` any more:
+they read the gateway's own `gateway_state.json`, start or restart it in the background and
+check that a gateway came up, logging their steps to
+`HERMES_HOME/logs/mnemosyne-installer-gateway.log`. The uninstaller brings the gateway back
+only if one was running when it started. If a gateway does not come back, look there and
+in `HERMES_HOME/logs/gateway.log`, then run `hermes gateway start`.
 
 ## `mnemosyne-hermes install` fails with "already exists"
 

@@ -72,29 +72,60 @@ run_bounded() {
     else "$@"; fi
 }
 
-# `hermes gateway restart` hands off to whatever service manager owns the gateway
-# (systemd user or system scope, launchd, s6) and returns. With none it runs the
-# gateway in the foreground and never returns, and Hermes' own detection of that
-# is broader than anything a script can glob for. So run it detached and give it
-# 60 seconds: if it returned, a manager took it; if it is still running, it is
-# the gateway itself and stays in the background. Sets GATEWAY_BG_PID; returns
-# 0 restarted, 200 running in the background, other = failed.
-GATEWAY_BG_PID=''
-restart_gateway_detached() {
-    local log="$1" pid waited=0 rc=0
-    shift
-    mkdir -p "$(dirname "$log")"
-    nohup "$@" gateway restart </dev/null >"$log" 2>&1 &
-    pid=$!
-    while (( waited < 60 )); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" || rc=$?
-            return "$rc"
-        fi
+# Gateway state comes from HERMES_HOME/gateway_state.json, which the gateway
+# process itself writes under every manager (systemd in either scope, launchd,
+# s6, a manual run): its "gateway_state" plus its own pid. A live pid in state
+# running, degraded or draining (Hermes' own set of up-and-serving states) is the
+# test for "running"; the wording `hermes gateway stop` prints is not a contract
+# (with a unit installed it says "Stopped" even when nothing ran).
+gateway_running_pid() {
+    local f="$HERMES_HOME/gateway_state.json" pid
+    [[ -f "$f" ]] || return 1
+    grep -qE '"gateway_state": *"(running|degraded|draining)"' "$f" || return 1
+    pid="$(grep -oE '"pid": *[0-9]+' "$f" | head -n 1 | grep -oE '[0-9]+$' || true)"
+    if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then printf '%s\n' "$pid"; return 0; fi
+    return 1
+}
+# Waits up to $1 seconds for a running gateway whose pid is not $2; prints its pid.
+wait_for_gateway() {
+    local secs="$1" old="${2:-}" waited=0 pid
+    while (( waited < secs )); do
+        pid="$(gateway_running_pid || true)"
+        if [[ -n "$pid" && "$pid" != "$old" ]]; then printf '%s\n' "$pid"; return 0; fi
         sleep 1; waited=$((waited + 1))
     done
-    GATEWAY_BG_PID="$pid"
-    return 200
+    return 1
+}
+# Our own log: Hermes' dashboard already owns logs/gateway-restart.log. Appended
+# to, and rotated once it passes 1 MB.
+gateway_log() { printf '%s\n' "$HERMES_HOME/logs/mnemosyne-installer-gateway.log"; }
+gateway_log_section() {
+    local log; log="$(gateway_log)"
+    mkdir -p "$(dirname "$log")"
+    if [[ -f "$log" ]] && (( $(wc -c <"$log") > 1048576 )); then mv -f "$log" "$log.1"; fi
+    printf '=== %s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$log"
+}
+# Brings a stopped gateway up. `hermes gateway start` goes through whatever
+# manages it (systemd, launchd, s6 -u); when nothing does, the gateway itself is
+# run detached, its output going to Hermes' own logs/gateway.log. A manager that
+# is merely slow can still win that race (s6 runs `gateway run --replace`), so who
+# runs the gateway is read from its pid, not assumed. Sets GATEWAY_PID and
+# GATEWAY_HOW; returns non-zero when no gateway came up.
+GATEWAY_PID=''; GATEWAY_HOW=''
+start_gateway() {
+    local hermes_cmd="$1" run_pid
+    gateway_log_section 'hermes gateway start'
+    run_bounded 120 "$hermes_cmd" gateway start </dev/null >>"$(gateway_log)" 2>&1 || true
+    if GATEWAY_PID="$(wait_for_gateway 60)"; then GATEWAY_HOW='by its service manager'; return 0; fi
+    gateway_log_section 'hermes gateway run (detached; output in logs/gateway.log)'
+    nohup "$hermes_cmd" gateway run </dev/null >/dev/null 2>&1 &
+    run_pid=$!
+    if GATEWAY_PID="$(wait_for_gateway 60)"; then
+        if [[ "$GATEWAY_PID" == "$run_pid" ]]; then GATEWAY_HOW='in the background (no service manager)'
+        else GATEWAY_HOW='by its service manager'; fi
+        return 0
+    fi
+    return 1
 }
 write_step() { printf '%s==> %s%s\n' "$C_STEP" "$1" "$C_OFF"; }
 write_ok()   { printf '%s  - %s%s\n' "$C_OK"   "$1" "$C_OFF"; }
@@ -333,19 +364,30 @@ fi
 
 write_step 'Stopping running processes...'
 
-# Remember whether a gateway was up, so the restart below brings back exactly
-# that and never starts one the user did not have. Hermes says "No gateway
-# running" / "No gateway processes found" when there was nothing; any other
-# answer (a stopped unit, an s6 dispatch, a wording this script does not know)
-# counts as running, because restarting is the safe side of that guess.
+# Remember whether a gateway was up, from its own state file rather than from
+# what `stop` prints, so the end of this script brings back exactly that and
+# never starts one the user did not have. The stop is bounded above Hermes' own
+# 90-second systemd stop wait, and then the old process is given time to exit:
+# under s6 it keeps draining after `stop` returns, and a start issued meanwhile
+# has nothing to start.
 GATEWAY_WAS_RUNNING=0
 if [[ -n "$HERMES_BIN" ]]; then
-    stop_output="$(run_bounded 60 "$HERMES_BIN" gateway stop </dev/null 2>&1 || true)"
-    if printf '%s\n' "$stop_output" | grep -qE 'No gateway (running|processes found)'; then
-        write_note 'Gateway was not running'
-    else
-        GATEWAY_WAS_RUNNING=1
+    old_gateway_pid="$(gateway_running_pid || true)"
+    if [[ -n "$old_gateway_pid" ]]; then GATEWAY_WAS_RUNNING=1; fi
+    gateway_log_section 'hermes gateway stop'
+    run_bounded 120 "$HERMES_BIN" gateway stop </dev/null >>"$(gateway_log)" 2>&1 || true
+    waited=0
+    while [[ -n "$old_gateway_pid" ]] && ps -p "$old_gateway_pid" >/dev/null 2>&1 && (( waited < 120 )); do
+        sleep 1; waited=$((waited + 1))
+    done
+    if gateway_running_pid >/dev/null; then
+        write_warn "Gateway is still running after hermes gateway stop; see $(gateway_log)"
+    elif [[ -n "$old_gateway_pid" ]] && ps -p "$old_gateway_pid" >/dev/null 2>&1; then
+        write_warn "Gateway process $old_gateway_pid is still shutting down after 120 s; continuing"
+    elif (( GATEWAY_WAS_RUNNING )); then
         write_ok 'Gateway stopped'
+    else
+        write_note 'Gateway was not running'
     fi
 fi
 
@@ -553,14 +595,10 @@ if (( ! INCLUDE_HERMES )) && [[ -n "$HERMES_BIN" ]]; then
     write_step 'Restarting the Hermes gateway...'
     if (( ! GATEWAY_WAS_RUNNING )); then
         write_note 'No gateway was running before the uninstall, so none is started.'
+    elif start_gateway "$HERMES_BIN"; then
+        write_ok "Gateway running again, $GATEWAY_HOW (PID $GATEWAY_PID)"
     else
-        gateway_log="$HERMES_HOME/logs/gateway-restart.log"
-        rc=0; restart_gateway_detached "$gateway_log" "$HERMES_BIN" || rc=$?
-        case "$rc" in
-            0) write_ok 'Gateway restarted' ;;
-            200) write_ok "Gateway running in the background (PID $GATEWAY_BG_PID, log $gateway_log)" ;;
-            *) write_warn "Gateway did not restart (exit $rc; see $gateway_log). Run: hermes gateway restart" ;;
-        esac
+        write_warn "Gateway did not come back; see $(gateway_log) and $HERMES_HOME/logs/gateway.log. Run: hermes gateway start"
     fi
 fi
 
