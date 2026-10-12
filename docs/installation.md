@@ -150,7 +150,8 @@ mnemosyne-hermes @ https://github.com/mnemosyne-oss/mnemosyne/archive/<sha>.zip#
 - **Network.** `api.github.com` and `github.com` must be reachable. The commit is resolved
   before the virtual environment is touched, so if that fails the existing install is left
   as it was. Unauthenticated, the GitHub API allows 60 requests an hour per IP; the
-  installers send `GITHUB_TOKEN` (or `GH_TOKEN`) when it is set.
+  installers send `GITHUB_TOKEN` (or `GH_TOKEN`) when it is set, and retry without it if
+  GitHub rejects it, so a stale or foreign token cannot block the install.
 
 ## Upgrading from a PyPI install
 
@@ -209,7 +210,8 @@ For a real check see
 Linux / macOS:
 
 - bash (the scripts target bash 3.2, so stock macOS works)
-- `sudo` rights, if `curl` or the Python `venv` module still need installing
+- `sudo` rights, if `curl`, `git` (needed by Hermes' own installer when Hermes is missing)
+  or the Python `venv` module still need installing
 
 Windows:
 

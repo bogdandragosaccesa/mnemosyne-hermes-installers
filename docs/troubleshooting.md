@@ -86,6 +86,11 @@ registering the service first. If you hit it on an older copy:
 hermes gateway install     # then re-run the installer
 ```
 
+The Unix **uninstaller** had the same hang at "Restarting the Hermes gateway..." when no
+gateway service was registered, for example after installing with
+`--skip-hermes-configuration`. It now restarts only a registered service, bounded to two
+minutes, and otherwise tells you to start the gateway yourself with `hermes gateway run`.
+
 ## `mnemosyne-hermes install` fails with "already exists"
 
 ```text

@@ -62,6 +62,15 @@ if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
 else
     C_STEP=''; C_OK=''; C_NOTE=''; C_WARN=''; C_OFF=''
 fi
+
+# `timeout` is coreutils; stock macOS has neither it nor Homebrew's `gtimeout`
+# unless coreutils is installed. Unbounded is the last resort.
+run_bounded() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+    else "$@"; fi
+}
 write_step() { printf '%s==> %s%s\n' "$C_STEP" "$1" "$C_OFF"; }
 write_ok()   { printf '%s  - %s%s\n' "$C_OK"   "$1" "$C_OFF"; }
 write_note() { printf '%s  . %s%s\n' "$C_NOTE" "$1" "$C_OFF"; }
@@ -509,7 +518,13 @@ if (( ! stripped_any )); then write_note 'No installer-written exports found'; f
 
 if (( ! INCLUDE_HERMES )) && [[ -n "$HERMES_BIN" ]]; then
     write_step 'Restarting the Hermes gateway...'
-    if "$HERMES_BIN" gateway restart >/dev/null 2>&1; then
+    # Without a registered service `hermes gateway restart` falls back to running
+    # the gateway in the foreground and never returns, which hung this script.
+    # Restart only a registered service, and bound even that.
+    if [[ -z "$(gateway_service_files)" ]]; then
+        write_note 'No gateway background service is registered, so there is nothing to restart.'
+        write_note 'If you run the gateway by hand, start it again with: hermes gateway run'
+    elif run_bounded 120 "$HERMES_BIN" gateway restart </dev/null >/dev/null 2>&1; then
         write_ok 'Gateway restarted'
     else
         write_warn 'Gateway did not restart. Run: hermes gateway restart'

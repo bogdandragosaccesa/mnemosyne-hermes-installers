@@ -236,7 +236,8 @@ venv path is long; set `MNEMOSYNE_VENV` to something shorter if you hit it.
 Linux / macOS:
 
 - bash (the scripts are written for bash 3.2, so stock macOS works)
-- `sudo` rights, if `curl` or the Python `venv` module still need installing
+- `sudo` rights, if `curl`, `git` (needed by Hermes' own installer when Hermes is missing)
+  or the Python `venv` module still need installing
 
 Windows:
 

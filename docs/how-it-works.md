@@ -65,9 +65,12 @@ fetch a second uv from winget.
 Finding Hermes' interpreter is the other half. Current Hermes has no virtual environment
 inside its checkout: it runs from a managed Python under `HERMES_HOME/tools`, and its
 launcher reports that interpreter through `hermes --print-runtime-command`, a JSON array
-whose first element is the interpreter path. The installers ask that first and fall back
-to `HERMES_HOME/hermes-agent/venv` for older installs. When neither answers they stop
-rather than guess a version, and `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
+whose first element is the interpreter path. The installers ask that first. Only when the
+launcher gives no answer at all — an older Hermes that does not know the flag — do they
+fall back to `HERMES_HOME/hermes-agent/venv`, and they say so when they do; a launcher that
+hangs (60-second bound) or names an interpreter that does not exist is an error, not a
+reason to adopt a leftover venv. When nothing answers they stop rather than guess a
+version, and `MNEMOSYNE_HERMES_PYTHON` names the interpreter explicitly.
 
 ## The gateway
 

@@ -362,34 +362,54 @@ $mnemosyneCliExe = Join-Path $mnemosyneVenv 'Scripts\mnemosyne.exe'
 # gets an empty stdin. MNEMOSYNE_HERMES_PYTHON overrides detection (not
 # HERMES_PYTHON, which Hermes' own tooling sets to unrelated interpreters).
 function Resolve-HermesPython {
-    if ($env:MNEMOSYNE_HERMES_PYTHON) { return $env:MNEMOSYNE_HERMES_PYTHON }
+    if ($env:MNEMOSYNE_HERMES_PYTHON) {
+        if (Get-PyMinorVersion -PythonPath $env:MNEMOSYNE_HERMES_PYTHON) { return $env:MNEMOSYNE_HERMES_PYTHON }
+        throw "MNEMOSYNE_HERMES_PYTHON=$($env:MNEMOSYNE_HERMES_PYTHON) is not a runnable Python interpreter. Point it at Hermes' python.exe and rerun."
+    }
     $stdin = [IO.Path]::GetTempFileName()
     $stdout = [IO.Path]::GetTempFileName()
     $stderr = [IO.Path]::GetTempFileName()
+    $line = $null
     try {
         $process = Start-Process -FilePath $hermesExe -ArgumentList '--print-runtime-command' -NoNewWindow -PassThru `
             -RedirectStandardInput $stdin -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         # Touching Handle keeps ExitCode readable after exit (a Start-Process quirk).
         $null = $process.Handle
         if (-not $process.WaitForExit(60000)) {
-            & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null
+            # Native stderr under 'Stop' is a terminating error in PS 5.1, and
+            # taskkill reports children that already exited on stderr.
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { & taskkill.exe /T /F /PID $process.Id 2>&1 | Out-Null } finally { $ErrorActionPreference = $previous }
+            [void]$process.WaitForExit(5000)
+            # A launcher that hangs is a current one in trouble, not an old layout:
+            # adopting a leftover legacy venv here could pick the wrong Python.
             Write-Note 'hermes --print-runtime-command did not answer within 60 seconds.'
-        } elseif ($process.ExitCode -eq 0) {
+            return $null
+        }
+        if ($process.ExitCode -eq 0) {
             $line = Get-Content -LiteralPath $stdout | Where-Object { $_.StartsWith('[') } | Select-Object -First 1
-            if ($line) {
-                try {
-                    $python = @(($line | ConvertFrom-Json))[0]
-                    if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
-                } catch {
-                    Write-Note "hermes --print-runtime-command returned no usable JSON: $($_.Exception.Message)"
-                }
-            }
         }
     } finally {
         Remove-Item -LiteralPath $stdin, $stdout, $stderr -Force -ErrorAction SilentlyContinue
     }
+    if ($line) {
+        try {
+            $python = @(($line | ConvertFrom-Json))[0]
+            if ($python -is [string] -and (Test-Path -LiteralPath $python -PathType Leaf)) { return $python }
+        } catch {
+            Write-Note "hermes --print-runtime-command returned no usable JSON: $($_.Exception.Message)"
+            return $null
+        }
+        Write-Note "hermes --print-runtime-command named an interpreter that does not exist: $line"
+        return $null
+    }
+    # No answer at all: an older Hermes without the flag, with its venv in the checkout.
     $legacy = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe'
-    if (Test-Path -LiteralPath $legacy -PathType Leaf) { return $legacy }
+    if (Test-Path -LiteralPath $legacy -PathType Leaf) {
+        Write-Note "hermes --print-runtime-command gave no interpreter; using the legacy venv $legacy"
+        return $legacy
+    }
     return $null
 }
 # Refuse rather than guess: a guessed version is exactly how memories end up
@@ -411,25 +431,43 @@ Write-Ok "Hermes runs Python $hermesPyVersion ($hermesPython); matching it."
 # archive URL, so a re-run picks up whatever main has moved on to. Resolved
 # before the venv is touched, so a failure here leaves an existing install alone.
 $mnemosyneRepo = 'mnemosyne-oss/mnemosyne'
-$mnemosyneCommit = ''
-$commitStatus = $null
-$githubHeaders = @{}
-$githubToken = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
-if ($githubToken) { $githubHeaders['Authorization'] = "Bearer $githubToken" }
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $mnemosyneCommit = [string](Invoke-RestMethod -Uri "https://api.github.com/repos/$mnemosyneRepo/commits/main" -Headers $githubHeaders).sha
-} catch {
-    if ($_.Exception.Response) { $commitStatus = [int]$_.Exception.Response.StatusCode }
-    Write-Note "GitHub API request failed: $($_.Exception.Message)"
+# Returns @{ Sha; Status }: Status is the HTTP status, or $null when unreachable.
+function Get-MainCommit {
+    param([string]$Token)
+    $headers = @{}
+    if ($Token) { $headers['Authorization'] = "Bearer $Token" }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$mnemosyneRepo/commits/main" -Headers $headers
+        return @{ Sha = [string]$response.sha; Status = 200 }
+    } catch {
+        $status = $null
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+        Write-Note "GitHub API request failed: $($_.Exception.Message)"
+        return @{ Sha = ''; Status = $status }
+    }
 }
+$githubToken = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
+$commit = Get-MainCommit -Token $githubToken
+if ($commit.Status -eq 401 -and $githubToken) {
+    # An expired token, or one for another host, must not block a public repo.
+    Write-Note 'GitHub rejected the token in GITHUB_TOKEN/GH_TOKEN; retrying without it.'
+    $githubToken = $null
+    $commit = Get-MainCommit -Token $null
+}
+$mnemosyneCommit = $commit.Sha
 if ($mnemosyneCommit -notmatch '^[0-9a-f]{40}$') {
-    $hint = if ($commitStatus -eq 403 -or $commitStatus -eq 429) {
+    $commitStatus = $commit.Status
+    $hint = if (($commitStatus -eq 403 -or $commitStatus -eq 429) -and $githubToken) {
+        "GitHub answered HTTP $commitStatus to the token in GITHUB_TOKEN/GH_TOKEN (rate limit or missing access). Unset it, or wait, and rerun."
+    } elseif ($commitStatus -eq 403 -or $commitStatus -eq 429) {
         'GitHub API rate limit reached (60 requests/hour per IP without a token). Wait and rerun, or set GITHUB_TOKEN and rerun.'
     } elseif ($null -eq $commitStatus) {
         'api.github.com is unreachable; check the network or proxy and rerun.'
+    } elseif ($commitStatus -eq 200) {
+        'api.github.com answered, but not with a commit id; a proxy or captive portal may be intercepting HTTPS. Check the network and rerun.'
     } else {
-        "api.github.com answered HTTP $commitStatus; rerun, or set GITHUB_TOKEN if it persists."
+        "api.github.com answered HTTP $commitStatus; rerun later."
     }
     throw "Could not resolve the latest commit of https://github.com/$mnemosyneRepo (main). $hint The existing Mnemosyne environment was left untouched."
 }
@@ -588,15 +626,24 @@ if (-not $NoEmbeddings) {
     $vcRedistId = 'Microsoft.VCRedist.2015+.x64'
     $vcRedistCurrent = $false
     if (-not $embed.Ok -and $embed.Output -match 'DLL load failed') {
-        $machine = ([string](& $hermesPython -I -c 'import platform; print(platform.machine())' 2>$null | Select-Object -First 1)).Trim()
-        $vcRedistId = switch ($machine) {
-            'ARM64' { 'Microsoft.VCRedist.2015+.arm64' }
-            'x86' { 'Microsoft.VCRedist.2015+.x86' }
+        # sysconfig names the interpreter's own build (win-amd64 / win-arm64 / win32);
+        # platform.machine() names the CPU, which differs under emulation.
+        $previousEA = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $pyPlatform = ([string](& $hermesPython -I -c 'import sysconfig; print(sysconfig.get_platform())' 2>$null |
+                Select-Object -First 1)).Trim()
+        } finally {
+            $ErrorActionPreference = $previousEA
+        }
+        $vcRedistId = switch ($pyPlatform) {
+            'win-arm64' { 'Microsoft.VCRedist.2015+.arm64' }
+            'win32' { 'Microsoft.VCRedist.2015+.x86' }
             default { 'Microsoft.VCRedist.2015+.x64' }
         }
         Write-Note "onnxruntime cannot load its DLLs; installing the Visual C++ runtime it links against ($vcRedistId). This may ask for elevation."
         try {
-            Install-WingetPackage -Id $vcRedistId -DisplayName "the Microsoft Visual C++ runtime ($machine)"
+            Install-WingetPackage -Id $vcRedistId -DisplayName "the Microsoft Visual C++ runtime ($pyPlatform)"
             $vcRedistCurrent = ($script:LastNativeExit -eq -1978335189)
             $embed = Test-EmbeddingStack
         } catch {

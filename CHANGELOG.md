@@ -96,9 +96,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A virtual environment created in the same run skips the redundant `--force-reinstall`.
 - The documented `Set-ExecutionPolicy -Scope Process` lines now pass `-Force`, which skips
   Windows PowerShell 5.1's confirmation prompt.
+- A `GITHUB_TOKEN` / `GH_TOKEN` that GitHub rejects (401) no longer blocks the install:
+  the installers retry the commit lookup without it. A 403/429 with a token is reported as
+  a token problem rather than the anonymous rate limit, and an HTTP 200 without a commit id
+  (a proxy or captive portal) is named as such.
+- The legacy `hermes-agent/venv` fallback is taken only when the launcher gives no answer,
+  never after a timeout or an unusable answer, and it is announced. An unrunnable
+  `MNEMOSYNE_HERMES_PYTHON` is reported as that, not as a failed detection.
+- Windows: the Visual C++ runtime is chosen from `sysconfig.get_platform()` (the
+  interpreter's own build) rather than `platform.machine()` (the CPU); the timeout path's
+  `taskkill` can no longer abort the installer under PowerShell 5.1, and the process is
+  reaped before its temp files are deleted.
 
 ### Fixed
 
+- **The Unix uninstaller hung forever without a registered gateway service.** It ran
+  `hermes gateway restart`, which then runs the gateway in the foreground. It now restarts
+  only a registered service, bounded to two minutes. Found by an end-to-end run in an
+  `ubuntu:24.04` arm64 container.
+- **The Unix installer could not bootstrap Hermes on a minimal system.** Hermes' own
+  installer refuses to run without `git`, which container and cloud server images do not
+  ship; the installer now installs it first when Hermes is missing.
 - **On current Hermes the virtual environment was built against the wrong Python.** The
   installers read Hermes' version from `HERMES_HOME/hermes-agent/venv`, which current
   Hermes no longer creates — it runs from a managed interpreter under `HERMES_HOME/tools`.
