@@ -497,7 +497,7 @@ if path.exists():
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:  # written by an older Mnemosyne in the ANSI codepage (Windows)
-        fallback = locale.getencoding()
+        fallback = getattr(locale, "getencoding", lambda: locale.getpreferredencoding(False))()
         try:
             text = raw.decode(fallback)
         except UnicodeDecodeError:
@@ -511,12 +511,15 @@ if path.exists():
     for line in text.splitlines(keepends=True):
         if line.strip() and not line.lstrip().startswith("#"):
             break
-        header += line
+        if line.isascii():
+            header += line
+if header and not header.endswith("\n"):
+    header += "\n"
 wanted = dict(arg.split("=", 1) for arg in sys.argv[1:])
 data.update(wanted)
 path.parent.mkdir(parents=True, exist_ok=True)
-# Values are dumped as ASCII (non-ASCII escaped), so they read the same in any codepage:
-# on Windows the runtime opens this file in the ANSI codepage.
+# Only ASCII is written (header lines that are not ASCII are dropped, values are escaped),
+# so the file reads the same in any codepage: on Windows the runtime opens it in the ANSI one.
 path.write_text(header + yaml.safe_dump(data, default_flow_style=False, sort_keys=True), encoding="utf-8")
 for key, value in wanted.items():
     override = read_hermes_config_key(os.environ.get("HERMES_HOME"), key)
@@ -544,6 +547,7 @@ PY
     done
     echo "Recommended config applied: $RECOMMENDED_SETTINGS $RECOMMENDED_ENV"
     echo 'Memories are now shared by every session of this Hermes home; see docs/configuration.md#recommended-configuration.'
+    echo "Consolidation now uses Hermes' model provider: memory text is sent to it and costs tokens."
 fi
 if (( ! SKIP_HERMES_CONFIGURATION )); then
     hermes config set memory.provider mnemosyne

@@ -144,7 +144,8 @@ combined with `--skip-hermes-configuration`.
 The `config.yaml` keys are written directly, not with `mnemosyne config set`: the first
 `config set` copies every setting from the current environment into the file, and since
 the file outranks `MNEMOSYNE_*` variables, that would freeze all of them. The rewrite keeps
-the file's leading comment block but drops any other comments. Two of the keys,
+the ASCII lines of the file's leading comment block (Windows reads the file in the ANSI
+codepage, so it stays pure ASCII) and drops any other comments. Two of the keys,
 `default_scope` and `write_classifier`, can also be set under `memory.mnemosyne` in Hermes'
 `config.yaml`, which the provider reads first; the installer warns when one there disagrees.
 

@@ -535,9 +535,10 @@ if (( ! INCLUDE_HERMES )); then
 
         # --recommended-config writes these to Hermes' .env. Remove them while they still
         # hold the value it wrote, so a reinstall without the flag does not inherit them;
-        # any other value is the user's own.
+        # any other value is the user's own. Read the file itself: `hermes config get` also
+        # reports a value exported in the shell, which `unset` cannot remove.
         for key in MNEMOSYNE_LLM_ENABLED MNEMOSYNE_HOST_LLM_ENABLED; do
-            if [[ "$("$HERMES_BIN" config get "$key" 2>/dev/null | tail -n 1)" == true ]]; then
+            if grep -qx "$key=true" "$HERMES_HOME/.env" 2>/dev/null; then
                 if "$HERMES_BIN" config unset "$key" >/dev/null 2>&1; then
                     write_ok "Unset $key in Hermes .env (written by --recommended-config)"
                 else

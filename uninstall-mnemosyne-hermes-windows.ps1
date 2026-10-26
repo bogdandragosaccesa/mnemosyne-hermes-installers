@@ -288,10 +288,12 @@ if (-not $IncludeHermes) {
 
         # -RecommendedConfig writes these to Hermes' .env. Remove them while they still
         # hold the value it wrote, so a reinstall without the flag does not inherit them;
-        # any other value is the user's own.
+        # any other value is the user's own. Read the file itself: `hermes config get` also
+        # reports a User environment variable, which `unset` cannot remove.
+        $hermesEnvFile = Join-Path $hermesHome '.env'
         foreach ($key in @('MNEMOSYNE_LLM_ENABLED', 'MNEMOSYNE_HOST_LLM_ENABLED')) {
-            $cur = Invoke-NativeCapture -FilePath $hermesExe -ArgumentList @('config', 'get', $key)
-            if (([string]($cur.Output | Select-Object -Last 1)).Trim() -eq 'true') {
+            if ((Test-Path -LiteralPath $hermesEnvFile) -and
+                (Select-String -LiteralPath $hermesEnvFile -Pattern "^$key=true$" -Quiet)) {
                 if ((Invoke-NativeQuiet -FilePath $hermesExe -ArgumentList @('config', 'unset', $key)) -eq 0) {
                     Write-Ok "Unset $key in Hermes .env (written by -RecommendedConfig)"
                 } else {
