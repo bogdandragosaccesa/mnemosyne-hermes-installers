@@ -186,7 +186,10 @@ if ($targets.Count -eq 0) {
 foreach ($n in $envVarsToClear) {
     if ([Environment]::GetEnvironmentVariable($n, 'User')) { Write-Host ("  unset   user environment variable {0}" -f $n) }
 }
-if ($hermesExe -and -not $IncludeHermes) { Write-Host '  unset   memory.provider in Hermes configuration' }
+if ($hermesExe -and -not $IncludeHermes) {
+    Write-Host '  unset   memory.provider in Hermes configuration'
+    Write-Host '  unset   MNEMOSYNE_LLM_ENABLED / MNEMOSYNE_HOST_LLM_ENABLED in Hermes .env, if still true'
+}
 if ($IncludeHermes) {
     if (Test-Path -LiteralPath $gatewayLoginItem) {
         Write-Host ("  remove  {0}   [gateway login item]" -f $gatewayLoginItem)
@@ -279,6 +282,22 @@ if (-not $IncludeHermes) {
                     Write-Ok "Re-enabled $key (built-in memory was disabled for Mnemosyne)"
                 } else {
                     Add-Failure "Could not re-enable $key; set it manually."
+                }
+            }
+        }
+
+        # -RecommendedConfig writes these to Hermes' .env. Remove them while they still
+        # hold the value it wrote, so a reinstall without the flag does not inherit them;
+        # any other value is the user's own. Read the file itself: `hermes config get` also
+        # reports a User environment variable, which `unset` cannot remove.
+        $hermesEnvFile = Join-Path $hermesHome '.env'
+        foreach ($key in @('MNEMOSYNE_LLM_ENABLED', 'MNEMOSYNE_HOST_LLM_ENABLED')) {
+            if ((Test-Path -LiteralPath $hermesEnvFile) -and
+                (Select-String -LiteralPath $hermesEnvFile -Pattern "^$key=true$" -Quiet)) {
+                if ((Invoke-NativeQuiet -FilePath $hermesExe -ArgumentList @('config', 'unset', $key)) -eq 0) {
+                    Write-Ok "Unset $key in Hermes .env (written by -RecommendedConfig)"
+                } else {
+                    Add-Failure "Could not unset $key; remove it from Hermes' .env manually."
                 }
             }
         }

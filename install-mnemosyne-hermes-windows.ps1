@@ -45,6 +45,15 @@
 .PARAMETER SkipHermesConfiguration
     Do not change Hermes provider configuration and do not restart the gateway.
 
+.PARAMETER RecommendedConfig
+    Recommended settings: cross-session recall over global-scope memories and
+    the strict write classifier (drops secrets and noise) in Mnemosyne's
+    config.yaml, and LLM work routed through Hermes via Hermes' .env (memory
+    text then goes to Hermes' model provider and costs tokens). Memories
+    become visible to every session in the bank: do not use it where one
+    Hermes serves several people who must not see each other's memories. See
+    docs/configuration.md#recommended-configuration.
+
 .PARAMETER NonInteractive
     Never prompt; fail instead of asking. Implied when the session is not
     attached to a console.
@@ -61,6 +70,7 @@ param(
     [switch]$All,
     [switch]$DisableBuiltinMemory,
     [switch]$SkipHermesConfiguration,
+    [switch]$RecommendedConfig,
     [switch]$NonInteractive
 )
 
@@ -72,6 +82,9 @@ if ($All -and $NoEmbeddings) {
 }
 if ($DisableBuiltinMemory -and $SkipHermesConfiguration) {
     throw '-DisableBuiltinMemory needs to write Hermes configuration, which -SkipHermesConfiguration forbids. Pick one.'
+}
+if ($RecommendedConfig -and $SkipHermesConfiguration) {
+    throw '-RecommendedConfig needs to write Hermes configuration (.env), which -SkipHermesConfiguration forbids. Pick one.'
 }
 
 # ---------------------------------------------------------------------------
@@ -684,6 +697,108 @@ if (-not $NoEmbeddings) {
             Write-Warn "    winget install --id $vcRedistId"
         }
     }
+}
+
+# Opt-in: Mnemosyne's defaults keep every memory inside the session that wrote it
+# (default_scope=session, cross_session=false), so a new conversation recalls nothing
+# from earlier ones. Before the gateway restart below, so it starts with these.
+if ($RecommendedConfig) {
+    Write-Step 'Writing the recommended Mnemosyne configuration...'
+    # Read from Mnemosyne's config.yaml, which outranks MNEMOSYNE_* variables.
+    $recommendedSettings = 'cross_session=true default_scope=global write_classifier=strict'
+    # Read only from the environment, once, at import (mnemosyne/core/local_llm.py), so they
+    # go into Hermes' .env, which Hermes loads before it imports the provider.
+    $recommendedEnv = 'MNEMOSYNE_LLM_ENABLED=true MNEMOSYNE_HOST_LLM_ENABLED=true'
+    # Not `mnemosyne config set`: its first call seeds every key into config.yaml from this
+    # process's environment, freezing all MNEMOSYNE_* variables, and it reads the file in the
+    # ANSI codepage after this installer has re-encoded it as UTF-8. Write only these keys,
+    # at the path Mnemosyne itself resolves, keeping the file's leading comments (Mnemosyne's
+    # seed header marks auto-seeded values), and flag a Hermes-side memory.mnemosyne.<key>,
+    # which the provider reads before this file. -I: nothing from the current directory is
+    # imported.
+    $writeConfig = @'
+import locale, os, sys, yaml
+from mnemosyne.core.config import get_config
+from mnemosyne.hermes_config import read_hermes_config_key
+path = get_config()._config_path
+data, header = {}, ""
+if path.exists():
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:  # written by an older Mnemosyne in the ANSI codepage
+        fallback = getattr(locale, "getencoding", lambda: locale.getpreferredencoding(False))()
+        try:
+            text = raw.decode(fallback)
+        except UnicodeDecodeError:
+            sys.exit(f"ERROR: {path} is neither UTF-8 nor {fallback}; fix or remove it, then re-run.")
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        sys.exit(f"ERROR: {path} is not valid YAML ({exc}); fix or remove it, then re-run.")
+    if not isinstance(data, dict):
+        sys.exit(f"ERROR: {path} does not hold key: value settings; fix or remove it, then re-run.")
+    # Line endings are dropped and re-added as "\n", which text mode writes as the platform's
+    # own; keeping "\r\n" would come out as "\r\r\n" on Windows and grow on every re-run.
+    for line in text.splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            break
+        if line.isascii():
+            header += line + "\n"
+wanted = dict(arg.split("=", 1) for arg in sys.argv[1:])
+data.update(wanted)
+path.parent.mkdir(parents=True, exist_ok=True)
+# Only ASCII is written (header lines that are not ASCII are dropped, values are escaped),
+# so the file reads the same in any codepage: on Windows the runtime opens it in the ANSI one.
+path.write_text(header + yaml.safe_dump(data, default_flow_style=False, sort_keys=True), encoding="utf-8")
+for key, value in wanted.items():
+    override = read_hermes_config_key(os.environ.get("HERMES_HOME"), key)
+    if override is not None and str(override).lower() != value:
+        print(f"Warning: Hermes' memory.mnemosyne.{key} = {override} overrides {key}={value}."
+              f" Remove it with: hermes config unset memory.mnemosyne.{key}")
+'@
+    # Native stderr under $ErrorActionPreference='Stop' becomes a terminating error.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $written = $writeConfig | & $venvPython -I - @($recommendedSettings -split ' ') 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    foreach ($line in $written) {
+        if ("$line" -like 'Warning:*') { Write-Warn ("$line" -replace '^Warning: ', '') } elseif ("$line".Trim()) { Write-Host "$line" }
+    }
+    if ($code -ne 0) { throw "Writing Mnemosyne's config.yaml failed with exit code $code." }
+    # Read each value back the way the runtime sees it; neither `get` writes anything.
+    foreach ($setting in $recommendedSettings -split ' ') {
+        $key, $value = $setting -split '=', 2
+        $ErrorActionPreference = 'Continue'
+        try {
+            $got = ([string](& $mnemosyneCliExe config get $key 2>$null | Select-Object -Last 1)).Trim()
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+        if ($got -ne "$key = $value") {
+            throw "Mnemosyne config $key reads back as '$got', expected '$key = $value'."
+        }
+    }
+    foreach ($setting in $recommendedEnv -split ' ') {
+        $key, $value = $setting -split '=', 2
+        Invoke-Native -FilePath $hermesExe -Quiet -What "hermes config set $key" -ArgumentList @('config', 'set', $key, $value)
+        $ErrorActionPreference = 'Continue'
+        try {
+            $got = ([string](& $hermesExe config get $key 2>$null | Select-Object -Last 1)).Trim()
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+        if ($got -ne $value) {
+            throw "Hermes .env $key reads back as '$got', expected '$value'."
+        }
+    }
+    Write-Ok "Recommended config applied: $recommendedSettings $recommendedEnv"
+    Write-Warn 'Memories are now shared by every session of this Hermes home; see docs/configuration.md#recommended-configuration.'
+    Write-Warn "Consolidation now uses Hermes' model provider: memory text is sent to it and costs tokens."
 }
 
 if (-not $SkipHermesConfiguration) {
