@@ -5,6 +5,7 @@ NO_EMBEDDINGS=0
 SKIP_HERMES_CONFIGURATION=0
 DISABLE_BUILTIN_MEMORY=0
 ALL_EXTRAS=0
+RECOMMENDED_CONFIG=0
 usage() { cat <<'EOF'
 Usage: install-mnemosyne-hermes-unix.sh [options]
   --no-embeddings              Disable dense vector retrieval (sets MNEMOSYNE_NO_EMBEDDINGS=1)
@@ -15,6 +16,13 @@ Usage: install-mnemosyne-hermes-unix.sh [options]
   --disable-builtin-memory     Turn off Hermes' built-in MEMORY.md / USER.md store, which
                                upstream recommends once Mnemosyne is the provider
   --skip-hermes-configuration  Do not change Hermes provider configuration
+  --recommended-config         Write the recommended Mnemosyne settings to its config.yaml:
+                               cross-session recall over global-scope memories, LLM work
+                               routed through Hermes, and the strict write classifier
+                               (drops secrets and noise). Memories become visible to every
+                               session in the bank: do not use it where one Hermes serves
+                               several people who must not see each other's memories.
+                               See docs/configuration.md#recommended-configuration
   -h, --help                   Show help
 EOF
 }
@@ -24,6 +32,7 @@ for arg in "$@"; do
         --all) ALL_EXTRAS=1 ;;
         --disable-builtin-memory) DISABLE_BUILTIN_MEMORY=1 ;;
         --skip-hermes-configuration) SKIP_HERMES_CONFIGURATION=1 ;;
+        --recommended-config) RECOMMENDED_CONFIG=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
     esac
@@ -455,6 +464,24 @@ if (( ! NO_EMBEDDINGS )); then
         echo 'Warning: Hermes cannot import numpy/onnxruntime from the Mnemosyne environment.' >&2
         echo '         Memories would be stored without embeddings and semantic recall would not match.' >&2
     fi
+fi
+# Opt-in: Mnemosyne's defaults keep every memory inside the session that wrote it
+# (default_scope=session, cross_session=false), so a new conversation recalls nothing
+# from earlier ones. Written through `mnemosyne config set`, which resolves config.yaml
+# exactly as the running provider does. It accepts any key and value without checking,
+# so read each one back. Before the gateway restart below, so it starts with them.
+if (( RECOMMENDED_CONFIG )); then
+    RECOMMENDED_SETTINGS='cross_session=true default_scope=global llm_enabled=true host_llm_enabled=true write_classifier=strict'
+    for setting in $RECOMMENDED_SETTINGS; do
+        key="${setting%%=*}"; value="${setting#*=}"
+        "$MNEMOSYNE_CLI" config set "$key" "$value" >/dev/null
+        got="$("$MNEMOSYNE_CLI" config get "$key" 2>/dev/null || true)"
+        if [[ "$got" != "$key = $value" ]]; then
+            echo "ERROR: Mnemosyne config $key reads back as '${got:-nothing}', expected '$key = $value'." >&2
+            exit 1
+        fi
+    done
+    echo "Recommended config applied: $RECOMMENDED_SETTINGS"
 fi
 if (( ! SKIP_HERMES_CONFIGURATION )); then
     hermes config set memory.provider mnemosyne

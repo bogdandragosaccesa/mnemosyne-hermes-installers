@@ -14,6 +14,7 @@ cd mnemosyne-hermes-installers
 | `--all` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. See [below](#local-sleep-consolidation). |
 | `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store — see [below](#the-built-in-memory-store). |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
+| `--recommended-config` | Write the recommended Mnemosyne settings to its `config.yaml` — see [Configuration](configuration.md#recommended-configuration). Opt-in: it makes memories visible across sessions. |
 | `-h`, `--help` | Show usage. |
 
 ## Windows
@@ -46,6 +47,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | `-All` | As above. |
 | `-DisableBuiltinMemory` | As above. |
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
+| `-RecommendedConfig` | As above. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
 
 `--all` and `--no-embeddings` are mutually exclusive, as are

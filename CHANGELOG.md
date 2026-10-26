@@ -9,6 +9,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `--recommended-config` / `-RecommendedConfig`: opt-in settings for Mnemosyne's
+  `config.yaml` — cross-session recall over global-scope memories, LLM work routed through
+  Hermes, and the strict write classifier. Each key is written with `mnemosyne config set`
+  and read back; the install fails if one does not stick. See
+  [Configuration](docs/configuration.md#recommended-configuration).
 - [`outsourcing-team/`](outsourcing-team/README.md) — a second optional profile set, for the
   vendor side of a contract rather than a product team: eleven role profiles
   (engagement-lead, delivery-manager, business-analyst, domain-consultant,
@@ -115,6 +120,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- [Configuration](docs/configuration.md#sleep-consolidation) listed
+  `MNEMOSYNE_AUTO_SLEEP_ENABLED` as `false` and `MNEMOSYNE_WM_TTL_HOURS` as `24`; upstream's
+  defaults are `true` and `168`.
 - **The Unix uninstaller hung forever without a registered gateway service, and the first
   two fixes for it mishandled gateways.** `hermes gateway restart` runs the gateway in the
   foreground when no service manager owns it. Detecting unit files missed system-scope,

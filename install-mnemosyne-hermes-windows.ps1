@@ -45,6 +45,14 @@
 .PARAMETER SkipHermesConfiguration
     Do not change Hermes provider configuration and do not restart the gateway.
 
+.PARAMETER RecommendedConfig
+    Write the recommended Mnemosyne settings to its config.yaml: cross-session
+    recall over global-scope memories, LLM work routed through Hermes, and the
+    strict write classifier (drops secrets and noise). Memories become visible
+    to every session in the bank: do not use it where one Hermes serves several
+    people who must not see each other's memories. See
+    docs/configuration.md#recommended-configuration.
+
 .PARAMETER NonInteractive
     Never prompt; fail instead of asking. Implied when the session is not
     attached to a console.
@@ -61,6 +69,7 @@ param(
     [switch]$All,
     [switch]$DisableBuiltinMemory,
     [switch]$SkipHermesConfiguration,
+    [switch]$RecommendedConfig,
     [switch]$NonInteractive
 )
 
@@ -684,6 +693,32 @@ if (-not $NoEmbeddings) {
             Write-Warn "    winget install --id $vcRedistId"
         }
     }
+}
+
+# Opt-in: Mnemosyne's defaults keep every memory inside the session that wrote it
+# (default_scope=session, cross_session=false), so a new conversation recalls nothing
+# from earlier ones. Written through `mnemosyne config set`, which resolves config.yaml
+# exactly as the running provider does. It accepts any key and value without checking,
+# so read each one back. Before the gateway restart below, so it starts with them.
+if ($RecommendedConfig) {
+    Write-Step 'Writing the recommended Mnemosyne configuration...'
+    $recommendedSettings = 'cross_session=true default_scope=global llm_enabled=true host_llm_enabled=true write_classifier=strict'
+    foreach ($setting in $recommendedSettings -split ' ') {
+        $key, $value = $setting -split '=', 2
+        Invoke-Native -FilePath $mnemosyneCliExe -Quiet -What "mnemosyne config set $key" -ArgumentList @('config', 'set', $key, $value)
+        # Native stderr under $ErrorActionPreference='Stop' becomes a terminating error.
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $got = ([string](& $mnemosyneCliExe config get $key 2>$null | Select-Object -Last 1)).Trim()
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+        if ($got -ne "$key = $value") {
+            throw "Mnemosyne config $key reads back as '$got', expected '$key = $value'."
+        }
+    }
+    Write-Ok "Recommended config applied: $recommendedSettings"
 }
 
 if (-not $SkipHermesConfiguration) {

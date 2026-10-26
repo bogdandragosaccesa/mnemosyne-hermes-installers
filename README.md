@@ -55,6 +55,7 @@ Linux / macOS:
 | `--all` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. |
 | `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store. |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
+| `--recommended-config` | Write the recommended Mnemosyne settings (cross-session recall, LLM via Hermes, strict write classifier). See [Configuration](docs/configuration.md#recommended-configuration). |
 
 Windows:
 
@@ -69,6 +70,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this windo
 | `-All` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. |
 | `-DisableBuiltinMemory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store. |
 | `-SkipHermesConfiguration` | Register the provider but leave `memory.provider` and the gateway alone. |
+| `-RecommendedConfig` | As `--recommended-config`. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
 
 Hermes' own `MEMORY.md` / `USER.md` store stays active when a provider is registered, and

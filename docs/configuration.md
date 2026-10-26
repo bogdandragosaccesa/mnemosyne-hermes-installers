@@ -113,13 +113,42 @@ compression); leave `MNEMOSYNE_LLM_BASE_URL` unset to keep it that way.
 | `MNEMOSYNE_LLM_BASE_URL` | — | Any OpenAI-compatible endpoint |
 | `MNEMOSYNE_LLM_API_KEY` | — | Key for that endpoint |
 | `MNEMOSYNE_LLM_MODEL` | — | Model identifier |
-| `MNEMOSYNE_AUTO_SLEEP_ENABLED` | `false` | Automatic consolidation |
-| `MNEMOSYNE_WM_TTL_HOURS` | `24` | Working-memory expiry |
+| `MNEMOSYNE_AUTO_SLEEP_ENABLED` | `true` | Automatic consolidation on a background thread |
+| `MNEMOSYNE_WM_TTL_HOURS` | `168` | Age at which a working memory becomes eligible for consolidation |
 | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Eviction threshold |
 
 This is why `mnemosyne stats` can report `Total memories: 0` next to a non-zero working
 count: nothing has been consolidated yet. `mnemosyne sleep` is a no-op until entries are
 old enough.
+
+## Recommended configuration
+
+`--recommended-config` / `-RecommendedConfig` writes five keys to Mnemosyne's `config.yaml`
+(the file in the table at the top, which outranks environment variables), through
+`mnemosyne config set`, and reads each one back. Without the flag the installers leave
+the file alone.
+
+| Key | Written | Default | Why |
+| --- | --- | --- | --- |
+| `cross_session` | `true` | `false` | Recall searches every session of the bank, not just the current one. |
+| `default_scope` | `global` | `session` | New memories are stored as visible to all sessions. |
+| `llm_enabled` | `true` | `true` | LLM summarisation during sleep (pinned, as some configs turn it off). |
+| `host_llm_enabled` | `true` | `false` | Consolidation and fact extraction use Hermes' own authenticated model client, so Mnemosyne needs no credentials of its own. |
+| `write_classifier` | `strict` | `off` | Drops writes that contain a secret-shaped value (API keys, tokens, private keys, credentialed connection strings), built-in noise (shell output, stack traces, bare acknowledgements) and long low-structure dumps. |
+
+With the defaults, every memory stays in the session that wrote it, so a new
+conversation — a new day, a restarted gateway, another client — recalls nothing from
+earlier ones. Hermes starts a new session far more often than most people expect.
+
+> **Do not use it where one Hermes serves several people who must not see each other's
+> memories.** In a group chat Hermes gives each participant their own session key; with
+> these settings recall ignores that boundary for everything in the bank. Leave the flag
+> off there, or give each audience its own Hermes home.
+
+Re-running an installer with the flag rewrites the keys, so a later manual change to one
+of them does not survive it. To undo one, set it back, for example
+`mnemosyne config set cross_session false`. The file lives in the data directory, so the
+uninstallers remove it with the data unless you pass `--keep-data` / `-KeepData`.
 
 ## Windows: the config encoding trap
 
