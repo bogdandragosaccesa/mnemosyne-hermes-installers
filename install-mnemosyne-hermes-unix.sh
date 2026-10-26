@@ -19,7 +19,8 @@ Usage: install-mnemosyne-hermes-unix.sh [options]
   --recommended-config         Recommended settings: cross-session recall over global-scope
                                memories and the strict write classifier (drops secrets and
                                noise) in Mnemosyne's config.yaml, and LLM work routed through
-                               Hermes via Hermes' .env. Memories become visible to every
+                               Hermes via Hermes' .env (memory text then goes to Hermes' model
+                               provider and costs tokens). Memories become visible to every
                                session in the bank: do not use it where one Hermes serves
                                several people who must not see each other's memories.
                                See docs/configuration.md#recommended-configuration
@@ -481,30 +482,42 @@ if (( RECOMMENDED_CONFIG )); then
     RECOMMENDED_ENV='MNEMOSYNE_LLM_ENABLED=true MNEMOSYNE_HOST_LLM_ENABLED=true'
     # Not `mnemosyne config set`: its first call seeds every key into config.yaml from this
     # shell's environment, freezing all MNEMOSYNE_* variables. Write only these keys, at the
-    # path Mnemosyne itself resolves, as UTF-8 (what it reads back), and flag a Hermes-side
-    # memory.mnemosyne.<key>, which the provider reads before this file.
+    # path Mnemosyne itself resolves, keeping the file's leading comments (Mnemosyne's seed
+    # header marks auto-seeded values), and flag a Hermes-side memory.mnemosyne.<key>, which
+    # the provider reads before this file. -I: nothing from the current directory is imported.
     # shellcheck disable=SC2086  # the settings list is meant to split into arguments
-    "$VENV_PYTHON" - $RECOMMENDED_SETTINGS <<'PY'
+    "$VENV_PYTHON" -I - $RECOMMENDED_SETTINGS <<'PY'
 import locale, os, sys, yaml
 from mnemosyne.core.config import get_config
 from mnemosyne.hermes_config import read_hermes_config_key
 path = get_config()._config_path
-data = {}
+data, header = {}, ""
 if path.exists():
     raw = path.read_bytes()
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:  # written by an older Mnemosyne in the ANSI codepage (Windows)
-        fallback = locale.getpreferredencoding(False)
+        fallback = locale.getencoding()
         try:
             text = raw.decode(fallback)
         except UnicodeDecodeError:
             sys.exit(f"ERROR: {path} is neither UTF-8 nor {fallback}; fix or remove it, then re-run.")
-    data = yaml.safe_load(text) or {}
+    try:
+        data = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        sys.exit(f"ERROR: {path} is not valid YAML ({exc}); fix or remove it, then re-run.")
+    if not isinstance(data, dict):
+        sys.exit(f"ERROR: {path} does not hold key: value settings; fix or remove it, then re-run.")
+    for line in text.splitlines(keepends=True):
+        if line.strip() and not line.lstrip().startswith("#"):
+            break
+        header += line
 wanted = dict(arg.split("=", 1) for arg in sys.argv[1:])
 data.update(wanted)
 path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=True, allow_unicode=True), encoding="utf-8")
+# Values are dumped as ASCII (non-ASCII escaped), so they read the same in any codepage:
+# on Windows the runtime opens this file in the ANSI codepage.
+path.write_text(header + yaml.safe_dump(data, default_flow_style=False, sort_keys=True), encoding="utf-8")
 for key, value in wanted.items():
     override = read_hermes_config_key(os.environ.get("HERMES_HOME"), key)
     if override is not None and str(override).lower() != value:

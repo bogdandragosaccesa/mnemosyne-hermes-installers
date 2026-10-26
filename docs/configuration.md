@@ -105,7 +105,8 @@ tuning problem — set `vec_weight: 1.0, fts_weight: 0.0` and see whether anythi
 
 Working memories are promoted to episodic memory by a `sleep()` cycle that summarises
 them with an LLM. It runs entirely locally by default (a GGUF model, then extractive
-compression); leave `MNEMOSYNE_LLM_BASE_URL` unset to keep it that way.
+compression); leave `MNEMOSYNE_LLM_BASE_URL` unset and `MNEMOSYNE_HOST_LLM_ENABLED` off to
+keep it that way. [`--recommended-config`](#recommended-configuration) turns the latter on.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -132,7 +133,7 @@ of them alone.
 | `cross_session` | Mnemosyne `config.yaml` | `true` | `false` | Recall searches every session of the bank, not just the current one. |
 | `default_scope` | Mnemosyne `config.yaml` | `global` | `session` | New memories are stored as visible to all sessions. |
 | `write_classifier` | Mnemosyne `config.yaml` | `strict` | `off` | Drops writes that contain a secret-shaped value (API keys, tokens, private keys, credentialed connection strings), built-in noise (shell output, stack traces, bare acknowledgements) and long low-structure dumps. |
-| `MNEMOSYNE_HOST_LLM_ENABLED` | Hermes `.env` | `true` | `false` | Consolidation and fact extraction use Hermes' own authenticated model client, so Mnemosyne needs no credentials of its own. |
+| `MNEMOSYNE_HOST_LLM_ENABLED` | Hermes `.env` | `true` | `false` | Consolidation and fact extraction use Hermes' own authenticated model client, so Mnemosyne needs no credentials of its own. The text of your memories then goes to Hermes' configured model provider, and those calls cost tokens. |
 | `MNEMOSYNE_LLM_ENABLED` | Hermes `.env` | `true` | `true` | LLM summarisation during sleep, pinned in case the environment turns it off. |
 
 The two LLM switches are environment variables because Mnemosyne reads them only from the
@@ -142,7 +143,8 @@ combined with `--skip-hermes-configuration`.
 
 The `config.yaml` keys are written directly, not with `mnemosyne config set`: the first
 `config set` copies every setting from the current environment into the file, and since
-the file outranks `MNEMOSYNE_*` variables, that would freeze all of them. Two of the keys,
+the file outranks `MNEMOSYNE_*` variables, that would freeze all of them. The rewrite keeps
+the file's leading comment block but drops any other comments. Two of the keys,
 `default_scope` and `write_classifier`, can also be set under `memory.mnemosyne` in Hermes'
 `config.yaml`, which the provider reads first; the installer warns when one there disagrees.
 
@@ -163,8 +165,8 @@ Mnemosyne's `config.yaml` lives at `<MNEMOSYNE_DATA_DIR>/config.yaml`, else
 `<HERMES_HOME>/mnemosyne/config.yaml`. With the default paths that is inside the data
 directory, which the uninstallers delete unless you pass `--keep-data` / `-KeepData`. On
 Linux/macOS with a custom `MNEMOSYNE_HOME` it is not, and it survives an uninstall, so
-delete it yourself. The uninstallers leave the two `.env` lines in place; they are harmless
-without Mnemosyne, and `hermes config unset` removes them.
+delete it yourself. The uninstallers remove the two `.env` lines while they still read
+`true`, the value the flag wrote; any other value is left alone as yours.
 
 ## Windows: the config encoding trap
 
@@ -188,6 +190,7 @@ earlier silently does nothing. If you hit the warning, re-running the installer 
 | `MNEMOSYNE_HOME` | both installers | rc-file `export` / User env var |
 | `MNEMOSYNE_DATA_DIR` | Windows, non-default home only | User env var |
 | `MNEMOSYNE_NO_EMBEDDINGS` | `--no-embeddings` only | rc-file `export` / User env var |
+| `MNEMOSYNE_LLM_ENABLED`, `MNEMOSYNE_HOST_LLM_ENABLED` | `--recommended-config` only | Hermes `.env` |
 
-Everything else is left at its default for you to set. All four are removed by the
-uninstallers.
+Everything else is left at its default for you to set. The uninstallers remove all of
+these (the `.env` lines only while they still read `true`).

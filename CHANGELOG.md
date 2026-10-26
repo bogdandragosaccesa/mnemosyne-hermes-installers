@@ -14,7 +14,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writing only those keys), and LLM work routed through Hermes (in Hermes' `.env`, the only
   place Mnemosyne reads those switches). Each one is read back and the install fails if one
   does not stick; it warns when a Hermes-side `memory.mnemosyne` key overrides one. It
-  cannot be combined with `--skip-hermes-configuration`. See
+  cannot be combined with `--skip-hermes-configuration`. With it, consolidation sends
+  memory text to Hermes' model provider, which costs tokens. The uninstallers remove the two
+  `.env` lines while they still read `true`. See
   [Configuration](docs/configuration.md#recommended-configuration).
 - [`outsourcing-team/`](outsourcing-team/README.md) — a second optional profile set, for the
   vendor side of a contract rather than a product team: eleven role profiles

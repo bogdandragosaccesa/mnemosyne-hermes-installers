@@ -47,6 +47,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this windo
 - The data directory, unless `--keep-data`
 - The persisted environment variables — the `export` lines the Unix installer appended to
   your rc file, or the Windows User environment variables
+- `MNEMOSYNE_LLM_ENABLED` / `MNEMOSYNE_HOST_LLM_ENABLED` in Hermes' `.env`, written by
+  `--recommended-config`, while they still read `true`
 - Any `mnemosyne` packages bootstrapped into Hermes' own virtual environment
 
 Both scripts stop the gateway first, and any process still holding the virtual

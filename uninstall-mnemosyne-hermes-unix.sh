@@ -381,6 +381,7 @@ EOF
 
 if [[ -n "$HERMES_BIN" ]] && (( ! INCLUDE_HERMES )); then
     printf '  unset   memory.provider in Hermes configuration\n'
+    printf '  unset   MNEMOSYNE_LLM_ENABLED / MNEMOSYNE_HOST_LLM_ENABLED in Hermes .env, if still true\n'
 fi
 if (( INCLUDE_HERMES )); then
     while IFS= read -r unit; do
@@ -528,6 +529,19 @@ if (( ! INCLUDE_HERMES )); then
                     write_ok "Re-enabled $key (built-in memory was disabled for Mnemosyne)"
                 else
                     add_failure "Could not re-enable $key; set it manually."
+                fi
+            fi
+        done
+
+        # --recommended-config writes these to Hermes' .env. Remove them while they still
+        # hold the value it wrote, so a reinstall without the flag does not inherit them;
+        # any other value is the user's own.
+        for key in MNEMOSYNE_LLM_ENABLED MNEMOSYNE_HOST_LLM_ENABLED; do
+            if [[ "$("$HERMES_BIN" config get "$key" 2>/dev/null | tail -n 1)" == true ]]; then
+                if "$HERMES_BIN" config unset "$key" >/dev/null 2>&1; then
+                    write_ok "Unset $key in Hermes .env (written by --recommended-config)"
+                else
+                    add_failure "Could not unset $key; remove it from Hermes' .env manually."
                 fi
             fi
         done
