@@ -9,10 +9,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `--recommended-config` / `-RecommendedConfig`: opt-in settings for Mnemosyne's
-  `config.yaml` — cross-session recall over global-scope memories, LLM work routed through
-  Hermes, and the strict write classifier. Each key is written with `mnemosyne config set`
-  and read back; the install fails if one does not stick. See
+- `--recommended-config` / `-RecommendedConfig`: opt-in settings for cross-session recall
+  over global-scope memories and the strict write classifier (in Mnemosyne's `config.yaml`,
+  writing only those keys), and LLM work routed through Hermes (in Hermes' `.env`, the only
+  place Mnemosyne reads those switches). Each one is read back and the install fails if one
+  does not stick; it warns when a Hermes-side `memory.mnemosyne` key overrides one. It
+  cannot be combined with `--skip-hermes-configuration`. See
   [Configuration](docs/configuration.md#recommended-configuration).
 - [`outsourcing-team/`](outsourcing-team/README.md) — a second optional profile set, for the
   vendor side of a contract rather than a product team: eleven role profiles
@@ -122,7 +124,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - [Configuration](docs/configuration.md#sleep-consolidation) listed
   `MNEMOSYNE_AUTO_SLEEP_ENABLED` as `false` and `MNEMOSYNE_WM_TTL_HOURS` as `24`; upstream's
-  defaults are `true` and `168`.
+  defaults are `true` and `168`. The Hermes provider key `auto_sleep` was likewise listed as
+  `false`; it defaults to `true`.
 - **The Unix uninstaller hung forever without a registered gateway service, and the first
   two fixes for it mishandled gateways.** `hermes gateway restart` runs the gateway in the
   foreground when no service manager owns it. Detecting unit files missed system-scope,

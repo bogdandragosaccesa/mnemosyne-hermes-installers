@@ -14,7 +14,7 @@ cd mnemosyne-hermes-installers
 | `--all` | Install `mnemosyne-memory[all]` — adds the local consolidation LLM. See [below](#local-sleep-consolidation). |
 | `--disable-builtin-memory` | Turn off Hermes' built-in `MEMORY.md` / `USER.md` store — see [below](#the-built-in-memory-store). |
 | `--skip-hermes-configuration` | Register the provider but leave `memory.provider` and the gateway alone. |
-| `--recommended-config` | Write the recommended Mnemosyne settings to its `config.yaml` — see [Configuration](configuration.md#recommended-configuration). Opt-in: it makes memories visible across sessions. |
+| `--recommended-config` | Write the recommended settings to Mnemosyne's `config.yaml` and Hermes' `.env` — see [Configuration](configuration.md#recommended-configuration). Opt-in: it makes memories visible across sessions. |
 | `-h`, `--help` | Show usage. |
 
 ## Windows
@@ -50,9 +50,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | `-RecommendedConfig` | As above. |
 | `-NonInteractive` | Never prompt. Implied when no console is attached. |
 
-`--all` and `--no-embeddings` are mutually exclusive, as are
-`--disable-builtin-memory` and `--skip-hermes-configuration`; passing both of either pair
-is an error rather than a silent precedence rule.
+`--all` and `--no-embeddings` are mutually exclusive, and so is
+`--skip-hermes-configuration` with either `--disable-builtin-memory` or
+`--recommended-config` (both write Hermes configuration); passing a conflicting pair is an
+error rather than a silent precedence rule.
 
 ## Local sleep consolidation
 

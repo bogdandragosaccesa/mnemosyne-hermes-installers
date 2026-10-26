@@ -26,7 +26,7 @@ any of them — they only set `memory.provider: mnemosyne`.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `auto_sleep` | `false` | Run `sleep()` automatically once working memory passes the threshold |
+| `auto_sleep` | `true` | Run `sleep()` automatically once working memory passes the threshold |
 | `sleep_threshold` | `50` | Working-memory count that triggers auto-sleep |
 | `vector_type` | `int8` | Vector storage type (`float32`, `int8`, `bit`) |
 | `ignore_patterns` | `[]` | Regex patterns to keep out of memory |
@@ -123,18 +123,28 @@ old enough.
 
 ## Recommended configuration
 
-`--recommended-config` / `-RecommendedConfig` writes five keys to Mnemosyne's `config.yaml`
-(the file in the table at the top, which outranks environment variables), through
-`mnemosyne config set`, and reads each one back. Without the flag the installers leave
-the file alone.
+`--recommended-config` / `-RecommendedConfig` writes the settings below and reads each one
+back, failing the install if one does not stick. Without the flag the installers leave all
+of them alone.
 
-| Key | Written | Default | Why |
-| --- | --- | --- | --- |
-| `cross_session` | `true` | `false` | Recall searches every session of the bank, not just the current one. |
-| `default_scope` | `global` | `session` | New memories are stored as visible to all sessions. |
-| `llm_enabled` | `true` | `true` | LLM summarisation during sleep (pinned, as some configs turn it off). |
-| `host_llm_enabled` | `true` | `false` | Consolidation and fact extraction use Hermes' own authenticated model client, so Mnemosyne needs no credentials of its own. |
-| `write_classifier` | `strict` | `off` | Drops writes that contain a secret-shaped value (API keys, tokens, private keys, credentialed connection strings), built-in noise (shell output, stack traces, bare acknowledgements) and long low-structure dumps. |
+| Setting | Where | Written | Default | Why |
+| --- | --- | --- | --- | --- |
+| `cross_session` | Mnemosyne `config.yaml` | `true` | `false` | Recall searches every session of the bank, not just the current one. |
+| `default_scope` | Mnemosyne `config.yaml` | `global` | `session` | New memories are stored as visible to all sessions. |
+| `write_classifier` | Mnemosyne `config.yaml` | `strict` | `off` | Drops writes that contain a secret-shaped value (API keys, tokens, private keys, credentialed connection strings), built-in noise (shell output, stack traces, bare acknowledgements) and long low-structure dumps. |
+| `MNEMOSYNE_HOST_LLM_ENABLED` | Hermes `.env` | `true` | `false` | Consolidation and fact extraction use Hermes' own authenticated model client, so Mnemosyne needs no credentials of its own. |
+| `MNEMOSYNE_LLM_ENABLED` | Hermes `.env` | `true` | `true` | LLM summarisation during sleep, pinned in case the environment turns it off. |
+
+The two LLM switches are environment variables because Mnemosyne reads them only from the
+environment, once, when it is imported; written to `config.yaml` they would have no effect.
+Hermes loads its `.env` before it imports the provider. That is also why the flag cannot be
+combined with `--skip-hermes-configuration`.
+
+The `config.yaml` keys are written directly, not with `mnemosyne config set`: the first
+`config set` copies every setting from the current environment into the file, and since
+the file outranks `MNEMOSYNE_*` variables, that would freeze all of them. Two of the keys,
+`default_scope` and `write_classifier`, can also be set under `memory.mnemosyne` in Hermes'
+`config.yaml`, which the provider reads first; the installer warns when one there disagrees.
 
 With the defaults, every memory stays in the session that wrote it, so a new
 conversation — a new day, a restarted gateway, another client — recalls nothing from
@@ -145,10 +155,16 @@ earlier ones. Hermes starts a new session far more often than most people expect
 > these settings recall ignores that boundary for everything in the bank. Leave the flag
 > off there, or give each audience its own Hermes home.
 
-Re-running an installer with the flag rewrites the keys, so a later manual change to one
-of them does not survive it. To undo one, set it back, for example
-`mnemosyne config set cross_session false`. The file lives in the data directory, so the
-uninstallers remove it with the data unless you pass `--keep-data` / `-KeepData`.
+Re-running an installer with the flag rewrites these settings, so a later manual change to
+one of them does not survive it. To undo one, set it back, for example
+`mnemosyne config set cross_session false` or `hermes config unset MNEMOSYNE_HOST_LLM_ENABLED`.
+
+Mnemosyne's `config.yaml` lives at `<MNEMOSYNE_DATA_DIR>/config.yaml`, else
+`<HERMES_HOME>/mnemosyne/config.yaml`. With the default paths that is inside the data
+directory, which the uninstallers delete unless you pass `--keep-data` / `-KeepData`. On
+Linux/macOS with a custom `MNEMOSYNE_HOME` it is not, and it survives an uninstall, so
+delete it yourself. The uninstallers leave the two `.env` lines in place; they are harmless
+without Mnemosyne, and `hermes config unset` removes them.
 
 ## Windows: the config encoding trap
 

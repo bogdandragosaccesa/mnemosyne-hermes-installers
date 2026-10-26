@@ -16,10 +16,10 @@ Usage: install-mnemosyne-hermes-unix.sh [options]
   --disable-builtin-memory     Turn off Hermes' built-in MEMORY.md / USER.md store, which
                                upstream recommends once Mnemosyne is the provider
   --skip-hermes-configuration  Do not change Hermes provider configuration
-  --recommended-config         Write the recommended Mnemosyne settings to its config.yaml:
-                               cross-session recall over global-scope memories, LLM work
-                               routed through Hermes, and the strict write classifier
-                               (drops secrets and noise). Memories become visible to every
+  --recommended-config         Recommended settings: cross-session recall over global-scope
+                               memories and the strict write classifier (drops secrets and
+                               noise) in Mnemosyne's config.yaml, and LLM work routed through
+                               Hermes via Hermes' .env. Memories become visible to every
                                session in the bank: do not use it where one Hermes serves
                                several people who must not see each other's memories.
                                See docs/configuration.md#recommended-configuration
@@ -44,6 +44,11 @@ if (( ALL_EXTRAS && NO_EMBEDDINGS )); then
 fi
 if (( DISABLE_BUILTIN_MEMORY && SKIP_HERMES_CONFIGURATION )); then
     echo '--disable-builtin-memory needs to write Hermes configuration, which' >&2
+    echo '--skip-hermes-configuration forbids. Pick one.' >&2
+    exit 2
+fi
+if (( RECOMMENDED_CONFIG && SKIP_HERMES_CONFIGURATION )); then
+    echo '--recommended-config needs to write Hermes configuration (.env), which' >&2
     echo '--skip-hermes-configuration forbids. Pick one.' >&2
     exit 2
 fi
@@ -467,21 +472,65 @@ if (( ! NO_EMBEDDINGS )); then
 fi
 # Opt-in: Mnemosyne's defaults keep every memory inside the session that wrote it
 # (default_scope=session, cross_session=false), so a new conversation recalls nothing
-# from earlier ones. Written through `mnemosyne config set`, which resolves config.yaml
-# exactly as the running provider does. It accepts any key and value without checking,
-# so read each one back. Before the gateway restart below, so it starts with them.
+# from earlier ones. Before the gateway restart below, so it starts with these.
 if (( RECOMMENDED_CONFIG )); then
-    RECOMMENDED_SETTINGS='cross_session=true default_scope=global llm_enabled=true host_llm_enabled=true write_classifier=strict'
+    # Read from Mnemosyne's config.yaml, which outranks MNEMOSYNE_* variables.
+    RECOMMENDED_SETTINGS='cross_session=true default_scope=global write_classifier=strict'
+    # Read only from the environment, once, at import (mnemosyne/core/local_llm.py), so they go
+    # into Hermes' .env, which Hermes loads before it imports the provider.
+    RECOMMENDED_ENV='MNEMOSYNE_LLM_ENABLED=true MNEMOSYNE_HOST_LLM_ENABLED=true'
+    # Not `mnemosyne config set`: its first call seeds every key into config.yaml from this
+    # shell's environment, freezing all MNEMOSYNE_* variables. Write only these keys, at the
+    # path Mnemosyne itself resolves, as UTF-8 (what it reads back), and flag a Hermes-side
+    # memory.mnemosyne.<key>, which the provider reads before this file.
+    # shellcheck disable=SC2086  # the settings list is meant to split into arguments
+    "$VENV_PYTHON" - $RECOMMENDED_SETTINGS <<'PY'
+import locale, os, sys, yaml
+from mnemosyne.core.config import get_config
+from mnemosyne.hermes_config import read_hermes_config_key
+path = get_config()._config_path
+data = {}
+if path.exists():
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:  # written by an older Mnemosyne in the ANSI codepage (Windows)
+        fallback = locale.getpreferredencoding(False)
+        try:
+            text = raw.decode(fallback)
+        except UnicodeDecodeError:
+            sys.exit(f"ERROR: {path} is neither UTF-8 nor {fallback}; fix or remove it, then re-run.")
+    data = yaml.safe_load(text) or {}
+wanted = dict(arg.split("=", 1) for arg in sys.argv[1:])
+data.update(wanted)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=True, allow_unicode=True), encoding="utf-8")
+for key, value in wanted.items():
+    override = read_hermes_config_key(os.environ.get("HERMES_HOME"), key)
+    if override is not None and str(override).lower() != value:
+        print(f"Warning: Hermes' memory.mnemosyne.{key} = {override} overrides {key}={value}."
+              f" Remove it with: hermes config unset memory.mnemosyne.{key}", file=sys.stderr)
+PY
+    # Read each value back the way the runtime sees it; neither `get` writes anything.
     for setting in $RECOMMENDED_SETTINGS; do
         key="${setting%%=*}"; value="${setting#*=}"
-        "$MNEMOSYNE_CLI" config set "$key" "$value" >/dev/null
         got="$("$MNEMOSYNE_CLI" config get "$key" 2>/dev/null || true)"
         if [[ "$got" != "$key = $value" ]]; then
             echo "ERROR: Mnemosyne config $key reads back as '${got:-nothing}', expected '$key = $value'." >&2
             exit 1
         fi
     done
-    echo "Recommended config applied: $RECOMMENDED_SETTINGS"
+    for setting in $RECOMMENDED_ENV; do
+        key="${setting%%=*}"; value="${setting#*=}"
+        hermes config set "$key" "$value" >/dev/null
+        got="$(hermes config get "$key" 2>/dev/null || true)"
+        if [[ "$got" != "$value" ]]; then
+            echo "ERROR: Hermes .env $key reads back as '${got:-nothing}', expected '$value'." >&2
+            exit 1
+        fi
+    done
+    echo "Recommended config applied: $RECOMMENDED_SETTINGS $RECOMMENDED_ENV"
+    echo 'Memories are now shared by every session of this Hermes home; see docs/configuration.md#recommended-configuration.'
 fi
 if (( ! SKIP_HERMES_CONFIGURATION )); then
     hermes config set memory.provider mnemosyne
