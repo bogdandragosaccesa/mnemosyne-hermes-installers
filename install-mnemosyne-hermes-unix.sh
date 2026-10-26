@@ -508,13 +508,13 @@ if path.exists():
         sys.exit(f"ERROR: {path} is not valid YAML ({exc}); fix or remove it, then re-run.")
     if not isinstance(data, dict):
         sys.exit(f"ERROR: {path} does not hold key: value settings; fix or remove it, then re-run.")
-    for line in text.splitlines(keepends=True):
+    # Line endings are dropped and re-added as "\n", which text mode writes as the platform's
+    # own; keeping "\r\n" would come out as "\r\r\n" on Windows and grow on every re-run.
+    for line in text.splitlines():
         if line.strip() and not line.lstrip().startswith("#"):
             break
         if line.isascii():
-            header += line
-if header and not header.endswith("\n"):
-    header += "\n"
+            header += line + "\n"
 wanted = dict(arg.split("=", 1) for arg in sys.argv[1:])
 data.update(wanted)
 path.parent.mkdir(parents=True, exist_ok=True)
