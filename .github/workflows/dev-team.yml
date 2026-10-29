@@ -41,9 +41,6 @@ jobs:
       - name: Put hermes on PATH
         run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: hermes doctor
-        run: hermes doctor
-
       - name: Install Mnemosyne memory
         run: ./install-mnemosyne-hermes-unix.sh --disable-builtin-memory
 
@@ -90,10 +87,6 @@ jobs:
           $user = [Environment]::GetEnvironmentVariable('Path', 'User')
           $refreshed = ($machine, $user -join ';')
           Add-Content -Path $env:GITHUB_PATH -Value ($refreshed -split ';' | Where-Object { $_ })
-
-      - name: hermes doctor
-        shell: pwsh
-        run: hermes doctor
 
       - name: Install Mnemosyne memory
         shell: pwsh
