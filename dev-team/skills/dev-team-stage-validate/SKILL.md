@@ -23,20 +23,30 @@ judge whether it functions.
 | `evidence` | list | must be a list |
 | `findings` | list, **required only when `verdict` is `"fail"`** | non-empty |
 
+## Assignee names carry the team prefix
+
+Profiles are installed with a team prefix (`dev-` by default, set by the installer's
+`--prefix`). The installer writes it to `$HERMES_HOME/dev-team-prefix`; read it with
+`cat "$HERMES_HOME/dev-team-prefix"` (PowerShell: `Get-Content "$env:HERMES_HOME\dev-team-prefix"`)
+and build every assignee as `<prefix><role>`, e.g. `dev-qa`. In the examples below `<prefix>`
+stands for that value. Never assign a bare role name such as `qa`: the dispatcher would spawn
+a different, unguarded profile of that name. If the file is missing or empty,
+`kanban_block(kind="needs_input")` with a reason starting `setup: no-prefix` instead of guessing.
+
 ## The child card
 
 - **`verdict: "pass"`** → create one `review` child:
   ```
-  kanban_create(assignee="reviewer", parents=[<this card's id>],
+  kanban_create(assignee="<prefix>reviewer", parents=[<this card's id>],
                 skills=["dev-team-stage-review"], title="...")
   ```
 - **anything else (`"fail"`, or any value the guard doesn't recognise as the success case)** →
   create one new `implement` child instead, carrying your `findings`:
   ```
-  kanban_create(assignee="backend-db", parents=[<this card's id>],
+  kanban_create(assignee="<prefix>backend-db", parents=[<this card's id>],
                 skills=["dev-team-stage-implement"], title="...")
   ```
-  (pick whichever role — backend-db or frontend — the findings actually need)
+  (pick whichever profile — `<prefix>backend-db` or `<prefix>frontend` — the findings actually need)
 
 Either way, the guard requires exactly one card in `created_cards` with the right stage skill
 and this card as a parent. A `"fail"` verdict is a rework round and counts against the round

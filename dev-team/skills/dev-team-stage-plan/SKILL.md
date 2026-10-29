@@ -11,8 +11,8 @@ the facts below on `kanban_complete`; everything else (how you decompose the wor
 decisions you delegate) is yours to judge as pm, per your soul's "Specialists own their
 domains. I own the sequence."
 
-Delegate one-way-door architecture decisions to a child `architect` card, and interface
-decisions to a child `uiux` card, when the change needs them (per the design's Profiles table).
+Delegate one-way-door architecture decisions to a child card assigned to `<prefix>architect`,
+and interface decisions to a child card assigned to `<prefix>uiux` (see the prefix note below), when the change needs them (per the design's Profiles table).
 Those are ordinary child cards for your own judgment calls — they do not themselves carry a
 `dev-team-stage-*` skill, and the guard does not look for them.
 
@@ -25,6 +25,16 @@ Those are ordinary child cards for your own judgment calls — they do not thems
 `cards` lists the `implement` card(s) you create as this plan card's direct child(ren). List
 each one so the check above can verify them.
 
+## Assignee names carry the team prefix
+
+Profiles are installed with a team prefix (`dev-` by default, set by the installer's
+`--prefix`). The installer writes it to `$HERMES_HOME/dev-team-prefix`; read it with
+`cat "$HERMES_HOME/dev-team-prefix"` (PowerShell: `Get-Content "$env:HERMES_HOME\dev-team-prefix"`)
+and build every assignee as `<prefix><role>`, e.g. `dev-qa`. In the examples below `<prefix>`
+stands for that value. Never assign a bare role name such as `qa`: the dispatcher would spawn
+a different, unguarded profile of that name. If the file is missing or empty,
+`kanban_block(kind="needs_input")` with a reason starting `setup: no-prefix` instead of guessing.
+
 ## The child card
 
 Before completing, create the `implement` card as this card's direct child:
@@ -32,7 +42,7 @@ Before completing, create the `implement` card as this card's direct child:
 ```
 kanban_create(
     title="...",
-    assignee="backend-db",   # or "frontend", whichever role this unit needs
+    assignee="<prefix>backend-db",   # or "<prefix>frontend", whichever role this unit needs
     parents=[<this plan card's id>],
     skills=["dev-team-stage-implement"],
 )

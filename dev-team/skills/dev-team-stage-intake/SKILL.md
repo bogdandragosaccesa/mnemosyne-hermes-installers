@@ -29,6 +29,16 @@ are allowed.
 Getting `repo` wrong is expensive to unwind later: devops's onboarding (`dev-team-stage-pr-ci`)
 and the guard's own CI re-verification both resolve everything through this one string.
 
+## Assignee names carry the team prefix
+
+Profiles are installed with a team prefix (`dev-` by default, set by the installer's
+`--prefix`). The installer writes it to `$HERMES_HOME/dev-team-prefix`; read it with
+`cat "$HERMES_HOME/dev-team-prefix"` (PowerShell: `Get-Content "$env:HERMES_HOME\dev-team-prefix"`)
+and build every assignee as `<prefix><role>`, e.g. `dev-qa`. In the examples below `<prefix>`
+stands for that value. Never assign a bare role name such as `qa`: the dispatcher would spawn
+a different, unguarded profile of that name. If the file is missing or empty,
+`kanban_block(kind="needs_input")` with a reason starting `setup: no-prefix` instead of guessing.
+
 ## The child card
 
 On every successful `kanban_complete`, create exactly one `plan` card before completing:
@@ -36,7 +46,7 @@ On every successful `kanban_complete`, create exactly one `plan` card before com
 ```
 kanban_create(
     title="...",
-    assignee="pm",
+    assignee="<prefix>pm",
     parents=[<this card's id>],
     skills=["dev-team-stage-plan"],
 )

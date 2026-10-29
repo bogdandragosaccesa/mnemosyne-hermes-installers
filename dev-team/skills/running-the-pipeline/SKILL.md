@@ -44,7 +44,9 @@ protection covers only `main`/`master` for this repo until onboarding writes the
 (`_record_default_branch` in the guard reads it from there). Sequence it, not `pr-ci`, as the
 one doing this work:
 
-1. After creating the board above, create a `devops` onboarding card — an ordinary card
+1. After creating the board above, create an onboarding card assigned to `<prefix>devops`
+   (`<prefix>` is the team prefix in `$HERMES_HOME/dev-team-prefix`, `dev-` by default; never
+   the bare `devops`, which is a different, unguarded profile) — an ordinary card
    carrying no `dev-team-stage-*` skill, so the guard does not gate it — to run exactly the
    forge-onboarding steps documented in `dev-team-stage-pr-ci` (clone, `.worktrees/` exclude,
    `forge detect`, `default_workdir`).

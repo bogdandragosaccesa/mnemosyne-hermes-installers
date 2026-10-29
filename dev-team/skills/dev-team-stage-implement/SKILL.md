@@ -29,6 +29,16 @@ There is no verdict field here: an implement card either produces this metadata 
 child, or it is blocked. Don't call `kanban_complete` with a failing test in `tests_run` hoping
 the guard will route it as rework — it won't; fix it or block.
 
+## Assignee names carry the team prefix
+
+Profiles are installed with a team prefix (`dev-` by default, set by the installer's
+`--prefix`). The installer writes it to `$HERMES_HOME/dev-team-prefix`; read it with
+`cat "$HERMES_HOME/dev-team-prefix"` (PowerShell: `Get-Content "$env:HERMES_HOME\dev-team-prefix"`)
+and build every assignee as `<prefix><role>`, e.g. `dev-qa`. In the examples below `<prefix>`
+stands for that value. Never assign a bare role name such as `qa`: the dispatcher would spawn
+a different, unguarded profile of that name. If the file is missing or empty,
+`kanban_block(kind="needs_input")` with a reason starting `setup: no-prefix` instead of guessing.
+
 ## The child card
 
 Before completing, create exactly one `validate` card as this card's direct child:
@@ -36,7 +46,7 @@ Before completing, create exactly one `validate` card as this card's direct chil
 ```
 kanban_create(
     title="...",
-    assignee="qa",
+    assignee="<prefix>qa",
     parents=[<this implement card's id>],
     skills=["dev-team-stage-validate"],
 )

@@ -79,7 +79,7 @@ A stage is identified by the stage skill the card was created with
 from its title or body. A card with no stage skill only skips the `kanban_complete` stage
 checks — the merge/deploy and default-branch push blocks below still apply regardless.
 
-| Stage | Assignee | Required `metadata` on `kanban_complete` |
+| Stage | Assignee (prefixed: `<prefix><role>`, e.g. `dev-qa`) | Required `metadata` on `kanban_complete` |
 | --- | --- | --- |
 | `intake` | pm | `definition_of_done` (list), `budget` (`{amount, unit}`), `repo` |
 | `plan` | pm | `cards` (ids of the implement cards it created, each verified to carry a stage skill) |
@@ -119,7 +119,7 @@ naming what couldn't be checked — the guard fails closed, never open.
 | --- | --- | --- |
 | `--model MODEL` | `-Model` | Set one model on every profile, overriding the per-role tier table (frontier for `pm`, `architect`, `reviewer`; mid for the rest). A real model id, never a tier word. |
 | `--only a,b,c` | `-Only` | Create only these profiles (bare role names, unaffected by the prefix) instead of all eight. |
-| `--prefix PREFIX` | `-Prefix` | Prepend `PREFIX` to every profile name (default `dev-`), e.g. `--prefix t2-` creates `t2-qa`. Letters, digits, hyphen and underscore only; an empty or invalid prefix exits 2 before any Hermes call. Use to run a second team alongside the first. |
+| `--prefix PREFIX` | `-Prefix` | Prepend `PREFIX` to every profile name (default `dev-`), e.g. `--prefix t2-` creates `t2-qa`. Letters, digits, hyphen and underscore only; an empty or invalid prefix exits 2 before any Hermes call. Use to run a second team alongside the first. The prefix is written to `<profile>/dev-team-prefix`, and the skills tell agents to build every card assignee from it (`<prefix>qa`, never a bare `qa`). |
 | `--skip-model` | `-SkipModel` | Leave each profile's model at whatever it inherited. |
 | `--keep-soul` | `-KeepSoul` | Do not overwrite an existing `SOUL.md`. |
 | `--separate-memory` | `-SeparateMemory` | Give each profile its own Mnemosyne database instead of sharing the root one. Roles then cannot read each other's notes, so the board no longer hands work between them cleanly. |

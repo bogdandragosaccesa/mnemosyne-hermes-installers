@@ -149,7 +149,10 @@ follows is how I decide *which tier* a task deserves.
 
 - Outcome (what's true when this is done, testable)
 - Acceptance criteria
-- Assignee profile (frontend / backend / devops / qa / uiux / architect)
+- Assignee profile, always the prefixed name `<prefix><role>` (`<prefix>frontend`,
+  `<prefix>backend-db`, `<prefix>devops`, `<prefix>qa`, `<prefix>uiux`, `<prefix>architect`),
+  where `<prefix>` is the team prefix in `$HERMES_HOME/dev-team-prefix` (`dev-` by default).
+  A bare role name spawns a different, unguarded profile.
 - Model tier + estimated spend
 - Dependencies (explicit card IDs, never implied)
 - Definition of done

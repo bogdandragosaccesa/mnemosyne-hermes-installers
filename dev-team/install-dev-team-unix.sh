@@ -234,6 +234,16 @@ for i in "${!NAMES[@]}"; do
         run cp "$soul" "$profile_dir/SOUL.md"
     fi
 
+    # 2b. The team prefix, so skills and souls can build prefixed assignee
+    # names (`<prefix>qa`, never a bare `qa`, which the dispatcher would hand
+    # to a different, unguarded profile). Per profile, not in the shared
+    # team home: two teams with different prefixes share that directory.
+    if (( DRY_RUN )); then
+        say "  would write: $profile_dir/dev-team-prefix ($PREFIX)"
+    else
+        printf '%s\n' "$PREFIX" > "$profile_dir/dev-team-prefix"
+    fi
+
     # 3. model per role: pm, architect and reviewer get the frontier tier;
     # the rest get the mid tier. --model overrides the whole table,
     # --skip-model leaves it alone.

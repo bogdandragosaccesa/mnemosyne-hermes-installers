@@ -61,6 +61,17 @@ jobs:
       - name: dev-team install (run 2, idempotency)
         run: dev-team/install-dev-team-unix.sh --skip-model
 
+      - name: every dev-* profile records its team prefix
+        run: |
+          for role in pm architect uiux backend-db frontend qa reviewer devops; do
+            dir="$(dirname "$(hermes -p "dev-$role" config path)")"
+            got="$(cat "$dir/dev-team-prefix")"
+            if [ "$got" != "dev-" ]; then
+              echo "::error::dev-$role: dev-team-prefix is '$got', expected 'dev-'" >&2
+              exit 1
+            fi
+          done
+
       - name: test_prefix_isolation — qa SOUL.md hash is unchanged
         run: |
           qa_dir="$(dirname "$(hermes -p qa config path)")"
@@ -112,6 +123,15 @@ jobs:
       - name: dev-team install (run 2, idempotency)
         shell: pwsh
         run: dev-team\install-dev-team-windows.ps1 -SkipModel
+
+      - name: every dev-* profile records its team prefix
+        shell: pwsh
+        run: |
+          foreach ($role in 'pm','architect','uiux','backend-db','frontend','qa','reviewer','devops') {
+            $dir = Split-Path -Parent (hermes -p "dev-$role" config path | Select-Object -Last 1)
+            $got = (Get-Content -LiteralPath (Join-Path $dir 'dev-team-prefix') -Raw).Trim()
+            if ($got -ne 'dev-') { Write-Error "dev-$role : dev-team-prefix is '$got', expected 'dev-'"; exit 1 }
+          }
 
       - name: test_prefix_isolation — qa SOUL.md hash is unchanged
         shell: pwsh

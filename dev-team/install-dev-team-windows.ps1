@@ -317,6 +317,17 @@ foreach ($role in $Profiles.Keys) {
         Copy-Item -LiteralPath $soul -Destination (Join-Path $profileDir 'SOUL.md') -Force
     }
 
+    # 2b. The team prefix, so skills and souls can build prefixed assignee
+    # names (`<prefix>qa`, never a bare `qa`, which the dispatcher would hand
+    # to a different, unguarded profile). Per profile, not in the shared team
+    # home: two teams with different prefixes share that directory.
+    $prefixFile = Join-Path $profileDir 'dev-team-prefix'
+    if ($DryRun) {
+        Write-Host "  would write: $prefixFile ($Prefix)"
+    } else {
+        Set-Content -LiteralPath $prefixFile -Value "$Prefix`n" -NoNewline -Encoding ascii
+    }
+
     if ($DryRun) {
         Write-Host "  would link: $profileDir\plugins\mnemosyne -> $PluginSrcMnemo"
         if (-not $SeparateMemory) {
