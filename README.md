@@ -29,11 +29,14 @@ different commits. See [Installation](docs/installation.md#where-mnemosyne-comes
   the gateway, uninstall ordering
 - [Troubleshooting](docs/troubleshooting.md) — silent embedding failures, DLL errors,
   leftovers
-- [SDLC team profiles](old/sdlc-team/README.md) — optional: nine role profiles, each with its
-  own SOUL, all wired to Mnemosyne
-- [Outsourcing team profiles](old/outsourcing-team/README.md) — optional: eleven role profiles
-  for delivering into a client's estate under contract, each with its own SOUL, driven from
-  the kanban board through one entry-point profile
+- [dev-team](dev-team/README.md) — an autonomous software delivery team: eight role profiles
+  governed by a Hermes plugin that mechanically enforces stage completion (QA, review, green
+  CI) instead of trusting an agent's say-so. The maintained team; start here.
+- [SDLC team profiles](old/sdlc-team/README.md) — superseded by `dev-team/`, kept frozen: nine
+  role profiles, each with its own SOUL, all wired to Mnemosyne
+- [Outsourcing team profiles](old/outsourcing-team/README.md) — superseded by `dev-team/`, kept
+  frozen: eleven role profiles for delivering into a client's estate under contract, each with
+  its own SOUL, driven from the kanban board through one entry-point profile
 - [Changelog](CHANGELOG.md)
 - [TODO](TODO.md) — outstanding work, chiefly macOS verification
 
