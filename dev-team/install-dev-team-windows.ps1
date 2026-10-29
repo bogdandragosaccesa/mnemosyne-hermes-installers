@@ -79,12 +79,12 @@ $ModelExplicit = $PSBoundParameters.ContainsKey('Model')
 $EntryProfile = 'pm'
 
 if ($SkipModel -and $ModelExplicit) {
-    Write-Error '-SkipModel and -Model contradict each other: one sets the model, the other leaves it alone. Pick one.'
+    [Console]::Error.WriteLine('-SkipModel and -Model contradict each other: one sets the model, the other leaves it alone. Pick one.')
     exit 2
 }
 
-if ($Prefix -and $Prefix -notmatch '^[a-zA-Z0-9_-]+$') {
-    Write-Error '-Prefix must contain only letters, digits, hyphen and underscore.'
+if (-not $Prefix -or $Prefix -notmatch '^[a-zA-Z0-9_-]+$') {
+    [Console]::Error.WriteLine('-Prefix must be non-empty and contain only letters, digits, hyphen and underscore.')
     exit 2
 }
 
@@ -120,7 +120,7 @@ foreach ($role in $Profiles.Keys) {
 if ($Only) {
     $unknown = $Only | Where-Object { $_ -and ($Profiles.Keys -notcontains $_) }
     if ($unknown) {
-        Write-Error "Unknown profile(s) in -Only: $($unknown -join ', ')`nValid: $($Profiles.Keys -join ' ')"
+        [Console]::Error.WriteLine("Unknown profile(s) in -Only: $($unknown -join ', ')`nValid: $($Profiles.Keys -join ' ')")
         exit 2
     }
 }
@@ -262,7 +262,7 @@ Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"
 Write-Host "Model:         $modelLabel"
-if ($Prefix) { Write-Host "Name prefix:   $Prefix" }
+Write-Host "Name prefix:   $Prefix"
 $memLabel = if ($SeparateMemory) { 'separate per profile' } else { "shared bank at $MnemoHome" }
 Write-Host "Memory:        $memLabel"
 Write-Host "Team state:    $DevTeamHome (shared across every profile)"
@@ -298,8 +298,11 @@ foreach ($role in $Profiles.Keys) {
     }
 
     # Ask Hermes where the profile actually lives instead of assuming
-    # $HermesRoot\profiles\$name.
-    if ($DryRun -and -not $exists) {
+    # $HermesRoot\profiles\$name - except for a profile this run just
+    # created (or would create under -DryRun), where the path is always
+    # predictable and resolving it via `hermes -p $name config path` would
+    # just be one more unnecessary `-p $name` invocation.
+    if (-not $exists) {
         $profileDir = Join-Path $HermesRoot "profiles\$name"
     } else {
         $profileDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $name 'config' 'path'))
@@ -314,34 +317,13 @@ foreach ($role in $Profiles.Keys) {
         Copy-Item -LiteralPath $soul -Destination (Join-Path $profileDir 'SOUL.md') -Force
     }
 
-    # 3. model per role: pm, architect and reviewer get the frontier tier;
-    # the rest get the mid tier. -Model overrides the whole table,
-    # -SkipModel leaves it alone.
-    if (-not $SkipModel) {
-        if ($ModelExplicit) {
-            $roleModel = $Model
-        } else {
-            $roleModel = switch ($role) {
-                'pm'        { $FrontierModel }
-                'architect' { $FrontierModel }
-                'reviewer'  { $FrontierModel }
-                default     { $MidModel }
-            }
-        }
-        if ($DryRun) {
-            Write-Host "  would run: hermes -p $name config set model.default $roleModel"
-        } else {
-            $out = Invoke-Hermes '-p' $name 'config' 'set' 'model.default' $roleModel
-            if ($LASTEXITCODE -ne 0) { Write-Error "Setting model on '$name' failed: $out"; exit 1 }
-        }
-    }
-
     if ($DryRun) {
         Write-Host "  would link: $profileDir\plugins\mnemosyne -> $PluginSrcMnemo"
         if (-not $SeparateMemory) {
             Write-Host "  would link: $profileDir\mnemosyne -> $MnemoHome"
         }
         Write-Host "  would link: $profileDir\plugins\dev-team-gate -> $PluginSrcGate"
+        Write-Host "  would run:  hermes -p $name config set model.default ..."
         Write-Host "  would run:  hermes -p $name plugins enable dev-team-gate --no-allow-tool-override"
         Write-Host "  would link: $profileDir\dev-team -> $DevTeamHome"
         foreach ($stageDir in (Get-ChildItem -LiteralPath $SkillsDir -Directory -Filter 'dev-team-stage-*' -ErrorAction SilentlyContinue)) {
@@ -350,11 +332,24 @@ foreach ($role in $Profiles.Keys) {
         continue
     }
 
-    # 4. Mnemosyne plugin link. The gap this closes: a named profile
+    # 3. Mnemosyne plugin link. The gap this closes: a named profile
     # redirects HERMES_HOME to its own directory, and memory providers are
     # discovered under $HERMES_HOME\plugins\. So the Mnemosyne plugin
     # installed at the root is invisible to every named profile without
     # this link.
+    #
+    # This link, the Mnemosyne data link right below it, the dev-team-gate
+    # plugin link and the dev-team home link all happen here, before the
+    # model is set and every later `-p $name` call. `hermes profile create
+    # --clone` itself (the branch above, for a freshly created profile)
+    # already materializes a real `mnemosyne\` directory as part of the
+    # clone, before this script gets a chance to link anything - so moving
+    # these links earlier does not by itself avoid that directory; what
+    # does is the `$exists` check in the data-link block below, which only
+    # preserves a real directory when the profile predates this run.
+    # Linking here (rather than after the model/kanban/gate calls) still
+    # matters on its own: it keeps a freshly cloned profile's plugin and
+    # gate wiring in place before anything else touches it.
     $pluginDir = Join-Path $profileDir 'plugins'
     New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
     $pluginLinkMnemo = Join-Path $pluginDir 'mnemosyne'
@@ -370,39 +365,36 @@ foreach ($role in $Profiles.Keys) {
         $dataLink = Join-Path $profileDir 'mnemosyne'
         $existing = Get-Item -LiteralPath $dataLink -ErrorAction SilentlyContinue
         $isLink   = $existing -and $existing.LinkType
-        if ($existing -and -not $isLink) {
-            # A real directory means this profile already has its own
-            # memories. Merging them is not ours to decide, so leave it and
-            # say so rather than deleting somebody's history.
+        if ($existing -and -not $isLink -and $exists) {
+            # A real directory on a profile that already existed before this
+            # run means it has its own memories. Merging them is not ours to
+            # decide, so leave it and say so rather than deleting somebody's
+            # history.
             Write-Host "  NOTE: $dataLink is a real directory with its own database."
             Write-Host '        Left as-is - this profile will not share the team bank.'
             $unshared += $name
         } else {
+            # Either already a junction, or nothing there yet, or - the case
+            # this fixes - a real directory that `hermes profile create
+            # --clone` itself just created a few lines up in *this very
+            # run* ($exists was false for this profile at the top of the
+            # loop). That directory holds no memories yet; moving the link
+            # above this point in the script cannot help, because the
+            # clone call is itself the first `-p $name`-equivalent
+            # invocation that creates it. New-DirLink's Remove-Item +
+            # New-Item replaces it safely.
             $kind = New-DirLink -LinkPath $dataLink -Target $MnemoHome -Label 'the Mnemosyne data store'
             if ($kind -eq 'copy') { $copied += "$name (mnemosyne data)" }
         }
     }
 
-    # 5. Kanban is how this team actually works: the pm profile writes
-    # cards, the dispatcher spawns the assignee, and a worker raises cards
-    # for siblings. Workers inherit their profile's *CLI* toolsets at
-    # dispatch time, and the kanban toolset ships disabled by default - so
-    # without this, every profile silently lacks kanban_create/kanban_link
-    # and cannot delegate onward.
-    $out = Invoke-Hermes '-p' $name 'tools' 'enable' 'kanban' '--platform' 'cli'
-    if ($LASTEXITCODE -ne 0) { Write-Error "Enabling the kanban toolset on '$name' failed: $out"; exit 1 }
-
-    # 6. dev-team-gate: the plugin that enforces the pipeline. Linked the
-    # same way Mnemosyne is, then explicitly enabled - unlike Mnemosyne, a
-    # hook plugin does nothing until it is in `plugins.enabled`.
-    # --no-allow-tool-override: this plugin declares no tool overrides, so
-    # the confirmation prompt would never fire, but passing it keeps the
-    # script non-interactive regardless.
+    # 4. dev-team-gate link (enabled in step 6, after the model is set).
+    # Linked the same way Mnemosyne is, for the same reason: it must be in
+    # place before any `-p $name` call, including the `plugins enable` call
+    # that references it.
     $pluginLinkGate = Join-Path $pluginDir 'dev-team-gate'
     $gateLinkKind = New-DirLink -LinkPath $pluginLinkGate -Target $PluginSrcGate -Label 'dev-team-gate'
     if ($gateLinkKind -eq 'copy') { $copied += "$name (dev-team-gate)" }
-    $out = Invoke-Hermes '-p' $name 'plugins' 'enable' 'dev-team-gate' '--no-allow-tool-override'
-    if ($LASTEXITCODE -ne 0) { Write-Error "Enabling dev-team-gate on '$name' failed: $out"; exit 1 }
 
     # Team state (forge project records, team clones): same gap as
     # Mnemosyne's data link, same fix, always shared (see $DevTeamHome
@@ -411,7 +403,7 @@ foreach ($role in $Profiles.Keys) {
     $teamDataLink = Join-Path $profileDir 'dev-team'
     $existingTeam = Get-Item -LiteralPath $teamDataLink -ErrorAction SilentlyContinue
     $isTeamLink   = $existingTeam -and $existingTeam.LinkType
-    if ($existingTeam -and -not $isTeamLink) {
+    if ($existingTeam -and -not $isTeamLink -and $exists) {
         Write-Host "  NOTE: $teamDataLink is a real directory. Left as-is -"
         Write-Host '        this profile will not share the team''s forge records.'
     } else {
@@ -419,7 +411,44 @@ foreach ($role in $Profiles.Keys) {
         if ($kind -eq 'copy') { $copied += "$name (dev-team home)" }
     }
 
-    # 7. Pipeline stage skills: every dev-team-stage-* skill, for every
+    # 5. model per role: pm, architect and reviewer get the frontier tier;
+    # the rest get the mid tier. -Model overrides the whole table,
+    # -SkipModel leaves it alone. This is the first `-p $name` call for a
+    # freshly cloned profile, now safe because every directory link above
+    # is already in place.
+    if (-not $SkipModel) {
+        if ($ModelExplicit) {
+            $roleModel = $Model
+        } else {
+            $roleModel = switch ($role) {
+                'pm'        { $FrontierModel }
+                'architect' { $FrontierModel }
+                'reviewer'  { $FrontierModel }
+                default     { $MidModel }
+            }
+        }
+        $out = Invoke-Hermes '-p' $name 'config' 'set' 'model.default' $roleModel
+        if ($LASTEXITCODE -ne 0) { Write-Error "Setting model on '$name' failed: $out"; exit 1 }
+    }
+
+    # 6. Kanban is how this team actually works: the pm profile writes
+    # cards, the dispatcher spawns the assignee, and a worker raises cards
+    # for siblings. Workers inherit their profile's *CLI* toolsets at
+    # dispatch time, and the kanban toolset ships disabled by default - so
+    # without this, every profile silently lacks kanban_create/kanban_link
+    # and cannot delegate onward.
+    $out = Invoke-Hermes '-p' $name 'tools' 'enable' 'kanban' '--platform' 'cli'
+    if ($LASTEXITCODE -ne 0) { Write-Error "Enabling the kanban toolset on '$name' failed: $out"; exit 1 }
+
+    # 7. dev-team-gate enable: the plugin that enforces the pipeline does
+    # nothing until it is in `plugins.enabled`, unlike Mnemosyne.
+    # --no-allow-tool-override: this plugin declares no tool overrides, so
+    # the confirmation prompt would never fire, but passing it keeps the
+    # script non-interactive regardless.
+    $out = Invoke-Hermes '-p' $name 'plugins' 'enable' 'dev-team-gate' '--no-allow-tool-override'
+    if ($LASTEXITCODE -ne 0) { Write-Error "Enabling dev-team-gate on '$name' failed: $out"; exit 1 }
+
+    # 8. Pipeline stage skills: every dev-team-stage-* skill, for every
     # role, since the guard identifies a card's stage from the skill the
     # card itself carries, not from the completing profile's role.
     $stageSkillsDir = Join-Path $profileDir 'skills\dev-team'
