@@ -76,7 +76,8 @@ fix, or run the tests on the implementer's behalf.
 
 A stage is identified by the stage skill the card was created with
 (`--skill dev-team-stage-<stage>`); the guard reads the stage from the card's skills, never
-from its title or body. A card with no stage skill is not guarded at all.
+from its title or body. A card with no stage skill only skips the `kanban_complete` stage
+checks — the merge/deploy and default-branch push blocks below still apply regardless.
 
 | Stage | Assignee | Required `metadata` on `kanban_complete` |
 | --- | --- | --- |
@@ -128,8 +129,9 @@ Both installers are idempotent (re-running upgrades the SOUL, model, plugin link
 place), refuse when the root profile's `memory.provider` isn't `mnemosyne`, link the
 `dev-team-gate` plugin and Mnemosyne data into every profile, enable the kanban toolset, and
 install the stage skills plus `running-the-pipeline` and `kanban-budget.py` on `pm`. They also
-put `forge` on a PATH the gateway sees (`~/.local/bin`) and verify Mnemosyne `available` and
-the gate plugin loaded for every profile, exiting non-zero otherwise. Symlinks on Unix become
+put `forge` where the gateway resolves it — `~/.local/bin/forge` on Unix, `forge.cmd` beside
+`hermes.exe` on Windows — and verify Mnemosyne `available` and the gate plugin loaded for every
+profile, exiting non-zero otherwise. Symlinks on Unix become
 directory junctions on Windows (no Developer Mode or elevation needed), falling back to a copy
 with a warning when even a junction can't be created.
 
@@ -162,9 +164,11 @@ record. Exit 2 with `"ambiguous: pass --pr-adapter"` means devops decides and re
 
 **Give the team a forge token without merge rights.** The guard blocks known merge and deploy
 commands (`gh pr merge`, `glab mr merge`, `tea pr merge`, `kubectl apply/rollout`, `helm
-upgrade/install`, `terraform apply`, `docker push`, and a `git push` to the project's default
-branch) on every `terminal` call on a guarded card — tokenised, not matched by substring, so it
-catches shell nesting, `sh -c`, `eval` and command substitution too. It is still a best-effort
+upgrade/install`, `terraform apply`, `docker push`, and a `git push` to the default branch) on
+every `terminal` call in a dev-team profile — guarded card or not, and even before any board
+lookup — tokenised, not matched by substring, so it catches shell nesting, `sh -c`, `eval` and
+command substitution too. (Only the `hermes kanban` side-door verbs, like `complete` and
+`request-changes`, are limited to guarded cards.) It is still a best-effort
 guard in front of an irreversible action: **token scope is the real boundary.** Provision the
 forge credential the team authenticates with (via each vendor CLI's own login, or the
 operator's `secret` store) so it cannot merge or deploy at all, independent of anything the
@@ -208,7 +212,7 @@ occurrences as three unrelated incidents:
 | `review: rounds-exhausted` | The guard refused a 4th `implement` round. |
 | `ci: other` | A CI state that doesn't resolve to green/red-caused-by-the-change, or a poll timeout. |
 | `forge: unreachable` | The forge adapter itself can't be reached or verified. |
-| `merge: human-only` | A guarded terminal call tried to merge, deploy, or push to the default branch. |
+| `merge: human-only` | A terminal call tried to merge, deploy, or push to the default branch. |
 
 Any specialist soul's own stop conditions (an invalidated assumption, an irreversible action,
 another specialist's refusal) are blocked with the same label convention.
