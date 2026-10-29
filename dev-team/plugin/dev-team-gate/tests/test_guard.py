@@ -409,5 +409,449 @@ class SlugTests(unittest.TestCase):
             project_slug(b, "t_impl")
 
 
+# ---------------------------------------------------------------------------
+# Task 6: terminal guard and pre_tool_call wiring.
+#
+# `guard` is imported as a module and its Task 6 names are read at call time,
+# so the Task 5 tests above keep running while these are red.
+# ---------------------------------------------------------------------------
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+from unittest import mock  # noqa: E402
+
+import guard as guard_mod  # noqa: E402
+
+MERGE = "merge: human-only"
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+
+def terminal(board, task_id, command):
+    return guard_mod.check_terminal(board, task_id, command)
+
+
+def guarded_board(default_branch: str | None = "develop", home=None):
+    """intake(repo=widgets) -> plan -> implement t_impl1, plus an unguarded t_misc.
+
+    Writes the project record into `home` when both are given.
+    """
+    b = FakeBoard()
+    chain(b)
+    b.add("t_misc", None, extra_skills=["github-code-review"])
+    if home is not None and default_branch is not None:
+        rec = Path(home) / "dev-team" / "projects" / f"{SLUG}.json"
+        rec.parent.mkdir(parents=True)
+        rec.write_text(json.dumps({
+            "slug": SLUG, "repo_url": "", "pr_adapter": "github", "ci_adapter": "github",
+            "default_branch": default_branch, "ci_hint": {},
+        }))
+    return b
+
+
+class HomeMixin:
+    """A temporary HERMES_HOME, and HERMES_KANBAN_TASK unset unless a test sets it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = self._tmp.name
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": self.home})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("HERMES_KANBAN_BOARD", None)
+        self.addCleanup(self._tmp.cleanup)
+
+
+class MergeDeployTests(HomeMixin, unittest.TestCase):
+    BLOCKED = [
+        "gh pr merge 12",
+        "gh pr merge --squash --delete-branch 12",
+        "/usr/local/bin/gh pr merge 12",
+        "gh pr -R acme/widgets merge 12",
+        "glab mr merge 3",
+        "tea pr merge 4",
+        "tea prs merge 4",
+        "tea pulls merge 4",
+        "kubectl apply -f deploy.yaml",
+        "kubectl -n prod rollout restart deploy/web",
+        "helm upgrade web ./chart",
+        "helm install web ./chart",
+        "terraform apply -auto-approve",
+        "terraform -chdir=infra apply",
+        "docker push registry/web:1",
+        # chains and nesting: every simple command is checked
+        "cd x && gh pr merge 1",
+        "make test; kubectl apply -f k.yaml",
+        "true || helm upgrade web .",
+        "echo ok | docker push img",
+        "echo ok\ngh pr merge 1",
+        "(cd x; gh pr merge 1)",
+        "bash -c 'gh pr merge 1'",
+        "sh -lc \"cd x && glab mr merge 2\"",
+        'echo "$(gh pr merge 1)"',
+        "echo `gh pr merge 1`",
+        "eval gh pr merge 1",
+        # wrappers and prefixes
+        "FOO=1 helm upgrade web .",
+        "sudo -u deploy kubectl apply -f k.yaml",
+        "env GH_TOKEN=x gh pr merge 1",
+        "timeout 60 terraform apply",
+    ]
+    ALLOWED = [
+        "gh pr view 12",
+        "gh pr create --title t --body-file b.md",
+        "gh pr checks 12",
+        "glab mr view 3",
+        "kubectl get pods",
+        "helm list",
+        "terraform plan",
+        "docker build -t web .",
+        "git merge feature",
+        "echo merge",
+        "",
+    ]
+
+    def test_merge_commands_blocked(self):
+        b = guarded_board(home=self.home)
+        for task_id in (None, "t_misc", "t_impl1"):
+            for cmd in self.BLOCKED:
+                with self.subTest(task_id=task_id, cmd=cmd):
+                    msg = terminal(b, task_id, cmd)
+                    self.assertIsInstance(msg, str)
+                    self.assertTrue(msg.startswith(MERGE), msg)
+
+    def test_non_merge_commands_allowed(self):
+        b = guarded_board(home=self.home)
+        for task_id in (None, "t_misc", "t_impl1"):
+            for cmd in self.ALLOWED:
+                with self.subTest(task_id=task_id, cmd=cmd):
+                    self.assertIsNone(terminal(b, task_id, cmd))
+
+    def test_merge_blocked_without_board(self):
+        """The always-block rules need no board: a broken board still blocks them."""
+        b = FakeBoard()
+        b.fail = OSError("database is locked")
+        msg = terminal(b, "t_impl1", "gh pr merge 1")
+        self.assertTrue(msg.startswith(MERGE), msg)
+
+    def test_quoted_merge_in_commit_message_not_blocked(self):
+        b = guarded_board(home=self.home)
+        for task_id in (None, "t_misc", "t_impl1"):
+            for cmd in (
+                'git commit -m "gh pr merge"',
+                "git commit -m 'kubectl apply -f x'",
+                'git commit -m "hermes kanban complete t_impl1"',
+                'git commit -m "git push origin main"',
+                'echo "a; gh pr merge 1"',
+            ):
+                with self.subTest(task_id=task_id, cmd=cmd):
+                    self.assertIsNone(terminal(b, task_id, cmd))
+
+
+class PushTests(HomeMixin, unittest.TestCase):
+    PUSH_BLOCKED = [
+        "git push origin develop",          # the record's default branch
+        "git push origin main",             # main and master are always protected
+        "git push origin master",
+        "git push origin HEAD:develop",
+        "git push origin HEAD:main",
+        "git push origin feature:refs/heads/develop",
+        "git push origin +develop",
+        "git push --force origin feat/x:develop",
+        "git push origin :develop",         # deleting the default branch
+        "git push --delete origin main",
+        "git -C repo push origin develop",
+        "git -c push.default=current push origin main",
+        "git push origin feat/x develop",   # any refspec
+        # destination cannot be verified: no refspec, HEAD, matching, all
+        "git push",
+        "git push origin",
+        "git push -u origin",
+        "git push origin HEAD",
+        "git push origin :",
+        "git push --all origin",
+        "git push --mirror origin",
+        "git push --prune origin feat/x",   # prunes unnamed remote branches
+        "git push origin feat/x # done\ngit push",  # a comment never joins lines
+        "cd repo && git push",
+        "make && git push origin main",
+    ]
+    PUSH_ALLOWED = [
+        "git push origin feat/x",
+        "git push -u origin feat/x",
+        "git push origin HEAD:feat/x",
+        "git push origin HEAD:refs/heads/feat/x",
+        "git push --force-with-lease origin feat/x",
+        "git push -o ci.skip origin feat/x",
+        "git push origin --tags",
+        "git push origin refs/tags/v1",
+        "git status && git push origin feat/x",
+    ]
+
+    def test_push_to_default_branch_blocked_feature_branch_allowed(self):
+        b = guarded_board("develop", home=self.home)
+        for cmd in self.PUSH_BLOCKED:
+            with self.subTest(cmd=cmd):
+                msg = terminal(b, "t_impl1", cmd)
+                self.assertIsInstance(msg, str)
+                self.assertTrue(msg.startswith(MERGE), msg)
+        for cmd in self.PUSH_ALLOWED:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(terminal(b, "t_impl1", cmd))
+
+    def test_push_without_card_protects_main_and_master(self):
+        b = guarded_board("develop", home=self.home)
+        for task_id in (None, "t_misc"):
+            with self.subTest(task_id=task_id):
+                self.assertTrue(terminal(b, task_id, "git push origin main").startswith(MERGE))
+                self.assertTrue(terminal(b, task_id, "git push origin master").startswith(MERGE))
+                self.assertTrue(terminal(b, task_id, "git push").startswith(MERGE))
+                self.assertIsNone(terminal(b, task_id, "git push origin feat/x"))
+
+    def test_push_on_guarded_card_without_record_fails_closed(self):
+        b = guarded_board(default_branch=None, home=self.home)  # no record written
+        msg = terminal(b, "t_impl1", "git push origin feat/x")
+        self.assertIsInstance(msg, str)
+        self.assertTrue(msg.startswith("guard:"), msg)
+        self.assertIn(SLUG, msg)
+
+    def test_push_on_guarded_card_with_bad_slug_fails_closed(self):
+        b = guarded_board(home=self.home)
+        b.metadata["t_intake"] = dict(b.metadata["t_intake"], repo="../escape")
+        msg = terminal(b, "t_impl1", "git push origin feat/x")
+        self.assertTrue(msg.startswith("guard:"), msg)
+
+    def test_push_with_board_failure_fails_closed(self):
+        b = guarded_board(home=self.home)
+        b.fail = OSError("database is locked")
+        msg = terminal(b, "t_impl1", "git push origin feat/x")
+        self.assertTrue(msg.startswith("guard:"), msg)
+        self.assertIn("database is locked", msg)
+
+
+class SideDoorTests(HomeMixin, unittest.TestCase):
+    VERBS = ("complete", "request-changes", "edit", "unblock", "reopen-review")
+
+    def test_kanban_cli_side_door_blocked_on_guarded_card_only(self):
+        b = guarded_board(home=self.home)
+        for verb in self.VERBS:
+            for cmd in (
+                f"hermes kanban {verb} t_impl1",
+                f"hermes -p dev-qa kanban --board b {verb} t_impl1",
+                f"cd /x && hermes kanban {verb} t_impl1",
+                f"bash -c 'hermes kanban {verb} t_impl1'",
+            ):
+                with self.subTest(cmd=cmd):
+                    msg = terminal(b, "t_impl1", cmd)
+                    self.assertIsInstance(msg, str)
+                    self.assertTrue(msg.startswith("guard:"), msg)
+                    self.assertIn("kanban_", msg)  # points at the guarded tool instead
+                    self.assertIsNone(terminal(b, "t_misc", cmd))
+                    self.assertIsNone(terminal(b, None, cmd))
+
+    def test_other_kanban_cli_verbs_allowed_on_guarded_card(self):
+        b = guarded_board(home=self.home)
+        for cmd in (
+            "hermes kanban show t_impl1",
+            "hermes kanban block t_impl1 'review: rounds-exhausted'",
+            "hermes kanban comment t_impl1 'please edit the title'",
+            "hermes kanban list",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(terminal(b, "t_impl1", cmd))
+
+    def test_side_door_with_board_failure_fails_closed(self):
+        b = FakeBoard()
+        b.fail = OSError("database is locked")
+        msg = terminal(b, "t_impl1", "hermes kanban complete t_impl1")
+        self.assertTrue(msg.startswith("guard:"), msg)
+
+    def test_side_door_on_unknown_card_fails_closed(self):
+        msg = terminal(FakeBoard(), "t_gone", "hermes kanban complete t_gone")
+        self.assertTrue(msg.startswith("guard:"), msg)
+        self.assertIn("t_gone", msg)
+
+    def test_plain_commands_do_not_touch_the_board(self):
+        b = FakeBoard()
+        b.fail = OSError("database is locked")
+        self.assertIsNone(terminal(b, "t_impl1", "make test && git status"))
+
+
+class UnparseableTests(HomeMixin, unittest.TestCase):
+    def test_unparseable_command_fails_closed_on_guarded_card(self):
+        b = guarded_board(home=self.home)
+        msg = terminal(b, "t_impl1", 'git commit -m "unbalanced')
+        self.assertIsInstance(msg, str)
+        self.assertTrue(msg.startswith("guard:"), msg)
+
+    def test_unparseable_command_keeps_always_block_rules(self):
+        b = guarded_board(home=self.home)
+        for task_id in (None, "t_misc", "t_impl1"):
+            with self.subTest(task_id=task_id):
+                msg = terminal(b, task_id, "gh pr merge 1 'oops")
+                self.assertTrue(msg.startswith(MERGE), msg)
+
+    def test_unparseable_command_allowed_off_guarded_card(self):
+        b = guarded_board(home=self.home)
+        self.assertIsNone(terminal(b, "t_misc", 'echo "unbalanced'))
+        self.assertIsNone(terminal(b, None, 'echo "unbalanced'))
+
+
+class PreToolCallTests(HomeMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.board = guarded_board(home=self.home)
+        self.made = []
+
+        def make_board(slug):
+            self.made.append(slug)
+            return self.board
+
+        p = mock.patch.object(guard_mod, "_make_board", make_board)
+        p.start()
+        self.addCleanup(p.stop)
+        f = mock.patch.object(guard_mod, "forge_ci_status", no_forge)
+        f.start()
+        self.addCleanup(f.stop)
+
+    def test_complete_defaults_task_id_from_env(self):
+        os.environ["HERMES_KANBAN_TASK"] = "t_impl1"  # a guarded implement card
+        out = guard_mod.pre_tool_call("kanban_complete", {"summary": "s", "metadata": {}})
+        self.assertEqual(out["action"], "block")
+        self.assertTrue(out["message"].startswith("metadata:"), out)
+        # an explicit task_id wins over the environment
+        out = guard_mod.pre_tool_call(
+            "kanban_complete", {"task_id": "t_misc", "summary": "s", "metadata": {}})
+        self.assertIsNone(out)
+
+    def test_complete_without_any_task_id_fails_closed(self):
+        out = guard_mod.pre_tool_call("kanban_complete", {"summary": "s"})
+        self.assertEqual(out["action"], "block")
+        self.assertTrue(out["message"].startswith("guard:"), out)
+
+    def test_complete_reads_the_board_named_in_args(self):
+        guard_mod.pre_tool_call("kanban_complete", {"task_id": "t_misc", "board": "proj-b"})
+        self.assertEqual(self.made, ["proj-b"])
+
+    def test_kanban_block_never_guarded(self):
+        os.environ["HERMES_KANBAN_TASK"] = "t_impl1"
+        self.board.fail = OSError("database is locked")
+        for tool in ("kanban_block", "kanban_comment", "kanban_create", "read_file"):
+            with self.subTest(tool=tool):
+                self.assertIsNone(guard_mod.pre_tool_call(
+                    tool, {"task_id": "t_impl1", "reason": "review: rounds-exhausted",
+                           "command": "hermes kanban complete t_impl1"}))
+        self.assertEqual(self.made, [])
+
+    def test_terminal_dispatch(self):
+        os.environ["HERMES_KANBAN_TASK"] = "t_impl1"
+        out = guard_mod.pre_tool_call("terminal", {"command": "gh pr merge 1"})
+        self.assertEqual(out, {"action": "block", "message": out["message"]})
+        self.assertTrue(out["message"].startswith(MERGE))
+        out = guard_mod.pre_tool_call("terminal", {"command": "hermes kanban complete t_impl1"})
+        self.assertTrue(out["message"].startswith("guard:"))
+        self.assertIsNone(guard_mod.pre_tool_call("terminal", {"command": "make test"}))
+
+    def test_terminal_without_card_skips_side_door(self):
+        self.assertIsNone(guard_mod.pre_tool_call(
+            "terminal", {"command": "hermes kanban complete t_x"}))
+
+    def test_hook_never_raises(self):
+        os.environ["HERMES_KANBAN_TASK"] = "t_impl1"
+
+        def broken(slug):
+            raise RuntimeError("no hermes here")
+
+        with mock.patch.object(guard_mod, "_make_board", broken):
+            out = guard_mod.pre_tool_call("kanban_complete", {"metadata": {}})
+        self.assertEqual(out["action"], "block")
+        self.assertTrue(out["message"].startswith("guard:"), out)
+        self.assertIn("no hermes here", out["message"])
+
+    def test_terminal_non_string_command_blocks(self):
+        out = guard_mod.pre_tool_call("terminal", {"command": ["gh", "pr", "merge"]})
+        self.assertEqual(out["action"], "block")
+
+
+class ForgeCiStatusTests(unittest.TestCase):
+    def run_with(self, returncode, stdout):
+        done = subprocess.CompletedProcess(["forge"], returncode, stdout=stdout, stderr="")
+        with mock.patch.object(guard_mod.shutil, "which", return_value="/bin/forge"), \
+                mock.patch.object(guard_mod.subprocess, "run", return_value=done) as run:
+            result = guard_mod.forge_ci_status(SLUG, SHA)
+        return result, run
+
+    def test_calls_forge_ci_status_with_20s_timeout(self):
+        state, run = self.run_with(0, '{"state": "green"}\n')
+        self.assertEqual(state, "green")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, ["/bin/forge", "ci-status", "--slug", SLUG, "--sha", SHA])
+        self.assertEqual(run.call_args.kwargs["timeout"], 20)
+        self.assertLess(guard_mod.FORGE_TIMEOUT_S, 30)
+
+    def test_negative_state_returned(self):
+        for state in ("red", "pending", "none"):
+            with self.subTest(state=state):
+                self.assertEqual(self.run_with(1, json.dumps({"state": state}))[0], state)
+
+    def test_cannot_verify_raises(self):
+        for rc, out in ((2, '{"error": "no project record"}'), (0, "not json"),
+                        (0, '{"nope": 1}'), (3, '{"state": "green"}'),
+                        (0, '{"state": "red"}'), (1, '{"state": "green"}'),
+                        (3, '{"state": "red"}')):
+            with self.subTest(rc=rc, out=out):
+                with self.assertRaises(Exception):
+                    self.run_with(rc, out)
+
+    def test_forge_missing_raises(self):
+        with mock.patch.object(guard_mod.shutil, "which", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                guard_mod.forge_ci_status(SLUG, SHA)
+
+    def test_timeout_becomes_forge_unreachable(self):
+        b = FakeBoard()
+        chain(b)
+        b.add("t_val", "validate", ["t_impl1"], md={
+            "head_sha": SHA, "verdict": "pass", "evidence": ["ok"]})
+        b.add("t_rev", "review", ["t_val"], md={"head_sha": SHA, "verdict": "approve"})
+        b.add("t_prci", "pr-ci", ["t_rev"])
+        args = {"metadata": {"pr_url": "https://x/pr/1", "head_sha": SHA, "ci": "green"}}
+        with mock.patch.object(guard_mod.shutil, "which", return_value="/bin/forge"), \
+                mock.patch.object(guard_mod.subprocess, "run",
+                                  side_effect=subprocess.TimeoutExpired("forge", 20)):
+            msg = check_complete(b, "t_prci", args, guard_mod.forge_ci_status)
+        self.assertTrue(msg.startswith("forge: unreachable"), msg)
+
+
+class PluginWiringTests(unittest.TestCase):
+    def test_manifest(self):
+        text = (PLUGIN_DIR / "plugin.yaml").read_text()
+        lines = [ln.strip() for ln in text.splitlines()]
+        self.assertIn("name: dev-team-gate", lines)
+        self.assertIn("provides_hooks:", lines)
+        self.assertIn("- pre_tool_call", lines)
+
+    def test_register_wires_pre_tool_call(self):
+        spec = importlib.util.spec_from_file_location(
+            "dev_team_gate_under_test", PLUGIN_DIR / "__init__.py",
+            submodule_search_locations=[str(PLUGIN_DIR)])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = pkg
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(pkg)
+
+        calls = []
+
+        class Ctx:
+            def register_hook(self, name, cb):
+                calls.append((name, cb))
+
+        pkg.register(Ctx())
+        self.assertEqual([name for name, _ in calls], ["pre_tool_call"])
+        self.assertIs(calls[0][1], sys.modules["dev_team_gate_under_test.guard"].pre_tool_call)
+
+
 if __name__ == "__main__":
     unittest.main()

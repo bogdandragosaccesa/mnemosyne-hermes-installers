@@ -1,0 +1,6 @@
+name: dev-team-gate
+version: 0.1.0
+description: "dev-team stage gate: checks kanban_complete on dev-team stage cards and blocks merge, deploy and kanban-CLI side doors in terminal. Fails closed."
+author: dev-team
+provides_hooks:
+  - pre_tool_call
