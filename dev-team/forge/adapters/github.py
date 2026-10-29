@@ -10,20 +10,28 @@ import subprocess
 import urllib.request as urllib_request
 from pathlib import Path
 
-from . import detect_from_remote_url, parse_owner_repo
+from . import combine_states, decode_pages, detect_from_remote_url, parse_owner_repo
 
 # Explicit vendor-state table: GitHub check-run "conclusion" -> forge state.
 # Any conclusion not listed here is unmapped and ci_status() raises
-# ValueError, which forge_core turns into exit 2.
+# ValueError, which forge_core turns into exit 2. "neutral" means the check
+# did not decide anything: alone it is "none", never green.
 _CONCLUSION_TO_STATE = {
     "success": "green",
-    "neutral": "green",
-    "skipped": "green",
+    "neutral": "neutral",
+    "skipped": "neutral",
     "failure": "red",
     "timed_out": "red",
     "cancelled": "red",
     "action_required": "red",
     "stale": "red",
+}
+# GitHub commit status "state" (the statuses API) -> forge state.
+_STATUS_TO_STATE = {
+    "success": "green",
+    "pending": "pending",
+    "failure": "red",
+    "error": "red",
 }
 
 
@@ -105,19 +113,28 @@ class GithubAdapter:
         return {"pr": str(pr), "ready": True}
 
     def ci_status(self, sha: str) -> str:
+        # Every page of check runs (`--paginate`: 30 per page otherwise) plus
+        # the combined commit status, which carries the legacy statuses API
+        # (Jenkins/CircleCI plugins) that check runs do not.
         owner, repo = self._owner_repo()
-        stdout = self._gh(["gh", "api", f"repos/{owner}/{repo}/commits/{sha}/check-runs"])
-        data = json.loads(stdout)
-        check_runs = data.get("check_runs") or []
-        if not check_runs:
-            return "none"
-        if any(cr.get("status") != "completed" for cr in check_runs):
-            return "pending"
-        states = set()
-        for cr in check_runs:
-            conclusion = cr.get("conclusion")
-            try:
-                states.add(_CONCLUSION_TO_STATE[conclusion])
-            except KeyError:
-                raise ValueError(f"github: unmapped check-run conclusion {conclusion!r}") from None
-        return "red" if "red" in states else "green"
+        base = f"repos/{owner}/{repo}/commits/{sha}"
+        states = []
+        for page in decode_pages(self._gh(["gh", "api", "--paginate", f"{base}/check-runs"])):
+            for cr in (page or {}).get("check_runs") or []:
+                if cr.get("status") != "completed":
+                    states.append("pending")
+                    continue
+                conclusion = cr.get("conclusion")
+                try:
+                    states.append(_CONCLUSION_TO_STATE[conclusion])
+                except KeyError:
+                    raise ValueError(
+                        f"github: unmapped check-run conclusion {conclusion!r}") from None
+        for page in decode_pages(self._gh(["gh", "api", "--paginate", f"{base}/status"])):
+            for st in (page or {}).get("statuses") or []:
+                state = st.get("state")
+                try:
+                    states.append(_STATUS_TO_STATE[state])
+                except KeyError:
+                    raise ValueError(f"github: unmapped commit status {state!r}") from None
+        return combine_states(states)

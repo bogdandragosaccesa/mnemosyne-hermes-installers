@@ -51,6 +51,31 @@ class FakeRun:
         return SimpleNamespace(stdout=self._stdout, stderr=self._stderr, returncode=self._returncode)
 
 
+class FakeRunByEndpoint:
+    """Stand-in for subprocess.run that answers each `gh|glab api` call by the
+    endpoint it names (the first argument containing a key)."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((list(args), kwargs))
+        for key, stdout in self.answers.items():
+            if any(key in a for a in args):
+                return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+        raise AssertionError(f"unexpected call {args}")
+
+
+def runs_page(*conclusions, status="completed"):
+    return {"total_count": len(conclusions),
+            "check_runs": [{"status": status, "conclusion": c} for c in conclusions]}
+
+
+def combined(*states):
+    return {"state": states[0] if states else "pending",
+            "statuses": [{"state": st, "context": f"ci/{i}"} for i, st in enumerate(states)]}
+
+
 class FakeHttpResponse:
     def __init__(self, body: bytes):
         self._body = body
@@ -134,11 +159,57 @@ class GithubAdapterTests(unittest.TestCase):
             self._adapter(run).ci_status("abc123")
 
     def test_github_reads_check_runs_via_gh_api(self):
-        run = FakeRun(stdout=load_fixture("github_no_checks"))
+        # #8: every page of check runs, plus the combined commit status.
+        run = FakeRunByEndpoint({"check-runs": load_fixture("github_no_checks"),
+                                 "/status": json.dumps(combined())})
         self._adapter(run).ci_status("abc123")
-        args = run.calls[0][0]
-        self.assertEqual(args[:2], ["gh", "api"])
-        self.assertEqual(args[-1], "repos/acme/widgets/commits/abc123/check-runs")
+        calls = [c[0] for c in run.calls]
+        runs = [a for a in calls if a[-1].endswith("/check-runs")]
+        status = [a for a in calls if a[-1].endswith("/status")]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(len(status), 1)
+        for args in runs + status:
+            self.assertEqual(args[:2], ["gh", "api"])
+            self.assertIn("--paginate", args)
+        self.assertEqual(runs[0][-1], "repos/acme/widgets/commits/abc123/check-runs")
+        self.assertEqual(status[0][-1], "repos/acme/widgets/commits/abc123/status")
+
+    def test_github_failure_on_a_later_page_is_red(self):
+        page1 = runs_page(*(["success"] * 30))
+        page2 = runs_page("failure")
+        run = FakeRunByEndpoint({"check-runs": json.dumps(page1) + json.dumps(page2),
+                                 "/status": json.dumps(combined())})
+        self.assertEqual(self._adapter(run).ci_status("abc123"), "red")
+
+    def test_github_failing_commit_status_with_green_check_runs_is_red(self):
+        for states, expected in ((("failure",), "red"), (("error",), "red"),
+                                 (("success", "pending"), "pending"), (("success",), "green")):
+            with self.subTest(states=states):
+                run = FakeRunByEndpoint({"check-runs": json.dumps(runs_page("success")),
+                                         "/status": json.dumps(combined(*states))})
+                self.assertEqual(self._adapter(run).ci_status("abc123"), expected)
+
+    def test_github_commit_status_alone_counts(self):
+        run = FakeRunByEndpoint({"check-runs": json.dumps(runs_page()),
+                                 "/status": json.dumps(combined("success"))})
+        self.assertEqual(self._adapter(run).ci_status("abc123"), "green")
+
+    def test_github_no_check_runs_and_no_statuses_is_none(self):
+        run = FakeRunByEndpoint({"check-runs": json.dumps(runs_page()),
+                                 "/status": json.dumps(combined())})
+        self.assertEqual(self._adapter(run).ci_status("abc123"), "none")
+
+    def test_github_all_skipped_or_neutral_is_none_not_green(self):
+        for conclusions in (("skipped",), ("neutral",), ("skipped", "neutral", "skipped")):
+            with self.subTest(conclusions=conclusions):
+                run = FakeRunByEndpoint({"check-runs": json.dumps(runs_page(*conclusions)),
+                                         "/status": json.dumps(combined())})
+                self.assertEqual(self._adapter(run).ci_status("abc123"), "none")
+
+    def test_github_skipped_beside_success_is_green(self):
+        run = FakeRunByEndpoint({"check-runs": json.dumps(runs_page("success", "skipped")),
+                                 "/status": json.dumps(combined())})
+        self.assertEqual(self._adapter(run).ci_status("abc123"), "green")
 
     def test_github_detect_true_for_github_remote(self):
         run = FakeRun(stdout="git@github.com:acme/widgets.git\n")
@@ -231,8 +302,8 @@ class GithubStateTableTests(unittest.TestCase):
     # into "expected" here.
     EXPECTED = {
         "success": "green",
-        "neutral": "green",
-        "skipped": "green",
+        "neutral": "none",   # #8: a run where nothing ran is not green
+        "skipped": "none",
         "failure": "red",
         "timed_out": "red",
         "cancelled": "red",
@@ -246,14 +317,15 @@ class GithubStateTableTests(unittest.TestCase):
         # Catches an entry being added/removed from the adapter's table,
         # not just a value being changed.
         self.assertEqual(set(_CONCLUSION_TO_STATE), set(self.EXPECTED))
+        # (a lone neutral/skipped run maps to "neutral", which ci_status reports as "none")
         rec = make_record("github", "github")
         for conclusion, expected in self.EXPECTED.items():
             with self.subTest(conclusion=conclusion):
-                run = FakeRun(
-                    stdout=json.dumps(
-                        {"check_runs": [{"status": "completed", "conclusion": conclusion}]}
-                    )
-                )
+                run = FakeRunByEndpoint({
+                    "check-runs": json.dumps(
+                        {"check_runs": [{"status": "completed", "conclusion": conclusion}]}),
+                    "/status": json.dumps(combined()),
+                })
                 self.assertEqual(GithubAdapter(rec, run=run).ci_status("abc123"), expected)
 
 
@@ -288,7 +360,23 @@ class GitlabAdapterTests(unittest.TestCase):
         self._adapter(run).ci_status("abc123")
         args = run.calls[0][0]
         self.assertEqual(args[:2], ["glab", "api"])
-        self.assertEqual(args[-1], "projects/acme%2Fwidgets/repository/commits/abc123/statuses")
+        self.assertIn("--paginate", args)  # #8: 20 statuses per page by default
+        self.assertEqual(
+            args[-1], "projects/acme%2Fwidgets/repository/commits/abc123/statuses?per_page=100")
+
+    def test_gitlab_failure_on_a_later_page_is_red(self):
+        page1 = [{"status": "success"}] * 20
+        page2 = [{"status": "failed"}]
+        run = FakeRun(stdout=json.dumps(page1) + "\n" + json.dumps(page2))
+        self.assertEqual(self._adapter(run).ci_status("abc123"), "red")
+
+    def test_gitlab_all_skipped_is_none_not_green(self):
+        for statuses in (["skipped"], ["skipped", "manual"]):
+            with self.subTest(statuses=statuses):
+                run = FakeRun(stdout=json.dumps([{"status": st} for st in statuses]))
+                self.assertEqual(self._adapter(run).ci_status("abc123"), "none")
+        run = FakeRun(stdout=json.dumps([{"status": "success"}, {"status": "skipped"}]))
+        self.assertEqual(self._adapter(run).ci_status("abc123"), "green")
 
     def test_gitlab_detect_true_for_gitlab_remote(self):
         run = FakeRun(stdout="https://gitlab.com/acme/widgets.git\n")
@@ -309,8 +397,8 @@ class GitlabStateTableTests(unittest.TestCase):
 
     EXPECTED = {
         "success": "green",
-        "skipped": "green",
-        "manual": "green",
+        "skipped": "none",   # #8: nothing ran
+        "manual": "none",
         "failed": "red",
         "canceled": "red",
         "pending": "pending",
@@ -421,7 +509,7 @@ class GiteaStateTableTests(unittest.TestCase):
 
     EXPECTED = {
         "success": "green",
-        "warning": "pending",
+        "warning": "red",    # #8: terminal; "pending" could never complete
         "pending": "pending",
         "failure": "red",
         "error": "red",

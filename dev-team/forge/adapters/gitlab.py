@@ -11,15 +11,16 @@ import urllib.parse
 import urllib.request as urllib_request
 from pathlib import Path
 
-from . import detect_from_remote_url, parse_owner_repo
+from . import combine_states, decode_pages, detect_from_remote_url, parse_owner_repo
 
 # Explicit vendor-state table: GitLab commit "status" -> forge state. Any
 # status not listed here is unmapped and ci_status() raises ValueError,
-# which forge_core turns into exit 2.
+# which forge_core turns into exit 2. A skipped or manual job did not run:
+# alone it is "none", never green.
 _STATUS_TO_STATE = {
     "success": "green",
-    "skipped": "green",
-    "manual": "green",
+    "skipped": "neutral",
+    "manual": "neutral",
     "failed": "red",
     "canceled": "red",
     "pending": "pending",
@@ -108,21 +109,18 @@ class GitlabAdapter:
         return {"pr": str(pr), "ready": True}
 
     def ci_status(self, sha: str) -> str:
-        stdout = self._glab(
-            ["glab", "api", f"projects/{self._project()}/repository/commits/{sha}/statuses"]
-        )
-        statuses = json.loads(stdout)
-        if not statuses:
-            return "none"
-        states = set()
-        for item in statuses:
-            status = item.get("status")
-            try:
-                states.add(_STATUS_TO_STATE[status])
-            except KeyError:
-                raise ValueError(f"gitlab: unmapped commit status {status!r}") from None
-        if "red" in states:
-            return "red"
-        if "pending" in states:
-            return "pending"
-        return "green"
+        # Every page (`--paginate`; the API returns 20 per page otherwise) of
+        # the SHA's latest commit statuses: one per job, external ones included.
+        stdout = self._glab([
+            "glab", "api", "--paginate",
+            f"projects/{self._project()}/repository/commits/{sha}/statuses?per_page=100",
+        ])
+        states = []
+        for page in decode_pages(stdout):
+            for item in page or []:
+                status = item.get("status")
+                try:
+                    states.append(_STATUS_TO_STATE[status])
+                except KeyError:
+                    raise ValueError(f"gitlab: unmapped commit status {status!r}") from None
+        return combine_states(states)

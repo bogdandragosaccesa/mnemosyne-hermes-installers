@@ -6,6 +6,7 @@ forge.py hands to forge_core.main), keyed by vendor name.
 """
 from __future__ import annotations
 
+import json
 import urllib.parse
 from typing import Optional, Tuple
 
@@ -40,6 +41,36 @@ def detect_from_remote_url(url: Optional[str]) -> Optional[str]:
     if "gitlab.com" in url or "/-/" in url:
         return "gitlab"
     return None
+
+
+def decode_pages(text: str) -> list:
+    """The JSON documents in `text`: `gh|glab api --paginate` prints one per
+    page, back to back. Raises ValueError on anything that isn't JSON."""
+    decoder = json.JSONDecoder()
+    docs, i, text = [], 0, text or ""
+    while True:
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text):
+            return docs
+        doc, i = decoder.raw_decode(text, i)
+        docs.append(doc)
+
+
+def combine_states(states) -> str:
+    """One forge state from per-check states (green, red, pending, neutral).
+
+    red beats pending beats green; checks that did not run (neutral/skipped)
+    count for nothing, so a run where nothing ran, or no checks at all, is
+    "none" -- never green."""
+    states = set(states)
+    if "red" in states:
+        return "red"
+    if "pending" in states:
+        return "pending"
+    if "green" in states:
+        return "green"
+    return "none"
 
 
 def parse_owner_repo(url: Optional[str]) -> Tuple[str, str]:

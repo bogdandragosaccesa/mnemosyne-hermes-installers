@@ -33,10 +33,11 @@ def _strip_wip_prefix(title: str) -> str:
 
 # Explicit vendor-state table: Gitea combined-status "state" -> forge
 # state. Any state not listed here is unmapped and ci_status() raises
-# ValueError, which forge_core turns into exit 2.
+# ValueError, which forge_core turns into exit 2. "warning" is a final
+# state in Gitea: mapping it to "pending" meant a pr-ci could never finish.
 _STATE_TO_STATE = {
     "success": "green",
-    "warning": "pending",
+    "warning": "red",
     "pending": "pending",
     "failure": "red",
     "error": "red",
