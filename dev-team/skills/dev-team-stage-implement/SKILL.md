@@ -69,6 +69,8 @@ No other kanban verb finishes this card.
 
 ## Workspaces
 
-Hermes creates this card's worktree at `<repo>/.worktrees/<task-id>`. When this card is a link
-in a plan-built chain on the same branch (backend-db then frontend, or a rework round), reuse
-the existing worktree path for that branch instead of adding a second `git worktree add` for it.
+Hermes creates this card's worktree at `<repo>/.worktrees/<task-id>`. When this card continues
+the same branch as its own `implement`-card parent — a rework round, where validate, review or
+pr-ci routed back to a new `implement` card on that branch — reuse the existing worktree path
+for that branch instead of adding a second `git worktree add` for it. (A plan-built multi-role
+chain on one branch is not a supported path today — see `dev-team-stage-plan`.)

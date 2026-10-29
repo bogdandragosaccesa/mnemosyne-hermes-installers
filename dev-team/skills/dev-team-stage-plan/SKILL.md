@@ -41,12 +41,29 @@ kanban_create(
 The guard requires exactly one card in `created_cards` carrying `dev-team-stage-implement` with
 this plan card as a parent.
 
-**When a unit needs both backend-db and frontend on the same branch:** per the design, you
-create the implement cards yourself, in sequence, linked parent to child — the first one
-(parented on this plan card) and the next one (parented on the first), before this plan card
-ever completes. `implement`'s `head_sha` that review and pr-ci ultimately verify against is the
-last implement card's. List every implement card you create, at every link in that chain, in
-`cards`.
+**What the guard actually verifies, per implement card.** `guard.py` requires every single
+`implement` card — not just a chain's last one — to complete with exactly one `validate` child,
+and it matches that `validate` card's `head_sha` to its own one `implement` parent
+(`_PARENT_STAGE`). `review` and `pr-ci` likewise each verify against their own direct parent's
+`head_sha`, not some later or earlier card's. There is no guard notion of a "final" card in a
+chain that review/pr-ci verify instead of the others.
+
+So if you parent impl2 on impl1 to put two roles (backend-db then frontend) on the same branch,
+impl1 still spawns its own complete validate→review→pr-ci chain on impl1's `head_sha` alone —
+which can produce a "ready PR" covering only impl1's half of the change — and impl2 then spawns
+a second, independent validate→review→pr-ci chain on impl2's `head_sha`, meaning a second
+`pr-open` attempt on the same branch. That breaks "one branch, one PR." The round limit also
+counts every `implement` card in the ancestry including itself, so impl2 starts at round 2 of
+3, not a fresh round 1.
+
+**There is today no guard-supported way to land one plan-produced change spanning backend-db
+and frontend as a single review/pr-ci pass.** Do not build a same-branch implement chain hoping
+later stages will treat it as one unit — they won't. When a unit genuinely needs both roles,
+either split it into two separately-planned units (each its own full plan→…→pr-ci pass and its
+own PR), or raise the gap as `scope: multi-role-chain` to the orchestrator for a design/guard
+decision (e.g. teaching the guard to verify a chain's last head_sha) before building around it.
+List in `cards` only the implement card(s) you actually create as this plan card's direct
+child(ren).
 
 ## Ending
 

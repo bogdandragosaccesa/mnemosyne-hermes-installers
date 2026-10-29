@@ -11,28 +11,53 @@ You hold the `pr-ci` card: it carries the skill `dev-team-stage-pr-ci`, which is
 your metadata. This is the one stage skill allowed to name a vendor-neutral tool by its actual
 name: `forge`. Every other soul and skill in `dev-team` stays vendor-neutral.
 
-## Forge onboarding (first pr-ci card for a repo)
+## Forge onboarding (fallback — devops onboarding should already have run)
 
-Before opening a PR, check whether a project record already exists at
+`running-the-pipeline` sequences a devops onboarding card before the first `implement` card, so
+by the time a `pr-ci` card runs, the project record below should already exist. Treat the steps
+here as the fallback for when it doesn't:
+
+Check whether a project record already exists at
 `$HERMES_HOME/dev-team/projects/<repo-slug>.json` (`<repo-slug>` is the `repo` string the
 intake card recorded — see `dev-team-stage-intake`). If it does not:
 
-1. Run `forge detect` in the repository to identify the PR adapter, the CI adapter and the
-   default branch. If the result is ambiguous, decide and record how you decided.
-2. Make the team's own clone of the repository, never the operator's clone, at
+1. Clone the repository — never the operator's own clone — to
    `$HERMES_HOME/dev-team/repos/<repo-slug>/`.
-3. Add `.worktrees/` to that clone's `.git/info/exclude` (local only — never committed, never
+2. Add `.worktrees/` to that clone's `.git/info/exclude` (local only — never committed, never
    written into the target repository itself).
-4. Write the project record (`$HERMES_HOME/dev-team/projects/<repo-slug>.json`) with the PR
-   adapter, the CI adapter, the default branch and how CI is found. Credentials never go in
-   this file or in any log — they come from the vendor CLI's own login or the operator's
-   secret store.
-5. Set the board's `default_workdir` to that team-owned clone, so every later card on this
-   board works there instead of in the operator's checkout.
+3. Run `forge detect --repo-dir $HERMES_HOME/dev-team/repos/<repo-slug>/ --slug <repo-slug>`
+   (`--repo-dir` is required; always pass `--slug` with intake's `repo` string explicitly —
+   without it, `forge detect` defaults the slug to the clone directory's name, not intake's
+   `repo`). If it exits `2` with `"ambiguous: pass --pr-adapter"`, decide the PR and CI
+   adapters yourself and re-run with `--pr-adapter <name>` and/or `--ci-adapter <name>`.
+4. `forge detect` already writes the project record for you (via `save_record`) — do not
+   hand-write one; a hand-written record risks a schema the guard/forge can't read. It always
+   writes `default_branch: "main"` regardless of this repository's actual default branch, so if
+   that differs, amend only that one field afterward — never rewrite the whole record, and
+   credentials never go in it.
+5. Set the board's `default_workdir` to that team-owned clone
+   (`hermes kanban boards set-default-workdir`), so every later card on this board works there
+   instead of in the operator's checkout.
 
 This record is what the guard itself reads later (`_record_default_branch`) to know which
 branch `git push` must never target on this project, and what `forge ci-status` resolves
 against. Get `repo-slug` right the first time — intake already fixed it; don't re-derive it.
+
+## Shipping the branch
+
+Once your parent `review` card has approved `head_sha`:
+
+1. Push the branch: `git push origin <branch>`. (The guard only blocks pushes to the project's
+   protected default branch — this is not that.)
+2. Open the PR: `forge pr-open --slug <repo-slug> --branch <branch> --title <title>
+   --body-file <path>`.
+3. Poll `forge ci-status --slug <repo-slug> --sha <head_sha>` while it reports `pending`, up to
+   a bounded number of attempts with backoff — `pending` right after opening a PR is normal,
+   not an attention item by itself.
+4. On `green` (exit `0`): `forge mark-ready --slug <repo-slug> --pr <pr-number>`, then complete
+   as below.
+5. On `red` (exit `1`): judge per Outcomes below.
+6. On `none`, or `pending` that never resolves within your poll bound: block per Outcomes.
 
 ## Required `metadata` on `kanban_complete`
 
@@ -64,10 +89,11 @@ when it isn't does not get through by retrying the same claim.
 - **A flake or infrastructure failure on paths this change doesn't touch.** Re-run CI once,
   then judge again as above. Still red after the re-run, or anything you can't resolve into
   green/red-caused-by-the-change: **block**, you do not get a third chance to re-run.
-- **Anything else** — CI state the forge can't resolve into green or red, the forge adapter is
-  unreachable, or you cannot verify which the red belongs to — `kanban_block(kind="needs_input")`
-  with a reason labelled `ci: other` or `forge: unreachable`. Never guess, and never complete
-  with `ci: "green"` to get past an ambiguous state.
+- **Anything else** — `none`, a poll timeout waiting on `pending`, a CI state the forge can't
+  resolve into green or red, the forge adapter is unreachable, or you cannot verify which the
+  red belongs to — `kanban_block(kind="needs_input")` with a reason labelled `ci: other`
+  (unresolvable state or timeout) or `forge: unreachable` (the forge itself can't be reached).
+  Never guess, and never complete with `ci: "green"` to get past an ambiguous state.
 
 ## Irreversible actions
 

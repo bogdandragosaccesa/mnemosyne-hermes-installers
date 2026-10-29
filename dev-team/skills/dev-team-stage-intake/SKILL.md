@@ -22,7 +22,7 @@ are allowed.
 
 | Field | Type | Check |
 | --- | --- | --- |
-| `definition_of_done` | list | must be a list (may be empty is **not** allowed by the guard's type check — pass a list, normally non-empty) |
+| `definition_of_done` | list | must be a list — the guard's check (`stages.py`'s `_list`) accepts `[]`; keep it normally non-empty as your soul's own guidance, not a guard rule |
 | `budget` | object `{amount, unit}` | `amount` a finite non-negative number; `unit` a non-empty string |
 | `repo` | string | non-empty; this is the forge **project slug** — every later stage's forge calls and the project record `$HERMES_HOME/dev-team/projects/<repo>.json` are keyed on this exact string, so make it slug-safe (e.g. `org-reponame`), not a URL |
 

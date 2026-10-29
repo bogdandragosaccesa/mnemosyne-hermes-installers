@@ -35,6 +35,26 @@ stage (forge onboarding, the project record, the guard's default-branch check) r
 against one consistent name. One repository, one board, one slug — never split a repository's
 work across boards or reuse a slug for a different repository.
 
+## Devops onboarding before any implement card
+
+Before the first `implement` card ever runs on this board, the team's own clone, the forge
+project record and the board's `default_workdir` must already exist — otherwise implement
+worktrees get created in the operator's own checkout, and the guard's default-branch push
+protection covers only `main`/`master` for this repo until onboarding writes the project record
+(`_record_default_branch` in the guard reads it from there). Sequence it, not `pr-ci`, as the
+one doing this work:
+
+1. After creating the board above, create a `devops` onboarding card — an ordinary card
+   carrying no `dev-team-stage-*` skill, so the guard does not gate it — to run exactly the
+   forge-onboarding steps documented in `dev-team-stage-pr-ci` (clone, `.worktrees/` exclude,
+   `forge detect`, `default_workdir`).
+2. Don't let intake→plan→implement outrun it: hold the intake card's `kanban_complete` until
+   the onboarding card is done, or, once the plan card exists, add the onboarding card as an
+   extra parent of the plan card (`kanban_link`) so plan cannot proceed before onboarding has
+   finished.
+3. `dev-team-stage-pr-ci`'s own "no project record exists" onboarding steps stay as a fallback
+   only — they should rarely fire once this runs first.
+
 ## Decomposition and routing
 
 Intake's child is a `plan` card (see `dev-team-stage-plan`) that you also own. From there, the
@@ -48,12 +68,15 @@ already says.
 ## Budget checkpoints
 
 Run `kanban-budget.py` (`dev-team/scripts/kanban-budget.py`, installed at the pm profile) at the
-25%, 50% and 75% checkpoints your soul already defines, on the current board:
+25%, 50% and 75% checkpoints your soul already defines, on the current board.
+`kanban-budget.py` measures spend in USD only (`--set-budget` takes a `USD` amount); record
+intake's `budget.unit` as `USD`, or convert the human's figure to USD yourself before intake
+completes and before the first `--set-budget` call:
 
 ```
-kanban-budget.py --set-budget <amount>     # once, right after intake, in the budget's unit
+kanban-budget.py --set-budget <amount>     # once, right after intake, in USD
 kanban-budget.py                           # at each checkpoint
-kanban-budget.py --json                    # machine-readable, for the ledger below
+kanban-budget.py --json                    # machine-readable, for the ledger below — always exits 0, never use it as the exit-code gate
 ```
 
 The script's own exit code is the gate — not your reading of its output:
