@@ -55,11 +55,41 @@ jobs:
           echo "hash=$hash" >> "$GITHUB_OUTPUT"
           echo "qa SOUL.md before: $hash"
 
+      - name: dev-team install --dry-run changes nothing
+        run: |
+          dev-team/install-dev-team-unix.sh --skip-model --dry-run
+          if hermes profile show dev-qa >/dev/null 2>&1; then
+            echo "::error::--dry-run created a profile" >&2
+            exit 1
+          fi
+
       - name: dev-team install (run 1)
-        run: dev-team/install-dev-team-unix.sh --skip-model
+        # Brief item 11: the first run on a fresh machine exited 1 while the
+        # plugin was in fact enabled (a race with the plugin reload).
+        run: |
+          if ! dev-team/install-dev-team-unix.sh --skip-model; then
+            echo "::error::first run must exit 0 on a fresh machine" >&2
+            exit 1
+          fi
 
       - name: dev-team install (run 2, idempotency)
         run: dev-team/install-dev-team-unix.sh --skip-model
+
+      - name: dev-team install --only qa (run 3, partial re-run)
+        run: dev-team/install-dev-team-unix.sh --skip-model --only qa
+
+      - name: every dev-* profile links the shared Mnemosyne bank
+        # Brief item 10: profiles this installer creates share one bank.
+        run: |
+          shared="$(cd "$(dirname "$(hermes config path)")/mnemosyne" && pwd -P)"
+          for role in pm architect uiux backend-db frontend qa reviewer devops; do
+            dir="$(dirname "$(hermes -p "dev-$role" config path)")"
+            if [ ! -L "$dir/mnemosyne" ] || [ "$(cd "$dir/mnemosyne" && pwd -P)" != "$shared" ]; then
+              echo "::error::dev-$role: $dir/mnemosyne is not a symlink to the shared bank $shared" >&2
+              exit 1
+            fi
+          done
+          test -f "$shared/data/mnemosyne.db" || { echo "::error::shared Mnemosyne DB missing" >&2; exit 1; }
 
       - name: every dev-* profile records its team prefix
         run: |
@@ -142,4 +172,64 @@ jobs:
           if ($hash -ne '${{ steps.qa_soul_before.outputs.hash }}') {
             Write-Error "qa profile's SOUL.md changed -- dev-team install touched an unprefixed profile it must never touch."
             exit 1
+          }
+
+  # Review #2: on Windows PowerShell 5.1, `Remove-Item -Recurse` on a junction
+  # deletes the TARGET's contents, so a re-run used to wipe the shared
+  # Mnemosyne bank and the plugin source through the profile links. The
+  # installer is run twice under 5.1 itself (`shell: powershell`, not pwsh),
+  # then the link targets are checked to still be there.
+  install-windows-ps51:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hermes (non-interactive)
+        shell: powershell
+        run: '& ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive'
+
+      - name: Refresh PATH for this job
+        shell: powershell
+        run: |
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $refreshed = ($machine, $user -join ';')
+          Add-Content -Path $env:GITHUB_PATH -Value ($refreshed -split ';' | Where-Object { $_ })
+
+      - name: Install Mnemosyne memory
+        shell: powershell
+        run: .\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory
+
+      - name: Runs under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) { Write-Error "expected 5.1, got $($PSVersionTable.PSVersion)"; exit 1 }
+
+      - name: dev-team install (run 1, 5.1)
+        shell: powershell
+        run: |
+          dev-team\install-dev-team-windows.ps1 -SkipModel
+          if ($LASTEXITCODE -ne 0) { Write-Error "first run must exit 0 on a fresh machine"; exit 1 }
+
+      - name: dev-team install (run 2, 5.1 - replaces every link)
+        shell: powershell
+        run: |
+          dev-team\install-dev-team-windows.ps1 -SkipModel
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: link targets survived the re-run
+        shell: powershell
+        run: |
+          $root = Split-Path -Parent (hermes config path | Select-Object -Last 1)
+          $db = Join-Path $root 'mnemosyne\data\mnemosyne.db'
+          if (-not (Test-Path -LiteralPath $db)) { Write-Error "shared Mnemosyne DB is gone: $db"; exit 1 }
+          $guard = Join-Path $env:GITHUB_WORKSPACE 'dev-team\plugin\dev-team-gate\guard.py'
+          if (-not (Test-Path -LiteralPath $guard)) { Write-Error "plugin source is gone: $guard"; exit 1 }
+          foreach ($role in 'pm','architect','uiux','backend-db','frontend','qa','reviewer','devops') {
+            $dir = Split-Path -Parent (hermes -p "dev-$role" config path | Select-Object -Last 1)
+            $linked = Join-Path $dir 'plugins\dev-team-gate\guard.py'
+            if (-not (Test-Path -LiteralPath $linked)) { Write-Error "dev-$role : $linked missing"; exit 1 }
+            if (-not (Test-Path -LiteralPath (Join-Path $dir 'mnemosyne\data\mnemosyne.db'))) {
+              Write-Error "dev-$role : shared Mnemosyne DB not reachable through the link"; exit 1
+            }
           }

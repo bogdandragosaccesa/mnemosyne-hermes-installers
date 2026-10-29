@@ -182,9 +182,23 @@ function New-DirLink {
     #>
     param([string] $LinkPath, [string] $Target, [string] $Label)
 
-    $existing = Get-Item -LiteralPath $LinkPath -ErrorAction SilentlyContinue
+    $existing = Get-Item -LiteralPath $LinkPath -Force -ErrorAction SilentlyContinue
     if ($existing) {
-        Remove-Item -LiteralPath $LinkPath -Force -Recurse
+        if ($existing.LinkType) {
+            # A junction or symlink: delete the link itself, never what it
+            # points at. Windows PowerShell 5.1's `Remove-Item -Recurse` on a
+            # junction walks INTO the target and deletes its contents - the
+            # shared Mnemosyne bank, or the plugin source. Directory.Delete
+            # without the recursive flag removes only the reparse point.
+            [System.IO.Directory]::Delete($LinkPath)
+        } elseif ($existing.PSIsContainer) {
+            # A real directory (an earlier copy fallback, or what `profile
+            # create --clone` just made). Callers only get here for a
+            # directory this run owns.
+            Remove-Item -LiteralPath $LinkPath -Force -Recurse
+        } else {
+            Remove-Item -LiteralPath $LinkPath -Force
+        }
     }
 
     try {
@@ -258,6 +272,25 @@ installer with -DisableBuiltinMemory to turn it off.
 }
 
 $modelLabel = if ($SkipModel) { '(unchanged)' } else { $Model }
+
+# forge.cmd goes next to hermes.exe. Another tool may already own the name
+# `forge` there: never overwrite a file this installer did not write.
+# Checked before any profile is touched, so a refusal leaves nothing half
+# installed.
+$ForgeMarker  = 'REM dev-team forge wrapper (install-dev-team-windows.ps1)'
+$hermesCmd    = Get-Command hermes -ErrorAction Stop
+$hermesDir    = Split-Path -Parent $hermesCmd.Source
+$forgeCmdPath = Join-Path $hermesDir 'forge.cmd'
+if (Test-Path -LiteralPath $forgeCmdPath) {
+    $currentForge = Get-Content -LiteralPath $forgeCmdPath -Raw -ErrorAction SilentlyContinue
+    $ours = $currentForge -and (
+        $currentForge.Contains($ForgeMarker) -or
+        ($currentForge -match '(?m)^python "[^"]*\\dev-team\\forge\\forge\.py" %\*'))
+    if (-not $ours) {
+        [Console]::Error.WriteLine("$forgeCmdPath already exists and was not written by this installer.`nRefusing to overwrite another tool's 'forge'. Move it aside, then re-run.")
+        exit 1
+    }
+}
 Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"
@@ -507,13 +540,23 @@ if (Test-Selected $EntryProfile) {
 # - the forge directory holds its own imports (adapters, forge_core) that
 # resolve off the script's own path, so the wrapper only needs to point
 # python at forge.py itself.
-$hermesCmd = Get-Command hermes -ErrorAction Stop
-$hermesDir = Split-Path -Parent $hermesCmd.Source
-$forgeCmdPath = Join-Path $hermesDir 'forge.cmd'
-$forgeCmdContent = "@echo off`r`npython `"$ForgePy`" %*`r`n"
+$forgeCmdContent = "@echo off`r`n$ForgeMarker`r`npython `"$ForgePy`" %*`r`n"
 Set-Content -LiteralPath $forgeCmdPath -Value $forgeCmdContent -NoNewline -Encoding ascii
 Write-Host ''
 Write-Host "forge installed: $forgeCmdPath"
+
+# The checks below can race the plugin reload right after `plugins enable`
+# (Task 12: a first run exited 1 although the plugin was enabled). Each is
+# retried a bounded number of times before it counts as a failure.
+$VerifyRetries = if ($env:DEV_TEAM_VERIFY_RETRIES) { [int]$env:DEV_TEAM_VERIFY_RETRIES } else { 10 }
+$VerifyDelay   = if ($env:DEV_TEAM_VERIFY_DELAY)   { [int]$env:DEV_TEAM_VERIFY_DELAY }   else { 1 }
+function Test-Eventually([scriptblock] $Check) {
+    for ($attempt = 1; $attempt -le $VerifyRetries; $attempt++) {
+        if (& $Check) { return $true }
+        if ($attempt -lt $VerifyRetries) { Start-Sleep -Seconds $VerifyDelay }
+    }
+    return $false
+}
 
 Write-Host ''
 Write-Host 'Verifying'
@@ -531,16 +574,14 @@ foreach ($role in $Profiles.Keys) {
         $failed++
     }
 
-    Invoke-Hermes '-p' $name 'plugins' 'doctor' 'dev-team-gate' '--ci' | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-Eventually { Invoke-Hermes '-p' $name 'plugins' 'doctor' 'dev-team-gate' '--ci' | Out-Null; $LASTEXITCODE -eq 0 }) {
         Write-Host "  $name : dev-team-gate doctor ok"
     } else {
         Write-Host "  $name : dev-team-gate doctor FAILED"
         $failed++
     }
 
-    $enabledList = Invoke-Hermes '-p' $name 'plugins' 'list' '--enabled' '--plain'
-    if ($enabledList -match 'dev-team-gate') {
+    if (Test-Eventually { (Invoke-Hermes '-p' $name 'plugins' 'list' '--enabled' '--plain') -match 'dev-team-gate' }) {
         Write-Host "  $name : dev-team-gate enabled"
     } else {
         Write-Host "  $name : dev-team-gate NOT enabled"

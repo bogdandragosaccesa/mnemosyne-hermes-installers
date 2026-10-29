@@ -143,6 +143,25 @@ done
 [[ -d $PLUGIN_SRC_GATE ]] || { echo "Missing $PLUGIN_SRC_GATE" >&2; exit 1; }
 [[ -f $FORGE_PY ]] || { echo "Missing $FORGE_PY" >&2; exit 1; }
 
+# `forge` goes to ~/.local/bin. Another tool may already own that name
+# (Laravel Forge, Foundry's forge): never overwrite a file this installer did
+# not write. Checked here, before any profile is touched, so a refusal never
+# leaves a partial install behind.
+FORGE_BIN="$HOME/.local/bin/forge"
+FORGE_MARKER="# dev-team forge wrapper (install-dev-team-unix.sh)"
+if [[ -e $FORGE_BIN || -L $FORGE_BIN ]]; then
+    if ! grep -qF "$FORGE_MARKER" "$FORGE_BIN" 2>/dev/null \
+            && ! grep -qE '^exec python3 ".*/dev-team/forge/forge\.py" "\$@"$' "$FORGE_BIN" 2>/dev/null; then
+        echo "$FORGE_BIN already exists and was not written by this installer." >&2
+        echo "Refusing to overwrite another tool's 'forge'. Move it aside, then re-run." >&2
+        exit 1
+    fi
+fi
+if (( ! DRY_RUN )); then
+    mkdir -p "$HOME/.local/bin"
+    [[ -w "$HOME/.local/bin" ]] || { echo "$HOME/.local/bin is not writable." >&2; exit 1; }
+fi
+
 # Resolve HERMES_HOME from Hermes itself rather than assuming ~/.hermes, so a
 # custom HERMES_HOME keeps working.
 ROOT_CONFIG="$(hermes config path)"
@@ -213,10 +232,12 @@ for i in "${!NAMES[@]}"; do
     if hermes profile show "$name" >/dev/null 2>&1; then
         say "→ $name (exists, updating)"
         updated=$((updated + 1))
+        existed=1
     else
         say "→ $name (creating)"
         run hermes profile create "$name" --clone --description "$desc"
         created=$((created + 1))
+        existed=0
     fi
 
     # Ask Hermes where the profile actually lives instead of assuming
@@ -277,16 +298,27 @@ for i in "${!NAMES[@]}"; do
             say "  would link: $profile_dir/mnemosyne -> $MNEMO_HOME"
         elif [[ -L "$profile_dir/mnemosyne" ]]; then
             run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
-        elif [[ -d "$profile_dir/mnemosyne" ]]; then
-            # A real directory here means this profile has already
-            # accumulated its own memories. Moving them is not ours to
-            # decide, so say so and leave it alone rather than deleting
-            # someone's history.
+        elif [[ -d "$profile_dir/mnemosyne" ]] && (( existed )); then
+            # A real directory on a profile that existed before this run
+            # means it has accumulated its own memories. Moving them is not
+            # ours to decide, so say so and leave it alone rather than
+            # deleting someone's history.
             say "  NOTE: $profile_dir/mnemosyne is a real directory with its own"
             say "        database. Left as-is — this profile will not share the"
             say "        team bank. Remove or merge it, then re-run, to share."
             unshared="$unshared $name"
         else
+            # Nothing there yet, or — the case this fixes — the real
+            # directory `hermes profile create --clone` made a few lines up
+            # in this very run. It holds no memories of this profile's own,
+            # so it is replaced by the link to the shared bank.
+            if [[ -d "$profile_dir/mnemosyne" ]]; then
+                if [[ "$(cd "$profile_dir/mnemosyne" && pwd -P)" == "$(cd "$MNEMO_HOME" && pwd -P)" ]]; then
+                    echo "$profile_dir/mnemosyne is the shared bank itself; refusing to remove it." >&2
+                    exit 1
+                fi
+                rm -rf -- "$profile_dir/mnemosyne"
+            fi
             run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
         fi
     fi
@@ -378,13 +410,36 @@ fi
 # (adapters, forge_core) that resolve off the script's own path, so the
 # wrapper only needs to point python3 at forge.py itself.
 mkdir -p "$HOME/.local/bin"
-cat > "$HOME/.local/bin/forge" <<EOF
+cat > "$FORGE_BIN" <<EOF
 #!/usr/bin/env bash
+$FORGE_MARKER
 exec python3 "$FORGE_PY" "\$@"
 EOF
-chmod +x "$HOME/.local/bin/forge"
+chmod +x "$FORGE_BIN"
 say ""
-say "forge installed: $HOME/.local/bin/forge"
+say "forge installed: $FORGE_BIN"
+
+# A check that can race the gateway's plugin reload right after `plugins
+# enable` (Task 12: the first run exited 1 although the plugin was enabled).
+# Retried a bounded number of times before it counts as a failure.
+VERIFY_RETRIES="${DEV_TEAM_VERIFY_RETRIES:-10}"
+VERIFY_DELAY="${DEV_TEAM_VERIFY_DELAY:-1}"
+eventually() {
+    local attempt=1
+    while ! "$@"; do
+        (( attempt >= VERIFY_RETRIES )) && return 1
+        attempt=$((attempt + 1))
+        sleep "$VERIFY_DELAY"
+    done
+}
+gate_enabled() {
+    # Captured first, not piped into `grep -q`: under pipefail an early grep
+    # exit can SIGPIPE hermes and fail a check that actually matched.
+    local out
+    out="$(hermes -p "$1" plugins list --enabled --plain 2>/dev/null || true)"
+    [[ $out == *dev-team-gate* ]]
+}
+gate_doctor()  { hermes -p "$1" plugins doctor dev-team-gate --ci >/dev/null 2>&1; }
 
 say ""
 say "Verifying"
@@ -402,14 +457,14 @@ for role in "${NAMES[@]}"; do
         failed=$((failed + 1))
     fi
 
-    if hermes -p "$name" plugins doctor dev-team-gate --ci >/dev/null 2>&1; then
+    if eventually gate_doctor "$name"; then
         say "  $name: dev-team-gate doctor ✓"
     else
         say "  $name: dev-team-gate doctor ✗"
         failed=$((failed + 1))
     fi
 
-    if hermes -p "$name" plugins list --enabled --plain 2>/dev/null | grep -q 'dev-team-gate'; then
+    if eventually gate_enabled "$name"; then
         say "  $name: dev-team-gate enabled ✓"
     else
         say "  $name: dev-team-gate NOT enabled ✗"

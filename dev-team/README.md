@@ -136,9 +136,17 @@ place), refuse when the root profile's `memory.provider` isn't `mnemosyne`, link
 install the stage skills plus `running-the-pipeline` and `kanban-budget.py` on `pm`. They also
 put `forge` where the gateway resolves it — `~/.local/bin/forge` on Unix, `forge.cmd` beside
 `hermes.exe` on Windows — and verify Mnemosyne `available` and the gate plugin loaded for every
-profile, exiting non-zero otherwise. Symlinks on Unix become
+profile, exiting non-zero otherwise. The plugin checks are retried for a few seconds first, because
+right after `plugins enable` the list can lag the reload. If a `forge` already exists there and
+this installer didn't write it (Laravel Forge, Foundry), the installer refuses before it touches
+any profile; move the other tool aside and re-run. A profile this run creates gets its
+`mnemosyne` directory (the one `profile create --clone` makes) replaced by a link to the shared
+bank. A profile that already existed and has a real `mnemosyne` directory keeps it and is named in
+the final summary. Symlinks on Unix become
 directory junctions on Windows (no Developer Mode or elevation needed), falling back to a copy
-with a warning when even a junction can't be created.
+with a warning when even a junction can't be created. On a re-run an existing junction is
+removed with `[System.IO.Directory]::Delete` and never with `Remove-Item -Recurse`. On Windows
+PowerShell 5.1 that cmdlet follows the junction and deletes the shared bank's contents.
 
 ## Onboarding a project
 
