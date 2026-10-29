@@ -1,0 +1,132 @@
+name: dev-team
+
+on:
+  push:
+    branches:
+      - autonomous-dev-team
+      - main
+  pull_request:
+    branches:
+      - main
+      - autonomous-dev-team
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: forge unit tests
+        run: python3 -m unittest discover -s dev-team/forge/tests
+
+      - name: dev-team-gate unit tests
+        run: python3 -m unittest discover -s dev-team/plugin/dev-team-gate/tests
+
+  install-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hermes (non-interactive)
+        run: curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --non-interactive
+
+      - name: Put hermes on PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: hermes doctor
+        run: hermes doctor
+
+      - name: Install Mnemosyne memory
+        run: ./install-mnemosyne-hermes-unix.sh --disable-builtin-memory
+
+      - name: Create qa collision canary (old-team profile name)
+        run: hermes profile create qa --clone
+
+      - name: Record qa SOUL.md hash before dev-team install
+        id: qa_soul_before
+        run: |
+          qa_dir="$(dirname "$(hermes -p qa config path)")"
+          hash="$(sha256sum "$qa_dir/SOUL.md" | awk '{print $1}')"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "qa SOUL.md before: $hash"
+
+      - name: dev-team install (run 1)
+        run: dev-team/install-dev-team-unix.sh --skip-model
+
+      - name: dev-team install (run 2, idempotency)
+        run: dev-team/install-dev-team-unix.sh --skip-model
+
+      - name: test_prefix_isolation — qa SOUL.md hash is unchanged
+        run: |
+          qa_dir="$(dirname "$(hermes -p qa config path)")"
+          hash="$(sha256sum "$qa_dir/SOUL.md" | awk '{print $1}')"
+          echo "qa SOUL.md after: $hash"
+          if [ "$hash" != "${{ steps.qa_soul_before.outputs.hash }}" ]; then
+            echo "::error::qa profile's SOUL.md changed — dev-team install touched an unprefixed profile it must never touch." >&2
+            exit 1
+          fi
+
+  install-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hermes (non-interactive)
+        shell: pwsh
+        run: '& ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -NonInteractive'
+
+      - name: Refresh PATH for this job
+        shell: pwsh
+        run: |
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $refreshed = ($machine, $user -join ';')
+          Add-Content -Path $env:GITHUB_PATH -Value ($refreshed -split ';' | Where-Object { $_ })
+
+      - name: hermes doctor
+        shell: pwsh
+        run: hermes doctor
+
+      - name: Install Mnemosyne memory
+        shell: pwsh
+        run: .\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory
+
+      - name: Create qa collision canary (old-team profile name)
+        shell: pwsh
+        run: hermes profile create qa --clone
+
+      - name: Record qa SOUL.md hash before dev-team install
+        id: qa_soul_before
+        shell: pwsh
+        run: |
+          $qaDir = Split-Path -Parent (hermes -p qa config path | Select-Object -Last 1)
+          $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $qaDir 'SOUL.md')).Hash
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "qa SOUL.md before: $hash"
+
+      - name: dev-team install (run 1)
+        shell: pwsh
+        run: dev-team\install-dev-team-windows.ps1 -SkipModel
+
+      - name: dev-team install (run 2, idempotency)
+        shell: pwsh
+        run: dev-team\install-dev-team-windows.ps1 -SkipModel
+
+      - name: test_prefix_isolation — qa SOUL.md hash is unchanged
+        shell: pwsh
+        run: |
+          $qaDir = Split-Path -Parent (hermes -p qa config path | Select-Object -Last 1)
+          $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $qaDir 'SOUL.md')).Hash
+          Write-Host "qa SOUL.md after: $hash"
+          if ($hash -ne '${{ steps.qa_soul_before.outputs.hash }}') {
+            Write-Error "qa profile's SOUL.md changed -- dev-team install touched an unprefixed profile it must never touch."
+            exit 1
+          }
