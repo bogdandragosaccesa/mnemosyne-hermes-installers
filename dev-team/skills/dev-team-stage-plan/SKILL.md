@@ -22,17 +22,17 @@ Those are ordinary child cards for your own judgment calls — they do not thems
 | --- | --- | --- |
 | `cards` | list of strings | non-empty; **the guard additionally verifies each id**: every card named must exist on the board and must carry a `dev-team-stage-*` skill, or completion is refused with `plan: card <id> carries no dev-team-stage-* skill` |
 
-`cards` is the full set of `implement` cards this plan produced — the whole chain, not only
-the one directly parented on this card. List every one so the check above can verify them all.
+`cards` lists the `implement` card(s) you create as this plan card's direct child(ren). List
+each one so the check above can verify them.
 
 ## The child card
 
-Before completing, create the first `implement` card as this card's direct child:
+Before completing, create the `implement` card as this card's direct child:
 
 ```
 kanban_create(
     title="...",
-    assignee="backend-db",   # or "frontend", whichever role starts the branch
+    assignee="backend-db",   # or "frontend", whichever role this unit needs
     parents=[<this plan card's id>],
     skills=["dev-team-stage-implement"],
 )
@@ -67,8 +67,8 @@ child(ren).
 
 ## Ending
 
-- `kanban_complete` with `cards` naming every implement card you created (each existing, each
-  carrying a stage skill) and the first one created as this card's child, or
+- `kanban_complete` with `cards` naming the implement card you created as this card's direct
+  child (existing, carrying a stage skill), or
 - `kanban_block(kind="needs_input")` with a labelled reason when decomposition itself hits a
   stop condition.
 
