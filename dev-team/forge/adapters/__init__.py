@@ -75,12 +75,16 @@ from .github import GithubAdapter  # noqa: E402
 from .gitlab import GitlabAdapter  # noqa: E402
 from .gitea import GiteaAdapter  # noqa: E402
 from .jenkins import JenkinsAdapter  # noqa: E402
-from forge_core import ADAPTERS  # noqa: E402
 
-ADAPTERS["github"] = GithubAdapter
-ADAPTERS["gitlab"] = GitlabAdapter
-ADAPTERS["gitea"] = GiteaAdapter
-ADAPTERS["jenkins"] = JenkinsAdapter
+# The registry, keyed by vendor name. This package imports nothing from
+# forge_core, so the dev-team-gate guard can load it by path next to its own
+# copy of forge_core; forge.py copies it into forge_core.ADAPTERS.
+ADAPTERS = {
+    "github": GithubAdapter,
+    "gitlab": GitlabAdapter,
+    "gitea": GiteaAdapter,
+    "jenkins": JenkinsAdapter,
+}
 
 __all__ = [
     "NotSupported",

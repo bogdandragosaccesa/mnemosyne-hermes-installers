@@ -332,17 +332,22 @@ class PrCiTests(unittest.TestCase):
         self.b.add("t_pr", "pr-ci", ["t_rev"])
         self.green = {"pr_url": "https://github.com/acme/w/pull/7", "head_sha": SHA,
                       "ci": "green"}
+        # #5: a green claim is checked against the PR first (in the project,
+        # head == head_sha, ready); these tests are about the CI read after it.
+        self.pr = lambda slug, url: {"pr": "7", "state": "open", "pr_url": url,
+                                     "head_sha": SHA, "ready": True}
 
     def test_pr_ci_green_with_no_child_passes(self):
         forge = ForgeSpy("green")
-        self.assertIsNone(check_complete(self.b, "t_pr", complete_args(self.green), forge))
+        self.assertIsNone(check_complete(self.b, "t_pr", complete_args(self.green), forge,
+                                         self.pr))
         self.assertEqual(forge.calls, [(SLUG, SHA)])
 
     def test_pr_ci_red_blocks(self):
         for state in ("red", "pending", "none", None, "GREEN"):
             with self.subTest(state=state):
                 msg = check_complete(
-                    self.b, "t_pr", complete_args(self.green), ForgeSpy(state))
+                    self.b, "t_pr", complete_args(self.green), ForgeSpy(state), self.pr)
                 self.assertIsInstance(msg, str)
                 self.assertTrue(msg.startswith("ci:"), msg)
 
@@ -351,13 +356,13 @@ class PrCiTests(unittest.TestCase):
                     RuntimeError("adapter missing")):
             with self.subTest(exc=exc):
                 msg = check_complete(
-                    self.b, "t_pr", complete_args(self.green), ForgeSpy(exc=exc))
+                    self.b, "t_pr", complete_args(self.green), ForgeSpy(exc=exc), self.pr)
                 self.assertIsInstance(msg, str)
                 self.assertTrue(msg.startswith("forge: unreachable"), msg)
 
     def test_pr_ci_no_intake_repo_blocks(self):
         self.b.metadata["t_intake"] = {}
-        msg = check_complete(self.b, "t_pr", complete_args(self.green), ForgeSpy())
+        msg = check_complete(self.b, "t_pr", complete_args(self.green), ForgeSpy(), self.pr)
         self.assertIsInstance(msg, str)
 
     def test_pr_ci_red_claim_requires_rework_child_without_forge(self):
@@ -806,54 +811,9 @@ class PreToolCallTests(HomeMixin, unittest.TestCase):
         self.assertEqual(out["action"], "block")
 
 
-class ForgeCiStatusTests(unittest.TestCase):
-    def run_with(self, returncode, stdout):
-        done = subprocess.CompletedProcess(["forge"], returncode, stdout=stdout, stderr="")
-        with mock.patch.object(guard_mod.shutil, "which", return_value="/bin/forge"), \
-                mock.patch.object(guard_mod.subprocess, "run", return_value=done) as run:
-            result = guard_mod.forge_ci_status(SLUG, SHA)
-        return result, run
-
-    def test_calls_forge_ci_status_with_20s_timeout(self):
-        state, run = self.run_with(0, '{"state": "green"}\n')
-        self.assertEqual(state, "green")
-        argv = run.call_args.args[0]
-        self.assertEqual(argv, ["/bin/forge", "ci-status", "--slug", SLUG, "--sha", SHA])
-        self.assertEqual(run.call_args.kwargs["timeout"], 20)
-        self.assertLess(guard_mod.FORGE_TIMEOUT_S, 30)
-
-    def test_negative_state_returned(self):
-        for state in ("red", "pending", "none"):
-            with self.subTest(state=state):
-                self.assertEqual(self.run_with(1, json.dumps({"state": state}))[0], state)
-
-    def test_cannot_verify_raises(self):
-        for rc, out in ((2, '{"error": "no project record"}'), (0, "not json"),
-                        (0, '{"nope": 1}'), (3, '{"state": "green"}'),
-                        (0, '{"state": "red"}'), (1, '{"state": "green"}'),
-                        (3, '{"state": "red"}')):
-            with self.subTest(rc=rc, out=out):
-                with self.assertRaises(Exception):
-                    self.run_with(rc, out)
-
-    def test_forge_missing_raises(self):
-        with mock.patch.object(guard_mod.shutil, "which", return_value=None):
-            with self.assertRaises(FileNotFoundError):
-                guard_mod.forge_ci_status(SLUG, SHA)
-
-    def test_timeout_becomes_forge_unreachable(self):
-        b = FakeBoard()
-        chain(b)
-        b.add("t_val", "validate", ["t_impl1"], md={
-            "head_sha": SHA, "verdict": "pass", "evidence": ["ok"]})
-        b.add("t_rev", "review", ["t_val"], md={"head_sha": SHA, "verdict": "approve"})
-        b.add("t_prci", "pr-ci", ["t_rev"])
-        args = {"metadata": {"pr_url": "https://x/pr/1", "head_sha": SHA, "ci": "green"}}
-        with mock.patch.object(guard_mod.shutil, "which", return_value="/bin/forge"), \
-                mock.patch.object(guard_mod.subprocess, "run",
-                                  side_effect=subprocess.TimeoutExpired("forge", 20)):
-            msg = check_complete(b, "t_prci", args, guard_mod.forge_ci_status)
-        self.assertTrue(msg.startswith("forge: unreachable"), msg)
+# The forge read (formerly a `forge ci-status` subprocess found on PATH) is
+# tested in test_guard_forge.TrustedForgeTests: since #4 the guard imports
+# forge_core by path and never runs a `forge` it finds on PATH.
 
 
 class PluginWiringTests(unittest.TestCase):

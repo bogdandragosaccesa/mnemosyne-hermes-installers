@@ -86,17 +86,22 @@ checks — the merge/deploy and default-branch push blocks below still apply reg
 | `implement` | backend-db / frontend | `branch`, `head_sha`, `changed_files` (non-empty), `tests_run` (list of `{command, exit_code}`, at least one, every `exit_code` 0) |
 | `validate` | qa | `head_sha` (must equal implement's), `verdict` (`pass`/`fail`), `evidence` (list); `fail` also needs non-empty `findings` |
 | `review` | reviewer | `head_sha` (must equal validate's), `verdict` (`approve`/`changes`); `changes` also needs non-empty `findings` |
-| `pr-ci` | devops | `pr_url`, `head_sha` (must equal review's), `ci` (`green`/`red`); `red` also needs non-empty `findings` — re-verified by the guard through `forge ci-status`, not taken on the worker's word |
+| `pr-ci` | devops | `pr_url`, `head_sha` (must equal review's), `ci` (`green`/`red`); `red` also needs non-empty `findings` — `green` is re-verified by the guard against the PR (in the project, head equals `head_sha`, ready) and its CI, not taken on the worker's word |
 
 **The pr-ci green/red rule, as the guard (`dev-team-gate/guard.py`) implements it:** a
-`pr-ci` card claiming `ci: "green"` is not believed. The guard itself runs
-`forge ci-status --slug <repo> --sha <head_sha>` before letting the completion through — exit 0
-with state `"green"` passes, anything else (`red`, `pending`, `none`, an unreachable forge, a
-timeout, a non-JSON answer) refuses the completion with a `forge: unreachable` or `ci:` label.
-Claiming green and retrying the same claim does not get past this; it fails closed by
-construction, not by convention. `ci: "red"` is accepted at face value (the guard does not
-re-verify a negative), and routes to exactly one new `implement` child card carrying the
-`findings`, which counts as a rework round.
+`pr-ci` card claiming `ci: "green"` is not believed. The guard reads the forge itself, in
+this order: the claimed `pr_url` must be a pull request of the project (the project's own
+forge reports that exact URL for its number), the PR's head must equal `head_sha`, CI on
+`head_sha` must be `"green"`, and the PR must be marked ready. Anything else (another
+repository's PR, a head pushed after review, `red`, `pending`, `none`, a draft, an unreachable
+forge, a timeout) refuses the completion with a `pr:`, `ci:` or `forge: unreachable` label.
+The guard does this in-process with the forge code shipped next to the plugin
+(`dev-team/forge`, reached through the plugin link), never by running a `forge` it finds on
+PATH; a plugin that was copied rather than linked cannot find that code and refuses every
+green claim. Claiming green and retrying the same claim does not get past this; it fails
+closed by construction, not by convention. `ci: "red"` is accepted at face value (the guard
+does not re-verify a negative), and routes to exactly one new `implement` child card carrying
+the `findings`, which counts as a rework round.
 
 Besides `pr-ci`'s CI re-read, the guard checks on every `kanban_complete` of a guarded card:
 the stage's required fields are present and well-typed; `head_sha` matches the parent stage
@@ -242,7 +247,11 @@ occurrences as three unrelated incidents:
 | `review: rounds-exhausted` | The guard refused a 4th `implement` round. |
 | `ci: other` | A CI state that doesn't resolve to green/red-caused-by-the-change, or a poll timeout. |
 | `forge: unreachable` | The forge adapter itself can't be reached or verified. |
+| `forge: record-stale` | The project record is wrong (repository moved, default branch changed); only the operator re-runs `forge detect --force`. |
+| `pr: not-in-project` / `pr: head-mismatch` / `pr: not-ready` | A green `pr-ci` claim whose PR is not the project's, whose head is not the reviewed `head_sha`, or which is still a draft. |
+| `setup: no-prefix` | The profile has no `dev-team-prefix` file, so assignee names cannot be built. |
 | `merge: human-only` | A terminal call tried to merge, deploy, or push to the default branch. |
+| `guard: ...` | A terminal call the guard cannot verify, that removes a fence, or that writes into the forge, the plugin or the project records. |
 
 Any specialist soul's own stop conditions (an invalidated assumption, an irreversible action,
 another specialist's refusal) are blocked with the same label convention.

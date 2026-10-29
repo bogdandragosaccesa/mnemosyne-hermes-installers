@@ -94,7 +94,14 @@ class GitlabAdapter:
     def pr_status(self, pr: str) -> dict:
         stdout = self._glab(["glab", "api", f"projects/{self._project()}/merge_requests/{pr}"])
         data = json.loads(stdout)
-        return {"state": str(data.get("state", "unknown")), "pr_url": data.get("web_url", "")}
+        draft = data.get("draft", data.get("work_in_progress"))
+        return {
+            "pr": str(data.get("iid", pr)),
+            "state": str(data.get("state", "unknown")),
+            "pr_url": data.get("web_url", ""),
+            "head_sha": data.get("sha") or "",
+            "ready": draft is False,
+        }
 
     def mark_ready(self, pr: str) -> dict:
         self._glab(["glab", "mr", "update", str(pr), "--ready"])

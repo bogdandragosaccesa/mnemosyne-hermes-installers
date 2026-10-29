@@ -93,7 +93,15 @@ class GiteaAdapter:
     def pr_status(self, pr: str) -> dict:
         base, owner, repo = self._target()
         data = self._request(f"{base}/api/v1/repos/{owner}/{repo}/pulls/{pr}")
-        return {"state": str(data.get("state", "unknown")), "pr_url": data.get("html_url", "")}
+        title = str(data.get("title", ""))
+        draft = bool(data.get("draft")) or _strip_wip_prefix(title) != title
+        return {
+            "pr": str(data.get("number", pr)),
+            "state": str(data.get("state", "unknown")),
+            "pr_url": data.get("html_url", ""),
+            "head_sha": (data.get("head") or {}).get("sha", ""),
+            "ready": not draft,
+        }
 
     def mark_ready(self, pr: str) -> dict:
         base, owner, repo = self._target()

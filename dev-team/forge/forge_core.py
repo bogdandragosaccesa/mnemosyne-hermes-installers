@@ -250,11 +250,55 @@ def _cmd_pr_open(args, home: Path, adapters, out) -> int:
     return EXIT_OK
 
 
+_PR_URL_NUMBER = re.compile(r"/(?:pull|pulls|merge_requests)/(\d+)/?(?:[?#].*)?$")
+_SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def parse_pr_number(ref: str) -> str:
+    """The PR number from `7` or a PR/MR URL; RecordError otherwise."""
+    ref = (ref or "").strip()
+    if ref.isdigit():
+        return ref
+    m = _PR_URL_NUMBER.search(ref)
+    if m and "://" in ref:
+        return m.group(1)
+    raise RecordError(f"cannot read a pull request number from {ref!r}")
+
+
+def pr_facts(rec: ProjectRecord, adapters, pr_ref: str) -> dict:
+    """{pr, state, pr_url, head_sha, ready} for PR `pr_ref` (number or URL) of
+    the project's own repository, read through its PR adapter. Raises on
+    anything off the contract: the guard ties a green pr-ci to these facts."""
+    number = parse_pr_number(pr_ref)
+    adapter = _build_adapter(rec, adapters, rec.pr_adapter)
+    data = adapter.pr_status(number)
+    if not isinstance(data, dict):
+        raise RecordError("pr-status: adapter returned no object")
+    url, head, ready = data.get("pr_url"), data.get("head_sha"), data.get("ready")
+    if not isinstance(url, str) or "://" not in url:
+        raise RecordError(f"pr-status: no PR URL for PR {number}")
+    if not isinstance(head, str) or not _SHA.match(head):
+        raise RecordError(f"pr-status: no head SHA for PR {number}")
+    if not isinstance(ready, bool):
+        raise RecordError(f"pr-status: no ready state for PR {number}")
+    return {"pr": number, "state": str(data.get("state", "unknown")), "pr_url": url,
+            "head_sha": head, "ready": ready}
+
+
+def ci_state(rec: ProjectRecord, adapters, sha: str) -> str:
+    """The CI state of `sha` through the project's CI adapter; raises on an
+    unknown state."""
+    adapter = _build_adapter(rec, adapters, rec.ci_adapter)
+    state = adapter.ci_status(sha)
+    if state not in CI_STATES:
+        raise RecordError(f"unknown ci state: {state!r}")
+    return state
+
+
 def _cmd_pr_status(args, home: Path, adapters, out) -> int:
     try:
         rec = load_record(args.slug, home)
-        adapter = _build_adapter(rec, adapters, rec.pr_adapter)
-        result = adapter.pr_status(args.pr)
+        result = pr_facts(rec, adapters, args.pr)
     except Exception as exc:
         _emit_error(out, exc)
         return EXIT_UNVERIFIABLE
@@ -265,14 +309,9 @@ def _cmd_pr_status(args, home: Path, adapters, out) -> int:
 def _cmd_ci_status(args, home: Path, adapters, out) -> int:
     try:
         rec = load_record(args.slug, home)
-        adapter = _build_adapter(rec, adapters, rec.ci_adapter)
-        state = adapter.ci_status(args.sha)
+        state = ci_state(rec, adapters, args.sha)
     except Exception as exc:
         _emit_error(out, exc)
-        return EXIT_UNVERIFIABLE
-
-    if state not in CI_STATES:
-        _emit(out, {"error": f"unknown ci state: {state!r}"})
         return EXIT_UNVERIFIABLE
 
     _emit(out, {"state": state})

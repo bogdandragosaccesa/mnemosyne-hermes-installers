@@ -14,12 +14,15 @@ label.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import shlex
-import shutil
-import subprocess
+import sys
+import threading
+import time
+import urllib.parse
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -48,12 +51,17 @@ def _describe(exc: BaseException) -> str:
 
 
 def check_complete(
-    board: Board, task_id: str, args: dict, ci_status: Callable[[str, str], str]
+    board: Board, task_id: str, args: dict, ci_status: Callable[[str, str], str],
+    pr_status: Callable[[str, str], dict] | None = None,
 ) -> str | None:
     """Rules, in order: unguarded card passes; metadata valid; head_sha equals
-    the parent stage's; exactly one right child; round limit; CI re-verified."""
+    the parent stage's; exactly one right child; round limit; a green pr-ci is
+    tied to its PR (in the project, head == head_sha) and CI is re-verified.
+
+    `ci_status(slug, sha)` and `pr_status(slug, pr_url)` read the forge; without
+    `pr_status` a green pr-ci is refused."""
     try:
-        return _check(board, task_id, args, ci_status)
+        return _check(board, task_id, args, ci_status, pr_status)
     except _Refuse as refusal:
         return str(refusal)
     except Exception as exc:  # fail closed
@@ -74,7 +82,7 @@ def _stage_of(board: Board, id: str, label: str) -> str | None:
     return _view_and_stage(board, id, label)[1]
 
 
-def _check(board, task_id, args, ci_status):
+def _check(board, task_id, args, ci_status, pr_status=None):
     # 1. Unguarded card.
     view = board.task(task_id)
     if view is None:
@@ -148,23 +156,68 @@ def _check(board, task_id, args, ci_status):
                     f"`review: rounds-exhausted`."
                 )
 
-    # 6. CI claimed green: the guard re-reads it from the forge.
+    # 6. CI claimed green: the guard re-reads it from the forge, tied to the PR.
+    # In this order: the PR belongs to the project, its head is head_sha, CI on
+    # that SHA is green, and the PR is marked ready.
     if stage == "pr-ci" and md["ci"] == "green":
-        sha = md["head_sha"]
-        slug = project_slug(board, task_id)
-        try:
-            state = ci_status(slug, sha)
-        except Exception as exc:
-            raise _Refuse(
-                f"forge: unreachable: cannot verify CI for {sha} ({_describe(exc)})"
-            ) from None
-        if state != "green":
-            raise _Refuse(
-                f"ci: forge reports {state!r} for {sha}, not 'green'; "
-                f"completion with ci=green refused"
-            )
+        _check_green_pr(board, task_id, md, ci_status, pr_status)
 
     return None
+
+
+def _canon_url(url: object) -> tuple | None:
+    if not isinstance(url, str) or "://" not in url:
+        return None
+    parts = urllib.parse.urlsplit(url.strip())
+    return (parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"))
+
+
+def _check_green_pr(board, task_id, md, ci_status, pr_status):
+    sha, claimed = md["head_sha"], md["pr_url"]
+    slug = project_slug(board, task_id)
+    if pr_status is None:
+        raise _Refuse(f"forge: unreachable: no PR check available to verify {claimed}")
+    try:
+        pr = pr_status(slug, claimed)
+    except Exception as exc:
+        raise _Refuse(
+            f"forge: unreachable: cannot read PR {claimed} of project {slug} ({_describe(exc)})"
+        ) from None
+    if not isinstance(pr, dict):
+        raise _Refuse(f"forge: unreachable: the forge returned no PR facts for {claimed}")
+
+    # (a) the PR belongs to the project: the project's own forge reports this
+    # exact URL for the PR number.
+    if _canon_url(pr.get("pr_url")) is None or _canon_url(pr.get("pr_url")) != _canon_url(claimed):
+        raise _Refuse(
+            f"pr: not-in-project: {claimed} is not a pull request of project {slug}; its "
+            f"forge reports {pr.get('pr_url')!r} for that number"
+        )
+    # (b) the PR's head is the SHA review approved and CI is read for.
+    head = pr.get("head_sha")
+    if not isinstance(head, str) or not head.lower().startswith(sha.lower()):
+        raise _Refuse(
+            f"pr: head-mismatch: the head of {claimed} is {head!r}, not head_sha {sha}; CI "
+            f"on {sha} says nothing about this PR. Block rather than complete."
+        )
+    # (c) CI on that SHA.
+    try:
+        state = ci_status(slug, sha)
+    except Exception as exc:
+        raise _Refuse(
+            f"forge: unreachable: cannot verify CI for {sha} ({_describe(exc)})"
+        ) from None
+    if state != "green":
+        raise _Refuse(
+            f"ci: forge reports {state!r} for {sha}, not 'green'; "
+            f"completion with ci=green refused"
+        )
+    # (d) marked ready.
+    if pr.get("ready") is not True:
+        raise _Refuse(
+            f"pr: not-ready: {claimed} is still a draft; run `forge mark-ready` and complete "
+            f"again"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +408,28 @@ _RAW_FUNCTION = re.compile(
 _RAW_SUBST_COMMAND = re.compile(
     r"(?:^|[;&|\n(]\s*)(?:[A-Za-z_]\w*=\S*\s+)*(?:\$\(|`)", re.MULTILINE)
 
+# Paths the guard trusts (#4): the forge code it imports, the `forge` wrapper
+# agents call, the plugin itself (and its link in each profile), and the
+# project records. Matched on any argv word or redirection target.
+_PROTECTED_PATHS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\.local/bin/forge(?![\w.-])",
+    r"forge\.cmd(?![\w.-])",
+    r"dev-team/projects(?![\w.-])",
+    r"plugins/dev-team-gate(?![\w.-])",
+    r"dev-team/plugin(?:/|$)",
+    r"dev-team/forge(?![\w.-])",
+))
+# Commands that only read what they are given. Anything else naming a
+# protected path is refused.
+_READ_ONLY_COMMANDS = frozenset({
+    "cat", "ls", "head", "tail", "less", "more", "stat", "file", "wc", "grep", "egrep",
+    "fgrep", "rg", "jq", "diff", "cmp", "sha256sum", "sha1sum", "md5sum", "b2sum", "test",
+    "[", "readlink", "realpath", "dirname", "basename", "echo", "printf", "du", "tree",
+    "forge", "get-content", "gc", "get-childitem", "select-string", "get-filehash",
+    "test-path",
+})
+_PLUGIN_REMOVERS = frozenset({"disable", "remove", "rm", "uninstall", "unlink", "delete"})
+
 
 def _basename(token: str) -> str:
     name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -376,15 +451,28 @@ def _is_operator(token: str) -> bool:
     return bool(token) and all(c in _OPERATOR_CHARS for c in token)
 
 
-def _split(tokens: Iterable[str]) -> list[list[str]]:
-    out, cur = [], []
+def _split(tokens: Iterable[str], redirects: list | None = None) -> list[list[str]]:
+    """Simple commands, split on shell operators. A redirection's target
+    (`> file`, `2>&1`, `<<< 'text'`, `<<EOF`) is not a command: it goes to
+    `redirects` as (operator, target)."""
+    out, cur, pending = [], [], None
     for tok in tokens:
         if _is_operator(tok):
-            if cur:
-                out.append(cur)
-            cur = []
-        else:
-            cur.append(tok)
+            redirect = "<" in tok or ">" in tok
+            separates = any(c in tok for c in ";|()\n") or ("&" in tok and not redirect)
+            if separates or (redirect and "(" in tok):  # `<(...)` is a new command
+                if cur:
+                    out.append(cur)
+                cur, pending = [], None
+            if redirect and "(" not in tok:
+                pending = tok
+            continue
+        if pending is not None:
+            if redirects is not None:
+                redirects.append((pending, tok))
+            pending = None
+            continue
+        cur.append(tok)
     if cur:
         out.append(cur)
     return out
@@ -526,7 +614,8 @@ def _command_index(argv: list[str]) -> int | None:
     return None
 
 
-def _simple_commands(command: str, depth: int = 0) -> list[list[str]]:
+def _simple_commands(command: str, depth: int = 0,
+                     redirects: list | None = None) -> list[list[str]]:
     """Every simple command in `command`, nested scripts included.
 
     Raises ValueError when the command cannot be tokenised.
@@ -534,27 +623,27 @@ def _simple_commands(command: str, depth: int = 0) -> list[list[str]]:
     if depth > _MAX_NESTING:
         raise ValueError("command nests shells too deeply to check")
     out = []
-    for argv in _split(_lex(command)):
+    for argv in _split(_lex(command), redirects):
         out.append(argv)
         for i, tok in enumerate(argv):
             base = _basename(tok)
             if base in _SHELLS:
                 script = _shell_c_script(argv[i + 1:])
                 if script is not None:
-                    out.extend(_simple_commands(script, depth + 1))
+                    out.extend(_simple_commands(script, depth + 1, redirects))
             elif base in _POWERSHELLS:
                 kind, script = _powershell_script(argv[i + 1:])
                 if kind == "command" and script:
-                    out.extend(_simple_commands(script, depth + 1))
+                    out.extend(_simple_commands(script, depth + 1, redirects))
             elif base == "eval" and i + 1 < len(argv):
-                out.extend(_simple_commands(" ".join(argv[i + 1:]), depth + 1))
+                out.extend(_simple_commands(" ".join(argv[i + 1:]), depth + 1, redirects))
             elif base == "alias":
                 for definition in argv[i + 1:]:
                     if "=" in definition:
-                        out.extend(_simple_commands(definition.split("=", 1)[1], depth + 1))
+                        out.extend(_simple_commands(definition.split("=", 1)[1], depth + 1, redirects))
             if "$(" in tok or "`" in tok:  # command substitution inside a quoted word
                 inner = tok.replace("$(", " ( ").replace("`", " ` ")
-                out.extend(_simple_commands(inner, depth + 1))
+                out.extend(_simple_commands(inner, depth + 1, redirects))
     return out
 
 
@@ -996,10 +1085,52 @@ def _shell_bypass(argv: list[str], cmd_index: int | None) -> str | None:
     return None
 
 
+def _protected_path(token: str) -> bool:
+    text = token.replace("\\", "/")
+    return any(p.search(text) for p in _PROTECTED_PATHS)
+
+
+def _trust_refusal(what: str) -> str:
+    return (
+        f"guard: `{what}` writes into a path the guard trusts (the forge code and wrapper, "
+        f"the dev-team-gate plugin, or the project records); refusing. Only the operator "
+        f"changes those. A fence that blocks you is a reason to block and ask."
+    )
+
+
+def _protected_write(argv: list[str], cmd_index: int | None) -> str | None:
+    """A command naming a trusted path that is not a read-only command, or one
+    that tampers with the forge or the plugin through their own CLIs."""
+    for i, tok in enumerate(argv):
+        base = _basename(tok)
+        rest = argv[i + 1:]
+        if base in ("forge", "forge.py") and "detect" in rest and "--force" in rest:
+            return _trust_refusal("forge detect --force")
+        if base == "hermes":
+            pos = _positional(rest)
+            if "plugins" in pos:
+                verbs = pos[pos.index("plugins") + 1:]
+                if verbs and verbs[0] in _PLUGIN_REMOVERS and "dev-team-gate" in verbs:
+                    return _trust_refusal(f"hermes plugins {verbs[0]} dev-team-gate")
+            if "config" in pos:
+                verbs = pos[pos.index("config") + 1:]
+                if verbs[:1] == ["edit"] or (
+                        verbs[:1] in (["set"], ["unset"]) and len(verbs) > 1
+                        and verbs[1].lower().startswith("plugins")):
+                    return _trust_refusal("hermes config " + " ".join(verbs[:2]))
+    hits = [t for t in argv if _protected_path(t)]
+    if not hits:
+        return None
+    word = argv[cmd_index] if cmd_index is not None else argv[0]
+    if _basename(word) in _READ_ONLY_COMMANDS and word not in hits:
+        return None
+    return _trust_refusal(f"{_basename(word)} {hits[0]}")
+
+
 def _record_default_branch(slug: str) -> str:
     """`default_branch` of the project record `$HERMES_HOME/dev-team/projects/<slug>.json`,
     resolved the way `forge` resolves it."""
-    if not slug or slug in (".", "..") or "/" in slug or "\\" in slug:
+    if not slug or slug in (".", "..") or any(c in slug for c in "/\\\0"):
         raise ValueError(f"unsafe project slug {slug!r}")
     home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
     path = Path(home) / "dev-team" / "projects" / f"{slug}.json"
@@ -1173,17 +1304,23 @@ def _check_terminal(board, task_id, command, open_board=None):
         return _unverifiable("a command substitution is the command name")
 
     parse_error = None
+    redirects: list = []
     try:
-        commands = _simple_commands(command)
+        commands = _simple_commands(command, redirects=redirects)
     except ValueError as exc:
         parse_error = exc
         commands = _lenient_commands(command)
+
+    for op, target in redirects:
+        if ">" in op and _protected_path(target):
+            return _trust_refusal(f"{op} {target}")
 
     # Rules that need no board.
     pushes = []
     for argv in commands:
         cmd_index = _command_index(argv)
-        for msg in (_fence(argv), _merge_or_deploy(argv), _api_write(argv)):
+        for msg in (_fence(argv), _protected_write(argv, cmd_index), _merge_or_deploy(argv),
+                    _api_write(argv)):
             if msg:
                 return msg
         found = _git_rules(argv, cmd_index)
@@ -1218,44 +1355,123 @@ def _check_terminal(board, task_id, command, open_board=None):
 
 
 # ---------------------------------------------------------------------------
-# The forge CI read and the pre_tool_call hook.
+# The forge read and the pre_tool_call hook.
+#
+# The guard never runs whatever `forge` is on PATH: that file is owned by the
+# same user the agents run as. It imports forge_core and the adapters by path
+# from the `forge/` directory next to this plugin (dev-team/forge, reached
+# through the plugin link's real path), under private module names so nothing
+# on sys.path can stand in for them. Terminal writes into that directory, the
+# plugin, the `forge` wrapper and the project records are refused (see
+# _PROTECTED_PATHS).
 # ---------------------------------------------------------------------------
 
-# Under the 30 s `plugins.hook_callback_timeout` that bounds the whole hook.
+# Under the 30 s `plugins.hook_callback_timeout` that bounds the whole hook;
+# one budget covers every forge read of one kanban_complete.
 FORGE_TIMEOUT_S = 20
 
-_NEGATIVE_CI = frozenset({"red", "pending", "none"})
+PLUGIN_DIR = Path(__file__).resolve().parent
+FORGE_DIR = PLUGIN_DIR.parent.parent / "forge"
+
+_FORGE: tuple | None = None  # (forge_core module, adapter registry), loaded once
+_FORGE_LOCK = threading.Lock()
+
+
+def _import_path(name: str, path: Path, package: bool = False):
+    spec = importlib.util.spec_from_file_location(
+        name, path, submodule_search_locations=[str(path.parent)] if package else None)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _load_forge():
+    """(forge_core, {vendor: adapter class}) imported by path from FORGE_DIR."""
+    global _FORGE
+    with _FORGE_LOCK:
+        if _FORGE is None:
+            if not (FORGE_DIR / "forge_core.py").is_file():
+                raise FileNotFoundError(
+                    f"forge not found next to the plugin at {FORGE_DIR} (a copied, not "
+                    f"linked, plugin cannot verify CI)")
+            core = _import_path("_dev_team_gate_forge_core", FORGE_DIR / "forge_core.py")
+            pkg = _import_path("_dev_team_gate_forge_adapters",
+                               FORGE_DIR / "adapters" / "__init__.py", package=True)
+            _FORGE = (core, dict(pkg.ADAPTERS))
+        return _FORGE
+
+
+def _adapter_registry() -> dict:
+    return _load_forge()[1]
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+class ForgeReader:
+    """In-process forge reads for one hook call, all under one deadline.
+
+    Each read runs in a daemon thread; past the deadline it raises
+    TimeoutError and check_complete reports `forge: unreachable`."""
+
+    def __init__(self, adapters: dict | None = None, home: Path | None = None,
+                 budget: float | None = None):
+        self._adapters, self._home = adapters, home
+        self._budget = FORGE_TIMEOUT_S if budget is None else budget
+        self._deadline = time.monotonic() + self._budget
+
+    def _run(self, fn, *args):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"forge did not answer within {self._budget}s")
+        box: dict = {}
+
+        def target():
+            try:
+                box["value"] = fn(*args)
+            except BaseException as exc:  # handed to the caller below
+                box["error"] = exc
+
+        worker = threading.Thread(target=target, name="dev-team-gate-forge", daemon=True)
+        worker.start()
+        worker.join(remaining)
+        if worker.is_alive():
+            raise TimeoutError(f"forge did not answer within {self._budget}s")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+    def _record(self, core, slug):
+        return core.load_record(slug, self._home or _hermes_home())
+
+    def ci_status(self, slug: str, sha: str) -> str:
+        """"green" or a negative state ("red", "pending", "none"); raises when
+        CI cannot be verified."""
+        core = _load_forge()[0]
+        adapters = self._adapters if self._adapters is not None else _adapter_registry()
+        return self._run(lambda: core.ci_state(self._record(core, slug), adapters, sha))
+
+    def pr_status(self, slug: str, pr_url: str) -> dict:
+        """{pr, state, pr_url, head_sha, ready} of the project's PR `pr_url`."""
+        core = _load_forge()[0]
+        adapters = self._adapters if self._adapters is not None else _adapter_registry()
+        return self._run(lambda: core.pr_facts(self._record(core, slug), adapters, pr_url))
 
 
 def forge_ci_status(slug: str, sha: str) -> str:
-    """`forge ci-status --slug <slug> --sha <sha>`: "green", or a negative state.
+    return ForgeReader().ci_status(slug, sha)
 
-    Raises when forge is missing, times out, cannot verify (exit 2) or answers
-    anything off the contract; check_complete turns that into `forge: unreachable`.
-    """
-    exe = shutil.which("forge")
-    if not exe:
-        raise FileNotFoundError("forge is not on PATH")
-    proc = subprocess.run(
-        [exe, "ci-status", "--slug", slug, "--sha", sha],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=FORGE_TIMEOUT_S,
-    )
-    try:
-        data = json.loads(proc.stdout)
-    except ValueError:
-        raise RuntimeError(f"forge ci-status exit {proc.returncode}: output is not JSON") from None
-    if not isinstance(data, dict):
-        raise RuntimeError(f"forge ci-status exit {proc.returncode}: output is not an object")
-    state = data.get("state")
-    if proc.returncode == 0 and state == "green":
-        return state
-    if proc.returncode == 1 and state in _NEGATIVE_CI:
-        return state
-    if proc.returncode == 2:
-        detail = str(data.get("error", ""))[:200]  # forge redacts before printing
-        raise RuntimeError(f"forge ci-status cannot verify: {detail}")
-    raise RuntimeError(f"forge ci-status exit {proc.returncode} with state {state!r}")
+
+def forge_pr_status(slug: str, pr_url: str) -> dict:
+    return ForgeReader().pr_status(slug, pr_url)
 
 
 def _make_board(board: str | None) -> Board:
@@ -1282,7 +1498,8 @@ def pre_tool_call(tool_name, args, **kw):
                     "unset; cannot verify the card, refusing"
                 )
             board = _make_board(args.get("board") or None)
-            msg = check_complete(board, task_id, args, forge_ci_status)
+            reader = ForgeReader()
+            msg = check_complete(board, task_id, args, reader.ci_status, reader.pr_status)
         else:
             command = args.get("command")
             if command is None:

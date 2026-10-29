@@ -72,10 +72,16 @@ Once your parent `review` card has approved `head_sha`:
 | `ci` | string | must be exactly `"green"` or `"red"` |
 | `findings` | list, **required only when `ci` is `"red"`** | non-empty |
 
-**`ci: "green"` is re-verified, not taken on your word.** The guard itself runs
-`forge ci-status --slug <repo-slug> --sha <head_sha>` before letting the completion through. If
-the forge disagrees, or cannot be reached at all, your completion is refused — claiming green
-when it isn't does not get through by retrying the same claim.
+**`ci: "green"` is re-verified, not taken on your word.** Before letting the completion
+through, the guard reads the forge itself, in this order: `pr_url` must be a pull request of
+this project (the project's own forge reports that exact URL for its number — refusal
+`pr: not-in-project`); the PR's head must be your `head_sha` (`pr: head-mismatch`: if anything
+was pushed after review, block rather than complete); CI on `head_sha` must be green (`ci:`);
+and the PR must be marked ready (`pr: not-ready`: run `forge mark-ready` first). If the forge
+disagrees, or cannot be reached at all (`forge: unreachable`), your completion is refused —
+claiming green when it isn't does not get through by retrying the same claim. The guard runs
+the forge code shipped next to the plugin, never a `forge` found on PATH, and refuses terminal
+writes into that code, the `forge` wrapper, the plugin and the project records.
 
 ## Assignee names carry the team prefix
 

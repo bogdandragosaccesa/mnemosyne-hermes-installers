@@ -166,6 +166,61 @@ class GithubAdapterTests(unittest.TestCase):
         self.assertNotIn("--json", run.calls[0][0])
 
 
+class PrStatusAdapterTests(unittest.TestCase):
+    """#5: every PR adapter reports the PR's head SHA and ready (not draft) state,
+    read from the project's own repository."""
+
+    HEAD = "9f4cbf1a2b3c4d5e6f708192a3b4c5d6e7f80912"
+
+    def test_github_pr_status_reads_the_project_pull(self):
+        body = {"number": 7, "html_url": "https://github.com/acme/widgets/pull/7",
+                 "state": "open", "draft": False, "head": {"sha": self.HEAD}}
+        run = FakeRun(stdout=json.dumps(body))
+        result = GithubAdapter(make_record("github", "github"), run=run).pr_status("7")
+        self.assertEqual(result, {"pr": "7", "state": "open",
+                                  "pr_url": "https://github.com/acme/widgets/pull/7",
+                                  "head_sha": self.HEAD, "ready": True})
+        self.assertEqual(run.calls[0][0], ["gh", "api", "repos/acme/widgets/pulls/7"])
+
+    def test_github_draft_pr_is_not_ready(self):
+        body = {"number": 7, "html_url": "u", "state": "open", "draft": True,
+                 "head": {"sha": self.HEAD}}
+        run = FakeRun(stdout=json.dumps(body))
+        self.assertIs(GithubAdapter(make_record("github", "github"), run=run)
+                      .pr_status("7")["ready"], False)
+
+    def test_gitlab_pr_status_reads_the_project_merge_request(self):
+        body = {"iid": 3, "web_url": "https://gitlab.com/acme/widgets/-/merge_requests/3",
+                 "state": "opened", "draft": False, "sha": self.HEAD}
+        run = FakeRun(stdout=json.dumps(body))
+        rec = make_record("gitlab", "gitlab", repo_url="https://gitlab.com/acme/widgets.git")
+        result = GitlabAdapter(rec, run=run).pr_status("3")
+        self.assertEqual(result, {"pr": "3", "state": "opened",
+                                  "pr_url": "https://gitlab.com/acme/widgets/-/merge_requests/3",
+                                  "head_sha": self.HEAD, "ready": True})
+        self.assertEqual(run.calls[0][0],
+                         ["glab", "api", "projects/acme%2Fwidgets/merge_requests/3"])
+        body["work_in_progress"] = True
+        body.pop("draft")
+        run = FakeRun(stdout=json.dumps(body))
+        self.assertIs(GitlabAdapter(rec, run=run).pr_status("3")["ready"], False)
+
+    def test_gitea_pr_status_reads_the_project_pull(self):
+        body = {"number": 5, "html_url": "https://git.example.com/acme/widgets/pulls/5",
+                 "state": "open", "title": "Add thing", "head": {"sha": self.HEAD}}
+        http = FakeHttp(body=json.dumps(body).encode())
+        rec = make_record("gitea", "gitea", repo_url="https://git.example.com/acme/widgets.git")
+        result = GiteaAdapter(rec, http=http).pr_status("5")
+        self.assertEqual(result, {"pr": "5", "state": "open",
+                                  "pr_url": "https://git.example.com/acme/widgets/pulls/5",
+                                  "head_sha": self.HEAD, "ready": True})
+        self.assertEqual(http.requests[0].full_url,
+                         "https://git.example.com/api/v1/repos/acme/widgets/pulls/5")
+        for draft_body in (dict(body, title="WIP: Add thing"), dict(body, draft=True)):
+            http = FakeHttp(body=json.dumps(draft_body).encode())
+            self.assertIs(GiteaAdapter(rec, http=http).pr_status("5")["ready"], False)
+
+
 class GithubStateTableTests(unittest.TestCase):
     """Table-driven coverage: every github check-run conclusion this adapter
     claims to support must map to the state the spec requires, independent

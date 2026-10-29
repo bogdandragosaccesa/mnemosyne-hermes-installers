@@ -74,7 +74,9 @@ class FakeAdapter:
         return {"pr_url": "https://example.test/pr/1"}
 
     def pr_status(self, pr):
-        return {"state": "open"}
+        self.pr_seen = pr
+        return {"pr": str(pr), "state": "open", "pr_url": f"https://example.test/acme/demo/pull/{pr}",
+                "head_sha": "9f4cbf1a2b3c4d5e6f708192a3b4c5d6e7f80912", "ready": True}
 
     def ci_status(self, sha):
         if self.raise_message:
@@ -432,6 +434,62 @@ class SlugValidationTests(unittest.TestCase):
             with self.subTest(slug=slug):
                 with self.assertRaises(RecordError):
                     record_path(slug, Path("/tmp/h"))
+
+
+class PrStatusTests(unittest.TestCase):
+    """#5: pr-status reports the PR's head SHA and ready state."""
+
+    def run_pr_status(self, pr, adapter):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_record(SAMPLE, home)
+            return run_main(["pr-status", "--slug", "demo", "--pr", pr], home,
+                            {"fake": lambda rec: adapter})
+
+    def test_pr_status_reports_head_sha_and_ready(self):
+        code, out = self.run_pr_status("7", FakeAdapter())
+        self.assertEqual(code, EXIT_OK, out)
+        data = json.loads(out)
+        self.assertEqual(data["head_sha"], "9f4cbf1a2b3c4d5e6f708192a3b4c5d6e7f80912")
+        self.assertIs(data["ready"], True)
+        self.assertEqual(data["pr_url"], "https://example.test/acme/demo/pull/7")
+        self.assertEqual(data["pr"], "7")
+
+    def test_pr_status_accepts_a_pr_url(self):
+        for url, number in (("https://github.com/acme/demo/pull/7", "7"),
+                            ("https://gitlab.com/g/sub/demo/-/merge_requests/12/", "12"),
+                            ("https://git.example.org/acme/demo/pulls/3#issuecomment-1", "3")):
+            with self.subTest(url=url):
+                adapter = FakeAdapter()
+                code, out = self.run_pr_status(url, adapter)
+                self.assertEqual(code, EXIT_OK, out)
+                self.assertEqual(adapter.pr_seen, number)
+
+    def test_pr_status_unparseable_ref_fails_closed(self):
+        for ref in ("abc", "https://github.com/acme/demo", "7; rm -rf /", ""):
+            with self.subTest(ref=ref):
+                code, out = self.run_pr_status(ref, FakeAdapter())
+                self.assertEqual(code, EXIT_UNVERIFIABLE)
+                self.assertIn("error", json.loads(out))
+
+    def test_pr_status_missing_facts_fails_closed(self):
+        class Partial(FakeAdapter):
+            def pr_status(self, pr):
+                return {"state": "open", "pr_url": "https://example.test/pull/1"}
+
+        class BadReady(FakeAdapter):
+            def pr_status(self, pr):
+                return dict(FakeAdapter.pr_status(self, pr), ready="yes")
+
+        class BadSha(FakeAdapter):
+            def pr_status(self, pr):
+                return dict(FakeAdapter.pr_status(self, pr), head_sha="not-a-sha")
+
+        for adapter in (Partial(), BadReady(), BadSha()):
+            with self.subTest(adapter=type(adapter).__name__):
+                code, out = self.run_pr_status("1", adapter)
+                self.assertEqual(code, EXIT_UNVERIFIABLE)
+                self.assertIn("error", json.loads(out))
 
 
 if __name__ == "__main__":

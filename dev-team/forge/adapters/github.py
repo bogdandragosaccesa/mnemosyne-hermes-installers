@@ -88,9 +88,17 @@ class GithubAdapter:
         return {"pr": pr_id, "pr_url": url}
 
     def pr_status(self, pr: str) -> dict:
-        stdout = self._gh(["gh", "pr", "view", str(pr), "--json", "state,url"])
-        data = json.loads(stdout)
-        return {"state": str(data["state"]).lower(), "pr_url": data["url"]}
+        # Read through the API with the project's own owner/repo, never `gh pr
+        # view` (which resolves the repository from the current directory).
+        owner, repo = self._owner_repo()
+        data = json.loads(self._gh(["gh", "api", f"repos/{owner}/{repo}/pulls/{pr}"]))
+        return {
+            "pr": str(data.get("number", pr)),
+            "state": str(data.get("state", "unknown")).lower(),
+            "pr_url": data.get("html_url", ""),
+            "head_sha": (data.get("head") or {}).get("sha", ""),
+            "ready": data.get("draft") is False,
+        }
 
     def mark_ready(self, pr: str) -> dict:
         self._gh(["gh", "pr", "ready", str(pr)])
