@@ -151,10 +151,55 @@ class GithubAdapterTests(unittest.TestCase):
         self.assertFalse(GithubAdapter(rec, run=run).detect(Path("/tmp/repo")))
 
     def test_github_pr_open_uses_gh_cli(self):
-        run = FakeRun(stdout=json.dumps({"number": 7, "url": "https://github.com/acme/widgets/pull/7"}))
+        # Real `gh pr create` stdout shape: human-readable progress lines
+        # followed by the new PR's URL as the last line. There is no --json
+        # flag on this subcommand.
+        run = FakeRun(
+            stdout=(
+                "Creating pull request for feature into main in acme/widgets\n\n"
+                "https://github.com/acme/widgets/pull/7\n"
+            )
+        )
         result = self._adapter(run).pr_open("feature", "Add thing", "body text")
         self.assertEqual(result, {"pr": "7", "pr_url": "https://github.com/acme/widgets/pull/7"})
         self.assertEqual(run.calls[0][0][:3], ["gh", "pr", "create"])
+        self.assertNotIn("--json", run.calls[0][0])
+
+
+class GithubStateTableTests(unittest.TestCase):
+    """Table-driven coverage: every github check-run conclusion this adapter
+    claims to support must map to the state the spec requires, independent
+    of whatever the adapter module's own table currently says."""
+
+    # Hardcoded from the vendor mapping, not imported from github.py, so a
+    # mutation to the adapter's table is caught instead of silently copied
+    # into "expected" here.
+    EXPECTED = {
+        "success": "green",
+        "neutral": "green",
+        "skipped": "green",
+        "failure": "red",
+        "timed_out": "red",
+        "cancelled": "red",
+        "action_required": "red",
+        "stale": "red",
+    }
+
+    def test_every_conclusion_maps_to_expected_state(self):
+        from adapters.github import _CONCLUSION_TO_STATE
+
+        # Catches an entry being added/removed from the adapter's table,
+        # not just a value being changed.
+        self.assertEqual(set(_CONCLUSION_TO_STATE), set(self.EXPECTED))
+        rec = make_record("github", "github")
+        for conclusion, expected in self.EXPECTED.items():
+            with self.subTest(conclusion=conclusion):
+                run = FakeRun(
+                    stdout=json.dumps(
+                        {"check_runs": [{"status": "completed", "conclusion": conclusion}]}
+                    )
+                )
+                self.assertEqual(GithubAdapter(rec, run=run).ci_status("abc123"), expected)
 
 
 class GitlabAdapterTests(unittest.TestCase):
@@ -204,6 +249,36 @@ class GitlabAdapterTests(unittest.TestCase):
         self.assertFalse(GitlabAdapter(rec, run=run).detect(Path("/tmp/repo")))
 
 
+class GitlabStateTableTests(unittest.TestCase):
+    """Table-driven coverage, expected states hardcoded (see GithubStateTableTests)."""
+
+    EXPECTED = {
+        "success": "green",
+        "skipped": "green",
+        "manual": "green",
+        "failed": "red",
+        "canceled": "red",
+        "pending": "pending",
+        "running": "pending",
+        "created": "pending",
+        "waiting_for_resource": "pending",
+        "preparing": "pending",
+        "scheduled": "pending",
+    }
+
+    def test_every_status_maps_to_expected_state(self):
+        from adapters.gitlab import _STATUS_TO_STATE
+
+        self.assertEqual(set(_STATUS_TO_STATE), set(self.EXPECTED))
+        for status, expected in self.EXPECTED.items():
+            with self.subTest(status=status):
+                run = FakeRun(stdout=json.dumps([{"status": status}]))
+                rec = make_record(
+                    "gitlab", "gitlab", repo_url="https://gitlab.com/acme/widgets.git"
+                )
+                self.assertEqual(GitlabAdapter(rec, run=run).ci_status("abc123"), expected)
+
+
 class GiteaAdapterTests(unittest.TestCase):
     def _adapter(self, http, repo_url="https://git.example.com/acme/widgets.git"):
         rec = make_record("gitea", "gitea", repo_url=repo_url)
@@ -234,6 +309,32 @@ class GiteaAdapterTests(unittest.TestCase):
         # Self-hosted: never guessed, caller must pass --pr-adapter explicitly.
         self.assertFalse(self._adapter(FakeHttp()).detect(Path("/tmp/repo")))
 
+    def test_gitea_mark_ready_strips_wip_colon_prefix(self):
+        http = FakeHttp(body=json.dumps({"title": "WIP: Add feature"}).encode())
+        result = self._adapter(http).mark_ready("5")
+        self.assertEqual(result, {"pr": "5", "ready": True})
+        self.assertEqual(len(http.requests), 2)
+        get_req, patch_req = http.requests
+        self.assertEqual(get_req.method, "GET")
+        self.assertEqual(patch_req.method, "PATCH")
+        payload = json.loads(patch_req.data.decode())
+        self.assertEqual(payload, {"title": "Add feature"})
+        self.assertNotIn("draft", payload)
+
+    def test_gitea_mark_ready_strips_bracket_wip_prefix_case_insensitively(self):
+        http = FakeHttp(body=json.dumps({"title": "[wip] Add feature"}).encode())
+        self._adapter(http).mark_ready("5")
+        patch_req = http.requests[1]
+        payload = json.loads(patch_req.data.decode())
+        self.assertEqual(payload, {"title": "Add feature"})
+
+    def test_gitea_mark_ready_leaves_non_wip_title_unchanged(self):
+        http = FakeHttp(body=json.dumps({"title": "Add feature"}).encode())
+        self._adapter(http).mark_ready("5")
+        patch_req = http.requests[1]
+        payload = json.loads(patch_req.data.decode())
+        self.assertEqual(payload, {"title": "Add feature"})
+
     def test_gitea_token_never_in_url_or_output(self):
         secret = "gta_" + "supersecrettoken1234567890"
         with mock.patch.dict(os.environ, {"GITEA_TOKEN": secret}):
@@ -258,6 +359,29 @@ class GiteaAdapterTests(unittest.TestCase):
                 {"url": failing_http.requests[0].full_url if failing_http.requests else "", "headers": {}}
             )
             self.assertNotIn(secret, built_request_text)
+
+
+class GiteaStateTableTests(unittest.TestCase):
+    """Table-driven coverage, expected states hardcoded (see GithubStateTableTests)."""
+
+    EXPECTED = {
+        "success": "green",
+        "warning": "pending",
+        "pending": "pending",
+        "failure": "red",
+        "error": "red",
+    }
+
+    def test_every_state_maps_to_expected_state(self):
+        from adapters.gitea import _STATE_TO_STATE
+
+        self.assertEqual(set(_STATE_TO_STATE), set(self.EXPECTED))
+        rec = make_record("gitea", "gitea", repo_url="https://git.example.com/acme/widgets.git")
+        for state, expected in self.EXPECTED.items():
+            with self.subTest(state=state):
+                body = json.dumps({"state": state, "statuses": [{"status": state}]}).encode()
+                http = FakeHttp(body=body)
+                self.assertEqual(GiteaAdapter(rec, http=http).ci_status("abc123"), expected)
 
 
 class JenkinsAdapterTests(unittest.TestCase):
@@ -325,6 +449,54 @@ class JenkinsAdapterTests(unittest.TestCase):
         with self.assertRaises(NotSupported) as ctx:
             adapter.pr_open("branch", "title", "body")
         self.assertEqual(str(ctx.exception), "forge: unsupported")
+
+
+class JenkinsStateTableTests(unittest.TestCase):
+    """Table-driven coverage, expected states hardcoded (see GithubStateTableTests)."""
+
+    EXPECTED = {
+        "SUCCESS": "green",
+        "FAILURE": "red",
+        "UNSTABLE": "red",
+        "ABORTED": "red",
+        "NOT_BUILT": "red",
+    }
+
+    def _adapter(self, http):
+        rec = make_record(
+            "github", "jenkins", ci_hint={"base_url": "https://ci.example.com", "job": "widgets"}
+        )
+        return JenkinsAdapter(rec, http=http)
+
+    def test_every_result_maps_to_expected_state(self):
+        from adapters.jenkins import _RESULT_TO_STATE
+
+        self.assertEqual(set(_RESULT_TO_STATE), set(self.EXPECTED))
+        for result, expected in self.EXPECTED.items():
+            with self.subTest(result=result):
+                body = json.dumps(
+                    {
+                        "builds": [
+                            {
+                                "number": 1,
+                                "result": result,
+                                "building": False,
+                                "actions": [{"lastBuiltRevision": {"SHA1": "abc123"}}],
+                            }
+                        ]
+                    }
+                ).encode()
+                http = FakeHttp(body=body)
+                self.assertEqual(self._adapter(http).ci_status("abc123"), expected)
+
+    def test_sha_filter_picks_the_matching_build_not_the_newest(self):
+        # Fixture has a newer build (number 7) for a different sha that is
+        # SUCCESS, and an older build (number 6) for the target sha that is
+        # FAILURE. If the SHA filter were ever removed (e.g. `if True`
+        # instead of `if self._matches_sha(...)`), the first/newest build
+        # would win and this would wrongly read "green".
+        http = FakeHttp(body=load_fixture("jenkins_sha_filter_red").encode())
+        self.assertEqual(self._adapter(http).ci_status("abc123"), "red")
 
 
 if __name__ == "__main__":

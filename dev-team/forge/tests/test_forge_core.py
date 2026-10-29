@@ -184,7 +184,15 @@ class DetectFailClosedTests(unittest.TestCase):
             out = io.StringIO()
             try:
                 code = main(
-                    ["detect", "--repo-dir", str(repo_dir)],
+                    [
+                        "detect",
+                        "--repo-dir",
+                        str(repo_dir),
+                        "--pr-adapter",
+                        "fake",
+                        "--ci-adapter",
+                        "fake",
+                    ],
                     home=home,
                     adapters={},
                     out=out,
@@ -220,6 +228,70 @@ class DetectFailClosedTests(unittest.TestCase):
             self.assertEqual(code, EXIT_UNVERIFIABLE)
             parsed = json.loads(output)
             self.assertIn("error", parsed)
+
+
+class DetectAmbiguousTests(unittest.TestCase):
+    """forge_core._cmd_detect must never silently write a "none" record."""
+
+    def test_detect_with_nothing_auto_detected_and_no_flag_is_ambiguous(self):
+        with TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            home = Path(tmp) / "home"
+            out = io.StringIO()
+            code = main(
+                ["detect", "--repo-dir", str(repo_dir)],
+                home=home,
+                adapters={},  # nothing can ever match -> no auto-detection
+                out=out,
+            )
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            self.assertEqual(json.loads(out.getvalue()), {"error": "ambiguous: pass --pr-adapter"})
+            # And no project record was written for an ambiguous result.
+            self.assertFalse(record_path(repo_dir.name, home).exists())
+
+    def test_detect_with_explicit_pr_adapter_flag_skips_ambiguity(self):
+        with TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            home = Path(tmp) / "home"
+            out = io.StringIO()
+            code = main(
+                [
+                    "detect",
+                    "--repo-dir",
+                    str(repo_dir),
+                    "--pr-adapter",
+                    "gitea",
+                    "--ci-adapter",
+                    "gitea",
+                ],
+                home=home,
+                adapters={},  # still nothing auto-detects; flags must win
+                out=out,
+            )
+            self.assertEqual(code, EXIT_OK)
+            parsed = json.loads(out.getvalue())
+            self.assertEqual(parsed["pr_adapter"], "gitea")
+            self.assertEqual(parsed["ci_adapter"], "gitea")
+
+    def test_detect_auto_detection_still_wins_when_no_flag_given(self):
+        with TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            home = Path(tmp) / "home"
+            out = io.StringIO()
+            adapters = {"fake": lambda rec: FakeAdapter(rec)}
+            code = main(
+                ["detect", "--repo-dir", str(repo_dir)],
+                home=home,
+                adapters=adapters,
+                out=out,
+            )
+            self.assertEqual(code, EXIT_OK)
+            parsed = json.loads(out.getvalue())
+            self.assertEqual(parsed["pr_adapter"], "fake")
+            self.assertEqual(parsed["ci_adapter"], "fake")
 
 
 if __name__ == "__main__":

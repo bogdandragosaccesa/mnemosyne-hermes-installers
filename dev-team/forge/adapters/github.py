@@ -65,6 +65,10 @@ class GithubAdapter:
         return result.stdout
 
     def pr_open(self, branch: str, title: str, body: str) -> dict:
+        # `gh pr create` has no --json flag (unlike `gh pr view`/`gh api`); it
+        # prints the new PR's URL on stdout as the last non-empty line, with
+        # some human-readable progress text ahead of it. The PR number is the
+        # URL's final path segment.
         stdout = self._gh(
             [
                 "gh",
@@ -76,12 +80,12 @@ class GithubAdapter:
                 title,
                 "--body",
                 body,
-                "--json",
-                "number,url",
             ]
         )
-        data = json.loads(stdout)
-        return {"pr": str(data["number"]), "pr_url": data["url"]}
+        lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+        url = lines[-1] if lines else ""
+        pr_id = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+        return {"pr": pr_id, "pr_url": url}
 
     def pr_status(self, pr: str) -> dict:
         stdout = self._gh(["gh", "pr", "view", str(pr), "--json", "state,url"])

@@ -127,25 +127,37 @@ def _cmd_detect(args, home: Path, adapters, out) -> int:
         repo_dir = Path(args.repo_dir)
         slug = args.slug or repo_dir.name
 
-        pr_adapter = "none"
-        ci_adapter = "none"
-        for name, factory in adapters.items():
-            probe = ProjectRecord(
-                slug=slug,
-                repo_url="",
-                pr_adapter=name,
-                ci_adapter=name,
-                default_branch="main",
-                ci_hint={},
-            )
-            try:
-                candidate = factory(probe)
-                if candidate.detect(repo_dir):
-                    pr_adapter = name
-                    ci_adapter = name
-                    break
-            except Exception:
-                continue
+        pr_adapter = getattr(args, "pr_adapter", None)
+        ci_adapter = getattr(args, "ci_adapter", None)
+
+        if not pr_adapter or not ci_adapter:
+            detected = None
+            for name, factory in adapters.items():
+                probe = ProjectRecord(
+                    slug=slug,
+                    repo_url="",
+                    pr_adapter=name,
+                    ci_adapter=name,
+                    default_branch="main",
+                    ci_hint={},
+                )
+                try:
+                    candidate = factory(probe)
+                    if candidate.detect(repo_dir):
+                        detected = name
+                        break
+                except Exception:
+                    continue
+            pr_adapter = pr_adapter or detected
+            ci_adapter = ci_adapter or detected
+
+        if not pr_adapter or not ci_adapter:
+            # Ambiguous: nothing was auto-detected and the caller didn't
+            # pass an explicit adapter. Never silently write a "none"
+            # record -- devops must decide and pass --pr-adapter (and/or
+            # --ci-adapter) at onboarding.
+            _emit(out, {"error": "ambiguous: pass --pr-adapter"})
+            return EXIT_UNVERIFIABLE
 
         rec = ProjectRecord(
             slug=slug,
@@ -224,6 +236,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_detect = sub.add_parser("detect")
     p_detect.add_argument("--repo-dir", required=True)
     p_detect.add_argument("--slug")
+    p_detect.add_argument("--pr-adapter")
+    p_detect.add_argument("--ci-adapter")
 
     p_pr_open = sub.add_parser("pr-open")
     p_pr_open.add_argument("--slug", required=True)

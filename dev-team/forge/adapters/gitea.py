@@ -16,6 +16,21 @@ from typing import Optional, Tuple
 
 from . import parse_owner_repo
 
+# Gitea's EditPullRequestOption has no "draft" field: draft/WIP status is
+# driven only by one of these (case-insensitive) title prefixes. mark_ready
+# strips whichever prefix is present; Gitea silently ignores unknown PATCH
+# fields, so sending "draft" there is a no-op, not a real state change.
+_WIP_PREFIXES = ("WIP:", "[WIP]")
+
+
+def _strip_wip_prefix(title: str) -> str:
+    stripped = title.lstrip()
+    for prefix in _WIP_PREFIXES:
+        if stripped[: len(prefix)].upper() == prefix.upper():
+            return stripped[len(prefix) :].lstrip()
+    return title
+
+
 # Explicit vendor-state table: Gitea combined-status "state" -> forge
 # state. Any state not listed here is unmapped and ci_status() raises
 # ValueError, which forge_core turns into exit 2.
@@ -82,11 +97,10 @@ class GiteaAdapter:
 
     def mark_ready(self, pr: str) -> dict:
         base, owner, repo = self._target()
-        self._request(
-            f"{base}/api/v1/repos/{owner}/{repo}/pulls/{pr}",
-            method="PATCH",
-            payload={"draft": False},
-        )
+        url = f"{base}/api/v1/repos/{owner}/{repo}/pulls/{pr}"
+        current = self._request(url)
+        title = _strip_wip_prefix(str(current.get("title", "")))
+        self._request(url, method="PATCH", payload={"title": title})
         return {"pr": str(pr), "ready": True}
 
     def ci_status(self, sha: str) -> str:
