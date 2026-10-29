@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 
+import adapters  # noqa: F401 -- side effect: registers github/gitlab/gitea/jenkins into ADAPTERS
 from forge_core import ADAPTERS, main
 
 

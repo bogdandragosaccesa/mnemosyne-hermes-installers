@@ -1,0 +1,12 @@
+{
+  "builds": [
+    {
+      "number": 7,
+      "result": null,
+      "building": true,
+      "actions": [
+        {"parameters": [{"name": "GIT_COMMIT", "value": "abc123"}]}
+      ]
+    }
+  ]
+}

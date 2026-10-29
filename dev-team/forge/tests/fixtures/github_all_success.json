@@ -1,0 +1,7 @@
+{
+  "check_runs": [
+    {"status": "completed", "conclusion": "success"},
+    {"status": "completed", "conclusion": "neutral"},
+    {"status": "completed", "conclusion": "skipped"}
+  ]
+}
