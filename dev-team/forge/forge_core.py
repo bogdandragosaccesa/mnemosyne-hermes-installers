@@ -92,7 +92,7 @@ ADAPTERS: Dict[str, Callable[[ProjectRecord], Adapter]] = {}
 _SECRET_SUBSTITUTIONS = (
     (re.compile(r"token=\S+", re.IGNORECASE), "token=***"),
     (re.compile(r"Bearer\s+\S+", re.IGNORECASE), "Bearer ***"),
-    (re.compile(r"Authorization:\s*\S+", re.IGNORECASE), "Authorization: ***"),
+    (re.compile(r"Authorization:\s*[^\r\n\"']*", re.IGNORECASE), "Authorization: ***"),
 )
 
 
@@ -123,38 +123,42 @@ def _build_adapter(
 
 
 def _cmd_detect(args, home: Path, adapters, out) -> int:
-    repo_dir = Path(args.repo_dir)
-    slug = args.slug or repo_dir.name
+    try:
+        repo_dir = Path(args.repo_dir)
+        slug = args.slug or repo_dir.name
 
-    pr_adapter = "none"
-    ci_adapter = "none"
-    for name, factory in adapters.items():
-        probe = ProjectRecord(
+        pr_adapter = "none"
+        ci_adapter = "none"
+        for name, factory in adapters.items():
+            probe = ProjectRecord(
+                slug=slug,
+                repo_url="",
+                pr_adapter=name,
+                ci_adapter=name,
+                default_branch="main",
+                ci_hint={},
+            )
+            try:
+                candidate = factory(probe)
+                if candidate.detect(repo_dir):
+                    pr_adapter = name
+                    ci_adapter = name
+                    break
+            except Exception:
+                continue
+
+        rec = ProjectRecord(
             slug=slug,
             repo_url="",
-            pr_adapter=name,
-            ci_adapter=name,
+            pr_adapter=pr_adapter,
+            ci_adapter=ci_adapter,
             default_branch="main",
             ci_hint={},
         )
-        try:
-            candidate = factory(probe)
-            if candidate.detect(repo_dir):
-                pr_adapter = name
-                ci_adapter = name
-                break
-        except Exception:
-            continue
-
-    rec = ProjectRecord(
-        slug=slug,
-        repo_url="",
-        pr_adapter=pr_adapter,
-        ci_adapter=ci_adapter,
-        default_branch="main",
-        ci_hint={},
-    )
-    save_record(rec, home)
+        save_record(rec, home)
+    except Exception as exc:  # fail closed: cannot verify
+        _emit_error(out, exc)
+        return EXIT_UNVERIFIABLE
     _emit(out, dataclasses.asdict(rec))
     return EXIT_OK
 
@@ -261,4 +265,8 @@ def main(
     parser = _build_parser()
     args = parser.parse_args(argv)
     handler = _DISPATCH[args.command]
-    return handler(args, home, adapters, out)
+    try:
+        return handler(args, home, adapters, out)
+    except Exception as exc:  # catch-all: never let an exception escape unredacted
+        _emit_error(out, exc)
+        return EXIT_UNVERIFIABLE

@@ -18,6 +18,7 @@ from forge_core import (  # noqa: E402
     load_record,
     main,
     record_path,
+    redact,
     save_record,
 )
 
@@ -138,6 +139,87 @@ class CiStatusTests(unittest.TestCase):
             code, output = self._run_ci_status(home, adapters)
             self.assertEqual(code, EXIT_UNVERIFIABLE)
             self.assertIn("error", output)
+
+    def test_adapter_exception_with_authorization_token_header_exits_2_without_secret(self):
+        secret = "tok" + "EN1234567890abcdef"
+        with TemporaryDirectory() as tmp:
+            home, adapters = self._setup(
+                tmp, raise_message="Authorization: token " + secret
+            )
+            code, output = self._run_ci_status(home, adapters)
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            self.assertNotIn(secret, output)
+
+    def test_adapter_exception_with_authorization_basic_header_exits_2_without_secret(self):
+        secret = "dXNl" + "cjpzZWNyZXRwYXNz"
+        with TemporaryDirectory() as tmp:
+            home, adapters = self._setup(
+                tmp, raise_message="Authorization: Basic " + secret
+            )
+            code, output = self._run_ci_status(home, adapters)
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            self.assertNotIn(secret, output)
+
+
+class RedactTests(unittest.TestCase):
+    def test_redact_strips_full_authorization_token_header(self):
+        secret = "tok" + "EN1234567890abcdef"
+        redacted = redact("Authorization: token " + secret)
+        self.assertNotIn(secret, redacted)
+
+    def test_redact_strips_full_authorization_basic_header(self):
+        secret = "dXNl" + "cjpzZWNyZXRwYXNz"
+        redacted = redact("Authorization: Basic " + secret)
+        self.assertNotIn(secret, redacted)
+
+
+class DetectFailClosedTests(unittest.TestCase):
+    def test_detect_fails_closed_when_record_cannot_be_saved(self):
+        with TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo"
+            repo_dir.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            home.chmod(0o500)  # read+execute only: writes under it must fail
+            out = io.StringIO()
+            try:
+                code = main(
+                    ["detect", "--repo-dir", str(repo_dir)],
+                    home=home,
+                    adapters={},
+                    out=out,
+                )
+            finally:
+                home.chmod(0o700)
+            output = out.getvalue()
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            parsed = json.loads(output)
+            self.assertIn("error", parsed)
+
+    def test_main_catches_adapter_exceptions_that_escape_the_handler(self):
+        # A dict an adapter returns that json.dumps cannot serialize must not
+        # escape main() as an unhandled exception; it must fail closed.
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_record(SAMPLE, home)
+            adapters = {"fake": lambda rec: FakeAdapter(rec, ci_state="green")}
+
+            class UnserializableAdapter(FakeAdapter):
+                def pr_status(self, pr):
+                    return {"value": object()}  # type: ignore[return-value]
+
+            adapters = {"fake": lambda rec: UnserializableAdapter(rec)}
+            out = io.StringIO()
+            code = main(
+                ["pr-status", "--slug", "demo", "--pr", "1"],
+                home=home,
+                adapters=adapters,
+                out=out,
+            )
+            output = out.getvalue()
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            parsed = json.loads(output)
+            self.assertIn("error", parsed)
 
 
 if __name__ == "__main__":
