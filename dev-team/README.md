@@ -49,7 +49,8 @@ flowchart TB
 ```
 
 Rework loops back to a new `implement` card, not a fresh branch, up to a round limit of 3
-(counted by the guard across the card's ancestry). A fourth round is refused; the worker must
+(counted by the guard as 1 plus the rework cards in the ancestry, so a unit split into backend
+and frontend implement cards still starts at round 1). A fourth round is refused; the worker must
 block with `review: rounds-exhausted` instead.
 
 ## Profiles
@@ -106,7 +107,8 @@ the `findings`, which counts as a rework round.
 Besides `pr-ci`'s CI re-read, the guard checks on every `kanban_complete` of a guarded card:
 the stage's required fields are present and well-typed; `head_sha` matches the parent stage
 card's last completed run; exactly one child of the expected next stage exists in
-`created_cards`, parented on this card; and the round limit (3 `implement` cards in the card's
+`created_cards`, parented on this card; and the round limit (round 3: the first implement work
+plus two rework cards in the card's
 ancestry) isn't exceeded. Any exception, missing card, or unverifiable state is a refusal
 naming what couldn't be checked — the guard fails closed, never open.
 

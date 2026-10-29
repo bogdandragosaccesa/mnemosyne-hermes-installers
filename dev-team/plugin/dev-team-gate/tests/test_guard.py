@@ -280,8 +280,73 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(check_complete(
             b, "t_plan", complete_args({"cards": ["t_impl"]}, ["t_impl"]), no_forge))
 
+    def test_plan_cards_must_be_implement_children_of_the_plan(self):
+        # review Minor (guard.py:115-118): any stage skill was accepted
+        b = FakeBoard()
+        b.add("t_intake", "intake")
+        b.add("t_plan", "plan", ["t_intake"])
+        b.add("t_impl", "implement", ["t_plan"])
+        b.add("t_val", "validate", ["t_plan"])          # wrong stage
+        b.add("t_stray", "implement", ["t_intake"])     # not the plan's child
+        for bad in ("t_val", "t_stray"):
+            with self.subTest(bad=bad):
+                cards = ["t_impl", bad]
+                msg = check_complete(b, "t_plan", complete_args({"cards": cards}, ["t_impl"]),
+                                     no_forge)
+                self.assertIsInstance(msg, str)
+                self.assertTrue(msg.startswith("plan:"), msg)
+                self.assertIn(bad, msg)
+
+    def test_plan_may_name_a_split_unit(self):
+        b = FakeBoard()
+        b.add("t_intake", "intake")
+        b.add("t_plan", "plan", ["t_intake"])
+        b.add("t_be", "implement", ["t_plan"])
+        b.add("t_fe", "implement", ["t_plan", "t_be"])
+        self.assertIsNone(check_complete(
+            b, "t_plan", complete_args({"cards": ["t_be", "t_fe"]}, ["t_be"]), no_forge))
+
 
 class RoundTests(unittest.TestCase):
+    def test_split_unit_starts_at_round_one(self):
+        # review Minor (board.py:118-122): a unit split into backend and
+        # frontend implement cards started at round 2 and lost a rework round.
+        b = FakeBoard()
+        b.add("t_plan", "plan")
+        b.add("t_be", "implement", ["t_plan"])
+        b.add("t_fe", "implement", ["t_plan", "t_be"])
+        b.add("t_val", "validate", ["t_be", "t_fe"])
+        self.assertEqual(implement_rounds(b, "t_fe"), 1)
+        b.add("t_r2", "implement", ["t_val"])
+        self.assertEqual(implement_rounds(b, "t_r2"), 2)
+        b.add("t_val2", "validate", ["t_r2"])
+        b.add("t_r3", "implement", ["t_val2"])
+        self.assertEqual(implement_rounds(b, "t_r3"), 3)
+
+    def test_split_unit_still_gets_two_rework_rounds_from_the_guard(self):
+        b = FakeBoard()
+        b.add("t_intake", "intake", md={"repo": "widgets"})
+        b.add("t_plan", "plan", ["t_intake"])
+        b.add("t_be", "implement", ["t_plan"])
+        b.add("t_fe", "implement", ["t_plan", "t_be"])
+        b.add("t_val", "validate", ["t_be", "t_fe"])
+        b.add("t_r2", "implement", ["t_val"])
+        b.add("t_val2", "validate", ["t_r2"], md={})
+        b.add("t_r3", "implement", ["t_val2"])
+        b.metadata["t_r2"] = impl_md()
+        args = complete_args({"verdict": "fail", "head_sha": SHA, "evidence": [],
+                              "findings": ["x"]}, ["t_r3"])
+        self.assertIsNone(check_complete(b, "t_val2", args, no_forge))
+        # ...and a fourth round is still refused
+        b.add("t_val3", "validate", ["t_r3"])
+        b.add("t_r4", "implement", ["t_val3"])
+        b.metadata["t_r3"] = impl_md()
+        args = complete_args({"verdict": "fail", "head_sha": SHA, "evidence": [],
+                              "findings": ["x"]}, ["t_r4"])
+        msg = check_complete(b, "t_val3", args, no_forge)
+        self.assertIsInstance(msg, str)
+        self.assertTrue(msg.startswith("review: rounds-exhausted"), msg)
+
     def test_implement_rounds_counts_ancestry_including_self(self):
         b = FakeBoard()
         last = chain(b, rounds=3)

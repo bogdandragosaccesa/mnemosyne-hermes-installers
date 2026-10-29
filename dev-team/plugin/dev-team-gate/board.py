@@ -120,11 +120,28 @@ def ancestors(board: Board, task_id: str, include_self: bool = True) -> list[Tas
     return out
 
 
+_REWORK_FROM = frozenset({"validate", "review", "pr-ci"})
+
+
 def implement_rounds(board: Board, task_id: str) -> int:
-    """Count `implement` cards in the card's ancestry, the card itself included."""
-    return sum(
-        1 for v in ancestors(board, task_id) if stage_from_skills(v.skills) == "implement"
+    """The implement round the card is in: 1 for the unit's first implement
+    work, plus one per rework card in the card's ancestry (the card itself
+    included). A rework card is an `implement` card with a validate, review
+    or pr-ci parent.
+
+    Counting rework links rather than every implement card keeps a unit the
+    plan split into backend and frontend implement cards at round 1, not 2.
+    Returns 0 when there is no implement card in the ancestry at all.
+    """
+    views = ancestors(board, task_id)
+    stage_of = {v.id: stage_from_skills(v.skills) for v in views}
+    implements = [v for v in views if stage_of[v.id] == "implement"]
+    if not implements:
+        return 0
+    reworks = sum(
+        1 for v in implements if any(stage_of.get(p) in _REWORK_FROM for p in v.parents)
     )
+    return 1 + reworks
 
 
 def project_slug(board: Board, task_id: str) -> str:

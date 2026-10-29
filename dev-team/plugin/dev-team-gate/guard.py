@@ -119,11 +119,17 @@ def _check(board, task_id, args, ci_status, pr_status=None):
                 f"card {parents[0]}'s last completed run"
             )
 
-    # Plan: every card it names exists and carries a stage skill.
+    # Plan: every card it names exists, is an implement card, and is a direct
+    # child of this plan card.
     if stage == "plan":
         for cid in md["cards"]:
-            if _stage_of(board, cid, "plan") is None:
-                raise _Refuse(f"plan: card {cid} carries no dev-team-stage-* skill")
+            cview, cstage = _view_and_stage(board, cid, "plan")
+            if cstage != "implement":
+                raise _Refuse(
+                    f"plan: card {cid} carries {f'dev-team-stage-{cstage}' if cstage else 'no dev-team-stage-* skill'}"
+                    f", not dev-team-stage-implement")
+            if task_id not in cview.parents:
+                raise _Refuse(f"plan: card {cid} is not a child of plan card {task_id}")
 
     # 4. Exactly one child of the expected stage, parented on this card.
     child = expected_child(stage, md)

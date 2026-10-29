@@ -20,7 +20,7 @@ Those are ordinary child cards for your own judgment calls — they do not thems
 
 | Field | Type | Check |
 | --- | --- | --- |
-| `cards` | list of strings | non-empty; **the guard additionally verifies each id**: every card named must exist on the board and must carry a `dev-team-stage-*` skill, or completion is refused with `plan: card <id> carries no dev-team-stage-* skill` |
+| `cards` | list of strings | non-empty; **the guard additionally verifies each id**: every card named must exist on the board, carry `dev-team-stage-implement`, and have this plan card as a parent, or completion is refused with a `plan: card <id> …` message |
 
 `cards` lists the `implement` card(s) you create as this plan card's direct child(ren). List
 each one so the check above can verify them.
