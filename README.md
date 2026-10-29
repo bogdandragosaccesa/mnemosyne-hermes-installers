@@ -29,9 +29,9 @@ different commits. See [Installation](docs/installation.md#where-mnemosyne-comes
   the gateway, uninstall ordering
 - [Troubleshooting](docs/troubleshooting.md) — silent embedding failures, DLL errors,
   leftovers
-- [SDLC team profiles](sdlc-team/README.md) — optional: nine role profiles, each with its
+- [SDLC team profiles](old/sdlc-team/README.md) — optional: nine role profiles, each with its
   own SOUL, all wired to Mnemosyne
-- [Outsourcing team profiles](outsourcing-team/README.md) — optional: eleven role profiles
+- [Outsourcing team profiles](old/outsourcing-team/README.md) — optional: eleven role profiles
   for delivering into a client's estate under contract, each with its own SOUL, driven from
   the kanban board through one entry-point profile
 - [Changelog](CHANGELOG.md)

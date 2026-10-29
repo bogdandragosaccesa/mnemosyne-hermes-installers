@@ -7,6 +7,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Moved `sdlc-team/` and `outsourcing-team/` to `old/sdlc-team/` and `old/outsourcing-team/`
+  (`git mv`). Both are superseded by the forthcoming `dev-team/` and are kept frozen, not
+  maintained. Internal relative paths (`../install-...`, `../uninstall-...`, `../docs/...`)
+  were updated to `../../...` to account for the extra directory level.
+
 ### Added
 
 - `--recommended-config` / `-RecommendedConfig`: opt-in settings for cross-session recall
@@ -18,7 +25,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory text to Hermes' model provider, which costs tokens. The uninstallers remove the two
   `.env` lines while they still read `true`. See
   [Configuration](docs/configuration.md#recommended-configuration).
-- [`outsourcing-team/`](outsourcing-team/README.md) — a second optional profile set, for the
+- [`outsourcing-team/`](old/outsourcing-team/README.md) — a second optional profile set, for the
   vendor side of a contract rather than a product team: eleven role profiles
   (engagement-lead, delivery-manager, business-analyst, domain-consultant,
   solution-architect, app-engineer, integration-engineer, qa-lead, platform-sre,
@@ -46,7 +53,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name so two engagements of the same team can run side by side. `--only`/`-Only` still takes
   bare role names, unaffected by the prefix, and now fails fast on an unrecognised name
   instead of completing successfully having created nothing.
-- [`sdlc-team/`](sdlc-team/README.md) — an optional companion to the memory installers:
+- [`sdlc-team/`](old/sdlc-team/README.md) — an optional companion to the memory installers:
   nine role profiles (architect, backend-db, devops, frontend, pm, qa, researcher, uiux,
   writer), each with its own SOUL, each pointed at Mnemosyne, with
   `install-sdlc-team-unix.sh` and `install-sdlc-team-windows.ps1`. Flags:

@@ -1,3 +1,5 @@
+> Superseded by [dev-team](../../dev-team/README.md). Kept frozen; not maintained.
+
 # SDLC team profiles
 
 Nine Hermes profiles covering a software delivery lifecycle, each with its own SOUL and
@@ -33,7 +35,7 @@ are matched by role rather than by profile name alone.
 Hermes must already be installed with Mnemosyne as the active memory provider:
 
 ```bash
-../install-mnemosyne-hermes-unix.sh --disable-builtin-memory
+../../install-mnemosyne-hermes-unix.sh --disable-builtin-memory
 ```
 
 `--disable-builtin-memory` matters here beyond the usual context argument. `hermes profile
@@ -108,7 +110,7 @@ after upgrading Mnemosyne.
 Because all nine link to one install, they share **one** Mnemosyne database. That is the
 intended arrangement for a team that hands work between roles. To isolate them instead, set
 `memory.mnemosyne.profile_isolation: true`, which gives each profile its own Mnemosyne bank
-— see [Configuration](../docs/configuration.md#hermes-provider-keys).
+— see [Configuration](../../docs/configuration.md#hermes-provider-keys).
 
 ## Uninstall
 
