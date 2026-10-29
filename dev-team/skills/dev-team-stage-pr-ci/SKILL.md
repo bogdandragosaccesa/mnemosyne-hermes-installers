@@ -30,11 +30,15 @@ intake card recorded — see `dev-team-stage-intake`). If it does not:
    without it, `forge detect` defaults the slug to the clone directory's name, not intake's
    `repo`). If it exits `2` with `"ambiguous: pass --pr-adapter"`, decide the PR and CI
    adapters yourself and re-run with `--pr-adapter <name>` and/or `--ci-adapter <name>`.
-4. `forge detect` already writes the project record for you (via `save_record`) — do not
-   hand-write one; a hand-written record risks a schema the guard/forge can't read. It always
-   writes `default_branch: "main"` regardless of this repository's actual default branch, so if
-   that differs, amend only that one field afterward — never rewrite the whole record, and
-   credentials never go in it.
+4. `forge detect` writes the whole project record for you — do not hand-write or edit one. It
+   reads `repo_url` from the clone's `git remote get-url origin` (with any credentials in the
+   URL stripped) and `default_branch` from `git symbolic-ref refs/remotes/origin/HEAD`. If it
+   exits `2` saying it cannot read the default branch, run
+   `git -C $HERMES_HOME/dev-team/repos/<repo-slug>/ remote set-head origin --auto` and re-run
+   it. It refuses to overwrite an existing record; if the record is genuinely wrong (the
+   repository moved, or its default branch changed), block with `forge: record-stale` and let
+   the operator decide whether to re-run with `--force`. A slug containing `/`, `\`, or equal
+   to `.` or `..` is refused. Credentials never go in the record.
 5. Set the board's `default_workdir` to that team-owned clone
    (`hermes kanban boards set-default-workdir`), so every later card on this board works there
    instead of in the operator's checkout.

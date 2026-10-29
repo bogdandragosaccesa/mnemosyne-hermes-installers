@@ -155,12 +155,14 @@ forge detect --repo-dir ~/.hermes/dev-team/repos/<repo-slug>/ --slug <repo-slug>
 ```
 
 `--slug` must be passed explicitly with intake's `repo` string; without it, `detect` falls back
-to the clone directory's name. `detect` writes the project record itself
-(`~/.hermes/dev-team/projects/<repo-slug>.json`) with the PR adapter, the CI adapter and the
-default branch; it always records `default_branch: "main"` regardless of the repository's real
-default, so amend only that one field afterward if it differs — never hand-write the whole
-record. Exit 2 with `"ambiguous: pass --pr-adapter"` means devops decides and re-runs with
-`--pr-adapter`/`--ci-adapter` explicitly.
+to the clone directory's name. A slug containing `/` or `\`, or equal to `.` or `..`, is
+refused. `detect` writes the whole project record itself
+(`~/.hermes/dev-team/projects/<repo-slug>.json`): the PR and CI adapters, `repo_url` from the
+clone's `git remote get-url origin` (credentials in the URL stripped), and `default_branch`
+from `git symbolic-ref refs/remotes/origin/HEAD` (run `git remote set-head origin --auto` first
+if that ref is missing). Never hand-edit the record. `detect` refuses to overwrite an existing
+record unless the operator passes `--force`. Exit 2 with `"ambiguous: pass --pr-adapter"`
+means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly.
 
 **Branch protection on the default branch is REQUIRED.** Without it, the team's token needs
 write access to push feature branches, and that same access can update the default branch.

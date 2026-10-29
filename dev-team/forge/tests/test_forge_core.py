@@ -2,6 +2,7 @@
 import io
 import json
 import stat
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -31,6 +32,29 @@ SAMPLE = ProjectRecord(
     default_branch="main",
     ci_hint={"workflow": "ci.yml"},
 )
+
+
+def make_repo(parent, url="https://github.com/acme/demo.git", head="main", name="repo"):
+    """A real git repo with an `origin` remote and, unless head is None, an
+    `origin/HEAD` symbolic ref pointing at `head`."""
+    repo = Path(parent) / name
+    repo.mkdir(parents=True)
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    if url is not None:
+        git("remote", "add", "origin", url)
+    if head is not None:
+        git("symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{head}")
+    return repo
+
+
+def run_main(argv, home, adapters=None):
+    out = io.StringIO()
+    code = main(argv, home=home, adapters={} if adapters is None else adapters, out=out)
+    return code, out.getvalue()
 
 
 class FakeAdapter:
@@ -72,7 +96,7 @@ class RecordRoundtripTests(unittest.TestCase):
             self.assertEqual(loaded, SAMPLE)
 
             mode = stat.S_IMODE(path.stat().st_mode)
-            self.assertEqual(mode & 0o022, 0, "group/other write bits must be unset")
+            self.assertEqual(mode, 0o600, "the record must be owner read/write only")
 
 
 class CiStatusTests(unittest.TestCase):
@@ -176,8 +200,7 @@ class RedactTests(unittest.TestCase):
 class DetectFailClosedTests(unittest.TestCase):
     def test_detect_fails_closed_when_record_cannot_be_saved(self):
         with TemporaryDirectory() as tmp:
-            repo_dir = Path(tmp) / "repo"
-            repo_dir.mkdir()
+            repo_dir = make_repo(tmp)
             home = Path(tmp) / "home"
             home.mkdir()
             home.chmod(0o500)  # read+execute only: writes under it must fail
@@ -235,8 +258,7 @@ class DetectAmbiguousTests(unittest.TestCase):
 
     def test_detect_with_nothing_auto_detected_and_no_flag_is_ambiguous(self):
         with TemporaryDirectory() as tmp:
-            repo_dir = Path(tmp) / "repo"
-            repo_dir.mkdir()
+            repo_dir = make_repo(tmp, url="https://git.example.org/acme/demo.git")
             home = Path(tmp) / "home"
             out = io.StringIO()
             code = main(
@@ -252,8 +274,7 @@ class DetectAmbiguousTests(unittest.TestCase):
 
     def test_detect_with_explicit_pr_adapter_flag_skips_ambiguity(self):
         with TemporaryDirectory() as tmp:
-            repo_dir = Path(tmp) / "repo"
-            repo_dir.mkdir()
+            repo_dir = make_repo(tmp, url="https://git.example.org/acme/demo.git")
             home = Path(tmp) / "home"
             out = io.StringIO()
             code = main(
@@ -277,8 +298,7 @@ class DetectAmbiguousTests(unittest.TestCase):
 
     def test_detect_auto_detection_still_wins_when_no_flag_given(self):
         with TemporaryDirectory() as tmp:
-            repo_dir = Path(tmp) / "repo"
-            repo_dir.mkdir()
+            repo_dir = make_repo(tmp)
             home = Path(tmp) / "home"
             out = io.StringIO()
             adapters = {"fake": lambda rec: FakeAdapter(rec)}
@@ -292,6 +312,126 @@ class DetectAmbiguousTests(unittest.TestCase):
             parsed = json.loads(out.getvalue())
             self.assertEqual(parsed["pr_adapter"], "fake")
             self.assertEqual(parsed["ci_adapter"], "fake")
+
+
+class DetectOnboardingTests(unittest.TestCase):
+    """#6: the record `detect` writes must be usable by ci-status as written."""
+
+    def detect(self, home, repo_dir, *extra):
+        return run_main(["detect", "--repo-dir", str(repo_dir), "--slug", "demo",
+                         "--pr-adapter", "github", "--ci-adapter", "github", *extra], home)
+
+    def test_detect_fills_repo_url_from_origin(self):
+        with TemporaryDirectory() as tmp:
+            repo = make_repo(tmp, url="git@github.com:acme/demo.git")
+            code, out = self.detect(Path(tmp) / "home", repo)
+            self.assertEqual(code, EXIT_OK, out)
+            self.assertEqual(json.loads(out)["repo_url"], "git@github.com:acme/demo.git")
+            self.assertEqual(load_record("demo", Path(tmp) / "home").repo_url,
+                             "git@github.com:acme/demo.git")
+
+    def test_detect_strips_credentials_from_origin_url(self):
+        with TemporaryDirectory() as tmp:
+            secret = "ghp_" + "S3cr3tT0k3n"
+            repo = make_repo(tmp, url=f"https://bot:{secret}@github.com/acme/demo.git")
+            code, out = self.detect(Path(tmp) / "home", repo)
+            self.assertEqual(code, EXIT_OK, out)
+            self.assertNotIn(secret, out)
+            rec = load_record("demo", Path(tmp) / "home")
+            self.assertEqual(rec.repo_url, "https://github.com/acme/demo.git")
+            self.assertNotIn(secret, record_path("demo", Path(tmp) / "home").read_text())
+
+    def test_detect_fills_default_branch_from_origin_head(self):
+        with TemporaryDirectory() as tmp:
+            repo = make_repo(tmp, head="develop")
+            code, out = self.detect(Path(tmp) / "home", repo)
+            self.assertEqual(code, EXIT_OK, out)
+            self.assertEqual(json.loads(out)["default_branch"], "develop")
+            self.assertEqual(load_record("demo", Path(tmp) / "home").default_branch, "develop")
+
+    def test_detect_without_origin_fails_closed(self):
+        with TemporaryDirectory() as tmp:
+            repo = make_repo(tmp, url=None, head=None)
+            code, out = self.detect(Path(tmp) / "home", repo)
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            self.assertIn("origin", json.loads(out)["error"])
+            self.assertFalse(record_path("demo", Path(tmp) / "home").exists())
+
+    def test_detect_without_origin_head_fails_closed(self):
+        with TemporaryDirectory() as tmp:
+            repo = make_repo(tmp, head=None)
+            code, out = self.detect(Path(tmp) / "home", repo)
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            self.assertIn("set-head", json.loads(out)["error"])
+            self.assertFalse(record_path("demo", Path(tmp) / "home").exists())
+
+    def test_detect_refuses_to_overwrite_existing_record(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            repo = make_repo(tmp, head="develop")
+            self.assertEqual(self.detect(home, repo)[0], EXIT_OK)
+            before = record_path("demo", home).read_text()
+            other = make_repo(tmp, url="https://github.com/evil/other.git", name="other")
+            code, out = self.detect(home, other)
+            self.assertEqual(code, EXIT_UNVERIFIABLE)
+            self.assertIn("--force", json.loads(out)["error"])
+            self.assertEqual(record_path("demo", home).read_text(), before)
+
+    def test_detect_force_overwrites_existing_record(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self.assertEqual(self.detect(home, make_repo(tmp))[0], EXIT_OK)
+            other = make_repo(tmp, url="https://github.com/acme/moved.git", head="trunk",
+                              name="other")
+            code, out = self.detect(home, other, "--force")
+            self.assertEqual(code, EXIT_OK, out)
+            rec = load_record("demo", home)
+            self.assertEqual((rec.repo_url, rec.default_branch),
+                             ("https://github.com/acme/moved.git", "trunk"))
+
+    def test_detect_record_is_usable_by_the_github_adapter(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from adapters.github import GithubAdapter
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self.assertEqual(self.detect(home, make_repo(tmp))[0], EXIT_OK)
+            self.assertEqual(GithubAdapter(load_record("demo", home))._owner_repo(),
+                             ("acme", "demo"))
+
+
+class SlugValidationTests(unittest.TestCase):
+    """Minor: --slug is validated the way the guard validates it."""
+
+    UNSAFE = ("../../x", "a/b", "..", ".", "a\\b", "", "/abs")
+
+    def test_detect_rejects_unsafe_slug(self):
+        for slug in self.UNSAFE:
+            with self.subTest(slug=slug), TemporaryDirectory() as tmp:
+                home = Path(tmp) / "h1" / "h2" / "home"
+                code, out = run_main(["detect", "--repo-dir", str(make_repo(tmp)), "--slug", slug,
+                                      "--pr-adapter", "github", "--ci-adapter", "github"], home)
+                self.assertEqual(code, EXIT_UNVERIFIABLE)
+                self.assertIn("unsafe project slug", json.loads(out)["error"])
+                written = [p for p in Path(tmp).rglob("*.json")]
+                self.assertEqual(written, [])
+
+    def test_every_command_rejects_unsafe_slug(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            for argv in (["ci-status", "--slug", "../x", "--sha", "abc1234"],
+                         ["pr-status", "--slug", "a/b", "--pr", "1"],
+                         ["mark-ready", "--slug", "..", "--pr", "1"]):
+                with self.subTest(argv=argv):
+                    code, out = run_main(argv, home, {"fake": lambda rec: FakeAdapter(rec)})
+                    self.assertEqual(code, EXIT_UNVERIFIABLE)
+                    self.assertIn("unsafe project slug", json.loads(out)["error"])
+
+    def test_record_path_rejects_unsafe_slug(self):
+        from forge_core import RecordError
+        for slug in self.UNSAFE:
+            with self.subTest(slug=slug):
+                with self.assertRaises(RecordError):
+                    record_path(slug, Path("/tmp/h"))
 
 
 if __name__ == "__main__":

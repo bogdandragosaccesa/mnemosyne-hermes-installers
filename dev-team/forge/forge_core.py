@@ -10,7 +10,9 @@ import argparse
 import dataclasses
 import json
 import re
+import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Callable, Dict, Protocol
 
@@ -33,8 +35,18 @@ class ProjectRecord:
     ci_hint: dict
 
 
+def validate_slug(slug) -> str:
+    """The project slug names a file under ``projects/``; the guard applies the
+    same rule (``guard._record_default_branch``). Anything that could leave
+    that directory is refused."""
+    if (not isinstance(slug, str) or not slug or slug in (".", "..")
+            or "/" in slug or "\\" in slug or "\0" in slug):
+        raise RecordError(f"unsafe project slug {slug!r}")
+    return slug
+
+
 def record_path(slug: str, home: Path) -> Path:
-    return home / "dev-team" / "projects" / f"{slug}.json"
+    return home / "dev-team" / "projects" / f"{validate_slug(slug)}.json"
 
 
 def save_record(rec: ProjectRecord, home: Path) -> Path:
@@ -122,10 +134,60 @@ def _build_adapter(
     return factory(rec)
 
 
+GIT_TIMEOUT_S = 10
+
+
+def _git_output(repo_dir: Path, *args: str) -> str | None:
+    """stdout of `git -C repo_dir <args>`, stripped, or None when git fails."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), *args], capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip() or None
+
+
+def _strip_userinfo(url: str) -> str:
+    """Drop `user:token@` from an http(s)/ssh URL: credentials never go in the record."""
+    if "://" not in url:
+        return url  # scp-like `git@host:owner/repo`: the user is not a secret
+    parts = urllib.parse.urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    host = parts.netloc.rsplit("@", 1)[1]
+    return urllib.parse.urlunsplit(parts._replace(netloc=host))
+
+
+def _origin_facts(repo_dir: Path) -> tuple[str, str]:
+    """(repo_url, default_branch) from the clone's `origin`, or RecordError."""
+    url = _git_output(repo_dir, "remote", "get-url", "origin")
+    if not url:
+        raise RecordError(
+            f"cannot read `git remote get-url origin` in {repo_dir}; clone the repository "
+            f"there first")
+    head = _git_output(repo_dir, "symbolic-ref", "refs/remotes/origin/HEAD")
+    prefix = "refs/remotes/origin/"
+    if not head or not head.startswith(prefix) or not head[len(prefix):]:
+        raise RecordError(
+            f"cannot read the default branch from refs/remotes/origin/HEAD in {repo_dir}; "
+            f"run `git -C {repo_dir} remote set-head origin --auto` and re-run detect")
+    return _strip_userinfo(url), head[len(prefix):]
+
+
 def _cmd_detect(args, home: Path, adapters, out) -> int:
     try:
         repo_dir = Path(args.repo_dir)
-        slug = args.slug or repo_dir.name
+        slug = validate_slug(args.slug if args.slug is not None else repo_dir.name)
+        path = record_path(slug, home)
+        if path.exists() and not getattr(args, "force", False):
+            raise RecordError(
+                f"a project record for {slug!r} already exists at {path}; refusing to "
+                f"overwrite it (pass --force to replace it)")
+        repo_url, default_branch = _origin_facts(repo_dir)
 
         pr_adapter = getattr(args, "pr_adapter", None)
         ci_adapter = getattr(args, "ci_adapter", None)
@@ -135,10 +197,10 @@ def _cmd_detect(args, home: Path, adapters, out) -> int:
             for name, factory in adapters.items():
                 probe = ProjectRecord(
                     slug=slug,
-                    repo_url="",
+                    repo_url=repo_url,
                     pr_adapter=name,
                     ci_adapter=name,
-                    default_branch="main",
+                    default_branch=default_branch,
                     ci_hint={},
                 )
                 try:
@@ -161,10 +223,10 @@ def _cmd_detect(args, home: Path, adapters, out) -> int:
 
         rec = ProjectRecord(
             slug=slug,
-            repo_url="",
+            repo_url=repo_url,
             pr_adapter=pr_adapter,
             ci_adapter=ci_adapter,
-            default_branch="main",
+            default_branch=default_branch,
             ci_hint={},
         )
         save_record(rec, home)
@@ -238,6 +300,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_detect.add_argument("--slug")
     p_detect.add_argument("--pr-adapter")
     p_detect.add_argument("--ci-adapter")
+    p_detect.add_argument("--force", action="store_true",
+                          help="replace an existing project record")
 
     p_pr_open = sub.add_parser("pr-open")
     p_pr_open.add_argument("--slug", required=True)
