@@ -204,6 +204,11 @@ _ALWAYS_PROTECTED = frozenset({"main", "master"})
 _OPERATOR_CHARS = ";&|()<>`\n"
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _MAX_NESTING = 4
+# Shell long options that take a separate value (`bash --rcfile f -c ...`).
+_SHELL_LONG_VALUE_OPTS = frozenset({"--rcfile", "--init-file"})
+# A push destination containing any of these is a shell expansion or a
+# pattern, so the branch it names cannot be read from argv.
+_EXPANSION_CHARS = frozenset("$`{}~?[*")
 
 # git global options that take a separate value (`git -C dir push ...`).
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"})
@@ -247,6 +252,36 @@ def _split(tokens: Iterable[str]) -> list[list[str]]:
     return out
 
 
+def _shell_c_script(args: list[str]) -> str | None:
+    """The script of `sh/bash [options] -c script`, else None.
+
+    Options may come in any order: long options (`--login`, `--norc`), option
+    values (`-o pipefail`, `-O extglob`, `+o posix`) and short clusters
+    (`-lc`, `-ec`). As in bash, the script is the first non-option argument
+    once a cluster containing `c` has been seen.
+    """
+    saw_c = False
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a == "--":
+            j += 1
+            break
+        if a.startswith("--"):
+            j += 2 if a in _SHELL_LONG_VALUE_OPTS else 1
+            continue
+        if len(a) > 1 and a[0] in "-+":
+            cluster = a[1:]
+            if a[0] == "-" and "c" in cluster:
+                saw_c = True
+            j += 2 if ("o" in cluster or "O" in cluster) else 1
+            continue
+        break
+    if saw_c and j < len(args):
+        return args[j]
+    return None
+
+
 def _simple_commands(command: str, depth: int = 0) -> list[list[str]]:
     """Every simple command in `command`, nested scripts included.
 
@@ -260,14 +295,9 @@ def _simple_commands(command: str, depth: int = 0) -> list[list[str]]:
         for i, tok in enumerate(argv):
             base = _basename(tok)
             if base in _SHELLS:
-                for j in range(i + 1, len(argv)):
-                    flag = argv[j]
-                    if not flag.startswith("-") or flag.startswith("--"):
-                        break
-                    if "c" in flag[1:]:
-                        if j + 1 < len(argv):
-                            out.extend(_simple_commands(argv[j + 1], depth + 1))
-                        break
+                script = _shell_c_script(argv[i + 1:])
+                if script is not None:
+                    out.extend(_simple_commands(script, depth + 1))
             elif base == "eval" and i + 1 < len(argv):
                 out.extend(_simple_commands(" ".join(argv[i + 1:]), depth + 1))
             if "$(" in tok or "`" in tok:  # command substitution inside a quoted word
@@ -368,6 +398,8 @@ def _push_destinations(args: list[str]) -> list[str] | str:
         dst = s.split(":", 1)[1] if ":" in s else s
         if not dst:
             return _unverifiable_push(f"refspec {spec!r} has no destination")
+        if _EXPANSION_CHARS & set(dst):
+            return _unverifiable_push(f"refspec {spec!r} names the branch by a shell expansion")
         if dst.startswith("refs/heads/"):
             dst = dst[len("refs/heads/"):]
         elif dst.startswith("refs/"):

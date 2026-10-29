@@ -490,6 +490,10 @@ class MergeDeployTests(HomeMixin, unittest.TestCase):
         "(cd x; gh pr merge 1)",
         "bash -c 'gh pr merge 1'",
         "sh -lc \"cd x && glab mr merge 2\"",
+        "bash --login -c 'gh pr merge 1'",       # long options before -c
+        "bash --norc --noprofile -c 'gh pr merge 1'",
+        "bash -o pipefail -c 'gh pr merge 1'",   # option values before -c
+        "bash -O extglob +o posix -ec 'gh pr merge 1'",
         'echo "$(gh pr merge 1)"',
         "echo `gh pr merge 1`",
         "eval gh pr merge 1",
@@ -577,6 +581,21 @@ class PushTests(HomeMixin, unittest.TestCase):
         "git push origin feat/x # done\ngit push",  # a comment never joins lines
         "cd repo && git push",
         "make && git push origin main",
+        # destination is a shell expansion: the real branch is unknown
+        'git push origin "$(git branch --show-current)"',
+        'git push -u origin "$BRANCH"',
+        "B=main; git push origin $B",
+        "git push origin ${B}",
+        "git push origin {main,}",
+        "git push origin feat/x:$B",
+        "git push origin refs/heads/$B",
+        "git push origin ~",
+        "git push origin mai?",
+        "git push origin ma[i]n",
+        "git push origin 'm*'",
+        # nested shells with options before -c are parsed again
+        "bash -o pipefail -c 'git push origin develop'",
+        "bash --login -c 'git push origin develop'",
     ]
     PUSH_ALLOWED = [
         "git push origin feat/x",
@@ -588,6 +607,7 @@ class PushTests(HomeMixin, unittest.TestCase):
         "git push origin --tags",
         "git push origin refs/tags/v1",
         "git status && git push origin feat/x",
+        "bash -o pipefail -c 'git push origin feat/x'",
     ]
 
     def test_push_to_default_branch_blocked_feature_branch_allowed(self):
