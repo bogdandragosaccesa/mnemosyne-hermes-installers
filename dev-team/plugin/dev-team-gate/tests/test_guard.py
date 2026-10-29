@@ -668,8 +668,12 @@ class SideDoorTests(HomeMixin, unittest.TestCase):
                     self.assertIsInstance(msg, str)
                     self.assertTrue(msg.startswith("guard:"), msg)
                     self.assertIn("kanban_", msg)  # points at the guarded tool instead
-                    self.assertIsNone(terminal(b, "t_misc", cmd))
-                    self.assertIsNone(terminal(b, None, cmd))
+                    # Decided by the TARGET card (#7), not the caller: an unguarded caller
+                    # or no card at all must not open the side door onto a guarded card.
+                    for caller in ("t_misc", None):
+                        other = terminal(b, caller, cmd)
+                        self.assertIsInstance(other, str, f"{cmd!r} allowed from {caller}")
+                        self.assertTrue(other.startswith("guard:"), other)
 
     def test_other_kanban_cli_verbs_allowed_on_guarded_card(self):
         b = guarded_board(home=self.home)
@@ -774,9 +778,16 @@ class PreToolCallTests(HomeMixin, unittest.TestCase):
         self.assertTrue(out["message"].startswith("guard:"))
         self.assertIsNone(guard_mod.pre_tool_call("terminal", {"command": "make test"}))
 
-    def test_terminal_without_card_skips_side_door(self):
+    def test_terminal_without_card_still_checks_side_door_target(self):
+        # #7: no HERMES_KANBAN_TASK does not skip the check; t_x is not on the
+        # board, so the target cannot be verified and the call is refused.
+        out = guard_mod.pre_tool_call("terminal", {"command": "hermes kanban complete t_x"})
+        self.assertEqual(out["action"], "block")
+        self.assertTrue(out["message"].startswith("guard:"), out)
+        out = guard_mod.pre_tool_call("terminal", {"command": "hermes kanban complete t_impl1"})
+        self.assertTrue(out["message"].startswith("guard:"), out)
         self.assertIsNone(guard_mod.pre_tool_call(
-            "terminal", {"command": "hermes kanban complete t_x"}))
+            "terminal", {"command": "hermes kanban complete t_misc"}))
 
     def test_hook_never_raises(self):
         os.environ["HERMES_KANBAN_TASK"] = "t_impl1"

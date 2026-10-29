@@ -173,11 +173,19 @@ def _check(board, task_id, args, ci_status):
 # Commands are tokenised with shlex and matched on argv, never by a substring
 # search of the raw string, so `git commit -m "gh pr merge"` is one argument and
 # passes. Shell operators (; & | ( ) < > ` and newline) split the line into
-# simple commands; `sh -c`, `eval`, `$(...)` and backticks are parsed again.
-# Inside each simple command a rule matches at any argv position, so prefixes
-# such as `FOO=1`, `sudo -u x`, `env`, `timeout 60` or `cd x &&` do not hide it.
-# Matching errs toward blocking: this is a best-effort guard in front of an
-# irreversible action (token scope is the real boundary, see the README).
+# simple commands; `sh -c`, `eval`, `alias x=...`, `$(...)` and backticks are
+# parsed again. Inside each simple command a rule matches at any argv position,
+# so prefixes such as `FOO=1`, `sudo -u x`, `env`, `timeout 60` or `cd x &&` do
+# not hide it.
+#
+# What cannot be read from argv is refused rather than guessed: a script fed to
+# a shell or interpreter on stdin, a command name that is a shell expansion,
+# `env -S`, shell function definitions, git config that can redirect a push or
+# define an alias, an unknown git subcommand (it may be an alias).
+#
+# This is a best-effort guard in front of irreversible actions, and it only
+# sees the `terminal` tool. Branch protection on the default branch is
+# REQUIRED (see the README): it is the real boundary.
 # ---------------------------------------------------------------------------
 
 MERGE_LABEL = "merge: human-only"
@@ -188,27 +196,66 @@ _ALWAYS_BLOCK: dict[str, list[tuple[frozenset[str] | None, frozenset[str]]]] = {
     "gh": [(frozenset({"pr"}), frozenset({"merge"}))],
     "glab": [(frozenset({"mr"}), frozenset({"merge"}))],
     "tea": [(frozenset({"pr", "prs", "pulls"}), frozenset({"merge"}))],
-    "kubectl": [(None, frozenset({"apply", "rollout"}))],
-    "helm": [(None, frozenset({"upgrade", "install"}))],
-    "terraform": [(None, frozenset({"apply"}))],
+    "kubectl": [
+        (None, frozenset({"apply", "rollout", "delete", "patch", "replace", "scale", "edit"})),
+        (frozenset({"set"}), frozenset({"image", "env", "resources", "selector",
+                                        "serviceaccount", "subject"})),
+    ],
+    "helm": [(None, frozenset({"upgrade", "install", "rollback", "uninstall", "delete"}))],
+    "terraform": [(None, frozenset({"apply", "destroy"}))],
+    "tofu": [(None, frozenset({"apply", "destroy"}))],
     "docker": [(None, frozenset({"push"}))],
+    "podman": [(None, frozenset({"push"}))],
 }
+# Image builders whose `build`/`bake` can push with a flag.
+_IMAGE_BUILDERS = frozenset({"docker", "podman", "buildah", "nerdctl"})
 
-# `hermes kanban <verb>` that would move a guarded card without the
-# `kanban_complete` hook (design: "The terminal is not a side door").
-_SIDE_DOOR_VERBS = frozenset({"complete", "request-changes", "edit", "unblock", "reopen-review"})
+# `hermes kanban <verb>` that would move a card without the `kanban_complete`
+# hook (design: "The terminal is not a side door"), with each verb's options
+# that take a separate value. The target card ids are the positionals.
+_SIDE_DOOR_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "complete": frozenset({"--result", "--summary", "--metadata"}),
+    "request-changes": frozenset(),
+    "edit": frozenset({"--title", "--body", "--priority", "--result", "--summary", "--metadata"}),
+    "unblock": frozenset({"--reason"}),
+    "reopen-review": frozenset({"--reason"}),
+}
+_SIDE_DOOR_VERBS = frozenset(_SIDE_DOOR_VALUE_OPTS)
+_SIDE_DOOR_ONE_TARGET = frozenset({"request-changes", "edit"})
+_CARD_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # Branch names protected even when no project record says otherwise.
 _ALWAYS_PROTECTED = frozenset({"main", "master"})
 
 _OPERATOR_CHARS = ";&|()<>`\n"
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish", "csh", "tcsh"})
+_POWERSHELLS = frozenset({"pwsh", "powershell"})
 _MAX_NESTING = 4
 # Shell long options that take a separate value (`bash --rcfile f -c ...`).
 _SHELL_LONG_VALUE_OPTS = frozenset({"--rcfile", "--init-file"})
+# Arguments that make a shell or interpreter read its script from stdin.
+_STDIN_PATHS = ("/dev/stdin", "/dev/fd/", "/proc/self/fd/")
 # A push destination containing any of these is a shell expansion or a
 # pattern, so the branch it names cannot be read from argv.
 _EXPANSION_CHARS = frozenset("$`{}~?[*")
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Commands that run the rest of argv as a command, with their options that
+# take a separate value. Used to find the command word of a simple command.
+_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "sudo": frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T",
+                       "--user", "--group", "--chdir", "--host", "--prompt"}),
+    "doas": frozenset({"-u", "-C"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+    "xargs": frozenset({"-I", "-n", "-L", "-P", "-d", "-E", "-s", "-a", "--max-args",
+                        "--max-procs", "--delimiter", "--arg-file", "--replace"}),
+    "ionice": frozenset({"-c", "-n", "-p"}),
+    "nohup": frozenset(), "exec": frozenset(), "command": frozenset(), "time": frozenset(),
+    "setsid": frozenset(), "builtin": frozenset(), "unbuffer": frozenset(),
+}
 
 # git global options that take a separate value (`git -C dir push ...`).
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"})
@@ -216,6 +263,97 @@ _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespac
 _PUSH_VALUE_OPTS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
 # `git push` options that update branches no refspec names.
 _PUSH_ALL_OPTS = frozenset({"--all", "--mirror", "--branches", "--prune"})
+# git config whose value can change which branch a push updates, or what a git
+# command runs: aliases, remote push refspecs, push.default, branch upstreams,
+# included config files, URL rewrites.
+_GIT_MAPPING_KEYS = ("alias.", "remote.", "push.", "branch.", "include.", "includeif.", "url.")
+_GIT_MAPPING_SECTIONS = frozenset({"alias", "remote", "push", "branch", "include", "includeif", "url"})
+_GIT_CONFIG_ENV = re.compile(r"^GIT_CONFIG\w*=", re.IGNORECASE)
+# `git config` options that take a separate value.
+_GIT_CONFIG_VALUE_OPTS = frozenset({"-f", "--file", "--blob", "--type", "--default", "--comment",
+                                    "--value", "--fixed-value-of"})
+_GIT_CONFIG_READ_OPTS = frozenset({"--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l",
+                                   "--list", "--get-color", "--get-colorbool"})
+_GIT_CONFIG_WRITE_OPTS = frozenset({"--add", "--replace-all", "--unset", "--unset-all",
+                                    "--rename-section", "--remove-section"})
+# Subcommands that update remote refs without `git push`'s refspec rules.
+_GIT_REMOTE_WRITERS = frozenset({"send-pack", "http-push", "remote-ext", "remote-fd"})
+# git subcommands (git --list-cmds=builtins,main, git 2.53). Anything else
+# after `git` may be an alias, so it is refused: aliases cannot shadow these.
+_GIT_BUILTINS = frozenset("""
+add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file check-attr
+check-ignore check-mailmap check-ref-format checkout checkout--worker checkout-index cherry
+cherry-pick citool clean clone column commit commit-graph commit-tree config count-objects
+credential credential-cache credential-cache--daemon credential-store daemon describe diagnose
+diff diff-files diff-index diff-pairs diff-tree difftool difftool--helper fast-export fast-import
+fetch fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck
+fsck-objects fsmonitor--daemon gc get-tar-commit-id grep gui hash-object help hook http-backend
+http-fetch http-push imap-send index-pack init init-db instaweb interpret-trailers last-modified
+log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file
+merge-index merge-octopus merge-one-file merge-ours merge-recursive merge-recursive-ours
+merge-recursive-theirs merge-resolve merge-subtree merge-tree mergetool mktag mktree
+multi-pack-index mv name-rev notes pack-objects pack-redundant pack-refs patch-id pickaxe prune
+prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog refs remote
+remote-ext remote-fd remote-ftp remote-ftps remote-http remote-https repack replace replay repo
+request-pull rerere reset restore rev-list rev-parse revert rm send-email send-pack shortlog show
+show-branch show-index show-ref sparse-checkout stage stash status stripspace submodule
+submodule--helper subtree switch symbolic-ref tag unpack-file unpack-objects update-index
+update-ref update-server-info upload-archive upload-archive--writer upload-pack var
+verify-commit verify-pack verify-tag version web--browse whatchanged worktree write-tree
+""".split())
+# External git commands known not to update branch refs.
+_GIT_EXTERNAL_OK = frozenset({"lfs"})
+
+# Interpreters: (inline-code flags, flags that run a module/file, value options).
+_PYTHON = re.compile(r"^(python|pypy)[0-9.]*$")
+_INTERPRETERS: dict[str, tuple[frozenset[str], frozenset[str], frozenset[str]]] = {
+    "python": (frozenset({"-c"}), frozenset({"-m"}), frozenset({"-W", "-X", "-Q"})),
+    "perl": (frozenset({"-e", "-E"}), frozenset(), frozenset({"-I", "-M", "-m"})),
+    "ruby": (frozenset({"-e"}), frozenset(), frozenset({"-I", "-r"})),
+    "node": (frozenset({"-e", "--eval", "-p", "--print"}), frozenset(),
+             frozenset({"-r", "--require", "--import"})),
+    "php": (frozenset({"-r"}), frozenset({"-f"}), frozenset({"-d", "-c"})),
+    "lua": (frozenset({"-e"}), frozenset(), frozenset({"-l"})),
+}
+_INTERPRETER_ALIASES = {"nodejs": "node", "deno": "node", "bun": "node", "luajit": "lua"}
+# Inline interpreter code that mentions any of these may push, merge, move a
+# card or touch a fence; it cannot be checked, so it is refused.
+_SUSPECT_INLINE = re.compile(r"\b(push|merge|send-pack|kanban)\b|HERMES_", re.IGNORECASE)
+
+# Forge CLI `api` calls and raw HTTP clients that write to a merge or ref endpoint.
+_API_TOOLS = frozenset({"gh", "glab", "tea"})
+_API_VALUE_OPTS = frozenset({"-X", "--method", "-f", "-F", "--field", "--raw-field", "--input",
+                             "-H", "--header", "-q", "--jq", "-t", "--template", "--hostname",
+                             "-R", "--repo", "--cache", "-p", "--preview", "-d", "--data",
+                             "--login", "--remote"})
+_API_DATA_OPTS = frozenset({"-f", "-F", "--field", "--raw-field", "--input", "-d", "--data"})
+_MERGE_OR_REF_PATH = re.compile(r"(?:^|/)merges?(?=$|[/?#])|git/refs", re.IGNORECASE)
+_GRAPHQL_WRITE = re.compile(r"merge|updateRefs?|createRef|deleteRef", re.IGNORECASE)
+_CURL_VALUE_OPTS = frozenset({"-X", "--request", "-d", "--data", "--data-raw", "--data-binary",
+                              "--data-urlencode", "--json", "-F", "--form", "-T", "--upload-file",
+                              "-H", "--header", "-o", "--output", "-u", "--user", "--url",
+                              "-A", "--user-agent", "-e", "--referer", "-b", "--cookie",
+                              "-c", "--cookie-jar", "-m", "--max-time", "--connect-timeout"})
+_CURL_DATA_OPTS = frozenset({"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+                             "--json", "-F", "--form", "-T", "--upload-file"})
+
+# Fences: HERMES_* variables carry the worker's identity and Hermes' own
+# guards (HERMES_KANBAN_TASK, HERMES_DELEGATED_CHILD_CONTEXT, ...).
+_HERMES_ASSIGN = re.compile(r"^HERMES_[A-Za-z0-9_]*=", re.IGNORECASE)
+_HERMES_NAME = re.compile(r"^HERMES_", re.IGNORECASE)
+_ENV_DECLARERS = frozenset({"unset", "export", "declare", "typeset", "local", "readonly"})
+_RAW_FENCE = re.compile(
+    r"\$env:HERMES_\w*\s*=(?!=)"
+    r"|\b(?:remove-item|ri|rm|del|erase|clear-item|set-item|new-item)\b[^;|\n]*\benv:\\?HERMES_"
+    r"|SetEnvironmentVariable\s*\(\s*['\"]HERMES_",
+    re.IGNORECASE)
+# Shell function definitions: `f() {` or `function f`. The body runs under a
+# name the guard cannot follow.
+_RAW_FUNCTION = re.compile(
+    r"(?:^|[;&|\n({]\s*)(?:function\s+[\w.:-]+|[\w.:-]+\s*\(\s*\))", re.MULTILINE)
+# A command substitution in command position: `$(echo git) push ...`.
+_RAW_SUBST_COMMAND = re.compile(
+    r"(?:^|[;&|\n(]\s*)(?:[A-Za-z_]\w*=\S*\s+)*(?:\$\(|`)", re.MULTILINE)
 
 
 def _basename(token: str) -> str:
@@ -282,6 +420,112 @@ def _shell_c_script(args: list[str]) -> str | None:
     return None
 
 
+def _shell_reads_stdin(args: list[str]) -> bool:
+    """True when `sh/bash [options] [script]` (no -c) reads its script from stdin."""
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a == "-":
+            return True
+        if a == "--":
+            return j + 1 >= len(args) or args[j + 1].startswith(_STDIN_PATHS)
+        if a.startswith("--"):
+            j += 2 if a in _SHELL_LONG_VALUE_OPTS else 1
+            continue
+        if len(a) > 1 and a[0] in "-+":
+            if a[0] == "-" and "s" in a[1:]:
+                return True
+            j += 2 if ("o" in a[1:] or "O" in a[1:]) else 1
+            continue
+        return a.startswith(_STDIN_PATHS)  # a script file, unless it is stdin
+    return True
+
+
+def _powershell_script(args: list[str]) -> tuple[str, str | None]:
+    """("command", script) | ("stdin", None) | ("encoded", None) | ("file", None)."""
+    for j, a in enumerate(args):
+        low = a.lower()
+        if low in ("-encodedcommand", "-enc", "-ec", "-e"):
+            return "encoded", None
+        if low in ("-command", "-c"):
+            rest = args[j + 1:]
+            if not rest or rest[0] == "-":
+                return "stdin", None
+            return "command", " ".join(rest)
+        if low in ("-file", "-f"):
+            return "file", None
+        if not a.startswith("-"):
+            return "command", " ".join(args[j:])
+    return "stdin", None
+
+
+def _interpreter(base: str) -> str | None:
+    if _PYTHON.match(base):
+        return "python"
+    base = _INTERPRETER_ALIASES.get(base, base)
+    return base if base in _INTERPRETERS else None
+
+
+def _interpreter_mode(kind: str, args: list[str]) -> tuple[str, str | None]:
+    """("stdin"|"file", None) or ("inline", code) for `python3 [options] ...`."""
+    inline, module, values = _INTERPRETERS[kind]
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a == "-" or a.startswith(_STDIN_PATHS):
+            return "stdin", None
+        if a == "--":
+            return ("file", None) if j + 1 < len(args) else ("stdin", None)
+        if a.startswith("-") and len(a) > 1:
+            name = a.split("=", 1)[0]
+            if name in inline:
+                code = a.split("=", 1)[1] if "=" in a else (args[j + 1] if j + 1 < len(args) else "")
+                return "inline", code
+            if not a.startswith("--"):
+                # a short cluster such as `-uc` or `-pe`: the first inline flag
+                # letter in it takes the rest of the cluster, or the next word
+                for k, ch in enumerate(a[1:], 1):
+                    if f"-{ch}" in inline:
+                        code = a[k + 1:] or (args[j + 1] if j + 1 < len(args) else "")
+                        return "inline", code
+                    if f"-{ch}" in module:
+                        return "file", None
+            if name in module:
+                return "file", None
+            j += 2 if a in values else 1
+            continue
+        return "file", None
+    return "stdin", None
+
+
+def _command_index(argv: list[str]) -> int | None:
+    """Index of the command word of a simple command: past `VAR=value`
+    assignments and wrappers such as `sudo -u x`, `env`, `timeout 60`, `xargs`."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if _ASSIGNMENT.match(tok):
+            i += 1
+            continue
+        base = _basename(tok)
+        values = _WRAPPER_VALUE_OPTS.get(base)
+        if values is None:
+            return i
+        i += 1
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                i += 1
+                break
+            if a.startswith("-") and len(a) > 1:
+                i += 2 if a in values else 1
+                continue
+            if base == "timeout" and a[:1].isdigit():
+                i += 1
+            break
+    return None
+
+
 def _simple_commands(command: str, depth: int = 0) -> list[list[str]]:
     """Every simple command in `command`, nested scripts included.
 
@@ -298,8 +542,16 @@ def _simple_commands(command: str, depth: int = 0) -> list[list[str]]:
                 script = _shell_c_script(argv[i + 1:])
                 if script is not None:
                     out.extend(_simple_commands(script, depth + 1))
+            elif base in _POWERSHELLS:
+                kind, script = _powershell_script(argv[i + 1:])
+                if kind == "command" and script:
+                    out.extend(_simple_commands(script, depth + 1))
             elif base == "eval" and i + 1 < len(argv):
                 out.extend(_simple_commands(" ".join(argv[i + 1:]), depth + 1))
+            elif base == "alias":
+                for definition in argv[i + 1:]:
+                    if "=" in definition:
+                        out.extend(_simple_commands(definition.split("=", 1)[1], depth + 1))
             if "$(" in tok or "`" in tok:  # command substitution inside a quoted word
                 inner = tok.replace("$(", " ( ").replace("`", " ` ")
                 out.extend(_simple_commands(inner, depth + 1))
@@ -322,9 +574,21 @@ def _positional(args: list[str]) -> list[str]:
     return [a for a in args if not a.startswith("-")]
 
 
+def _merge_label(what: str) -> str:
+    return (
+        f"{MERGE_LABEL}: `{what}` merges or deploys. Merge and deploy are "
+        f"human-only; stop at a ready PR and leave it to the operator."
+    )
+
+
 def _merge_or_deploy(argv: list[str]) -> str | None:
     for i, tok in enumerate(argv):
-        rules = _ALWAYS_BLOCK.get(_basename(tok))
+        base = _basename(tok)
+        if base in _IMAGE_BUILDERS:
+            msg = _image_push(base, argv[i + 1:])
+            if msg:
+                return msg
+        rules = _ALWAYS_BLOCK.get(base)
         if not rules:
             continue
         pos = _positional(argv[i + 1:])
@@ -337,25 +601,138 @@ def _merge_or_deploy(argv: list[str]) -> str | None:
                 start = hits[0] + 1
             for p in pos[start:]:
                 if p in verbs:
-                    what = " ".join([_basename(tok)] + ([pos[start - 1]] if group else []) + [p])
-                    return (
-                        f"{MERGE_LABEL}: `{what}` merges or deploys. Merge and deploy are "
-                        f"human-only; stop at a ready PR and leave it to the operator."
-                    )
+                    return _merge_label(" ".join([base] + ([pos[start - 1]] if group else []) + [p]))
     return None
 
 
-def _git_push_args(argv: list[str]) -> list[str] | None:
-    """The arguments after `push` when argv contains a `git ... push`, else None."""
+def _image_push(base: str, args: list[str]) -> str | None:
+    """`docker [buildx] build|bake --push` and `--output type=registry|push=true`."""
+    pos = _positional(args)
+    if "build" not in pos and "bake" not in pos:
+        return None
+    for j, a in enumerate(args):
+        value = None
+        if a == "--push" or a.startswith("--push="):
+            return _merge_label(f"{base} build --push")
+        if a in ("-o", "--output"):
+            value = args[j + 1] if j + 1 < len(args) else ""
+        elif a.startswith("--output="):
+            value = a.split("=", 1)[1]
+        elif a.startswith("-o") and len(a) > 2:
+            value = a[2:]
+        if value and re.search(r"type=registry|push=true", value, re.IGNORECASE):
+            return _merge_label(f"{base} build --output {value}")
+    return None
+
+
+def _api_write(argv: list[str]) -> str | None:
+    """`gh|glab|tea api` and curl/wget writes to a merge or git-ref endpoint."""
     for i, tok in enumerate(argv):
-        if _basename(tok) != "git":
-            continue
-        j = i + 1
-        while j < len(argv) and argv[j].startswith("-"):
-            j += 2 if argv[j] in _GIT_VALUE_OPTS else 1
-        if j < len(argv) and argv[j] == "push":
-            return argv[j + 1:]
+        base = _basename(tok)
+        if base in _API_TOOLS and "api" in argv[i + 1:]:
+            args = argv[i + 1:]
+            args = args[args.index("api") + 1:]
+            method, data, endpoint, rest = None, False, None, []
+            j = 0
+            while j < len(args):
+                a = args[j]
+                name = a.split("=", 1)[0] if a.startswith("--") else a
+                if a.startswith("-") and len(a) > 1:
+                    joined = "=" in a if a.startswith("--") else (len(a) > 2 and a[:2] in _API_VALUE_OPTS)
+                    short = a[:2] if not a.startswith("--") else name
+                    value = (a.split("=", 1)[1] if a.startswith("--") else a[2:]) if joined else (
+                        args[j + 1] if j + 1 < len(args) else "")
+                    if short in ("-X", "--method"):
+                        method = value
+                    if short in _API_DATA_OPTS:
+                        data = True
+                    rest.append(value)
+                    j += 1 if joined or short not in _API_VALUE_OPTS else 2
+                    continue
+                if endpoint is None:
+                    endpoint = a
+                rest.append(a)
+                j += 1
+            writes = method.upper() not in ("GET", "HEAD") if method else data
+            if not writes or endpoint is None:
+                continue
+            if endpoint.lower() == "graphql":
+                if any(_GRAPHQL_WRITE.search(x) for x in rest) or "--input" in args:
+                    return _merge_label(f"{base} api graphql (merge or ref mutation)")
+                continue
+            if _EXPANSION_CHARS & set(endpoint) or _MERGE_OR_REF_PATH.search(endpoint):
+                return _merge_label(f"{base} api {method or 'POST'} {endpoint}")
+        elif base in ("curl", "wget"):
+            msg = _http_write(base, argv[i + 1:])
+            if msg:
+                return msg
     return None
+
+
+def _http_write(base: str, args: list[str]) -> str | None:
+    method, data, urls = None, False, []
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if base == "wget":
+            if a.startswith("--method="):
+                method = a.split("=", 1)[1]
+            elif a.startswith(("--post-data", "--post-file", "--body-data", "--body-file")):
+                data = True
+            elif not a.startswith("-"):
+                urls.append(a)
+            j += 1
+            continue
+        if a.startswith("--") and "=" in a:
+            name, value = a.split("=", 1)
+            joined = True
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 2 and a[:2] in _CURL_VALUE_OPTS:
+            name, value, joined = a[:2], a[2:], True
+        else:
+            name, value, joined = a, (args[j + 1] if j + 1 < len(args) else ""), False
+        if name in ("-X", "--request"):
+            method = value
+        if name in _CURL_DATA_OPTS:
+            data = True
+        if name == "--url":
+            urls.append(value)
+        if name.startswith("-") and len(name) > 1:
+            j += 1 if joined or name not in _CURL_VALUE_OPTS else 2
+            continue
+        urls.append(a)
+        j += 1
+    writes = method.upper() not in ("GET", "HEAD") if method else data
+    if writes and any(_MERGE_OR_REF_PATH.search(u) for u in urls):
+        return _merge_label(f"{base} {method or 'POST'} to a merge or git-ref endpoint")
+    return None
+
+
+def _git_calls(argv: list[str]) -> list[tuple[int, list[str], str | None, list[str], bool]]:
+    """Every git invocation in argv: (index, `-c` config entries, subcommand,
+    arguments after it, dashed). `/usr/lib/git-core/git-push` counts as
+    `git push` (dashed=True)."""
+    out = []
+    for i, tok in enumerate(argv):
+        base = _basename(tok)
+        if base == "git":
+            j, config = i + 1, []
+            while j < len(argv) and argv[j].startswith("-"):
+                a = argv[j]
+                if a in ("-c", "--config-env"):
+                    if j + 1 < len(argv):
+                        config.append(argv[j + 1])
+                    j += 2
+                    continue
+                if a.startswith("--config-env="):
+                    config.append(a.split("=", 1)[1])
+                elif a[:2] == "-c" and len(a) > 2:
+                    config.append(a[2:])
+                j += 2 if a in _GIT_VALUE_OPTS else 1
+            sub = argv[j] if j < len(argv) else None
+            out.append((i, config, sub, argv[j + 1:], False))
+        elif base.startswith("git-") and len(base) > 4:
+            out.append((i, [], base[4:], argv[i + 1:], True))
+    return out
 
 
 def _unverifiable_push(why: str) -> str:
@@ -364,6 +741,67 @@ def _unverifiable_push(why: str) -> str:
         f"Pushing to the default branch is human-only; name the destination branch, "
         f"e.g. `git push origin <feature-branch>`."
     )
+
+
+def _git_refusal(what: str, why: str) -> str:
+    return (
+        f"{MERGE_LABEL}: `{what}` is refused: {why}. Pushing to the default branch "
+        f"is human-only; use a plain `git push origin <feature-branch>`."
+    )
+
+
+def _config_key_redirects(key: str) -> bool:
+    key = key.split("=", 1)[0].strip().lower()
+    return key.startswith(_GIT_MAPPING_KEYS) or key in _GIT_MAPPING_SECTIONS
+
+
+def _git_config_refusal(args: list[str]) -> str | None:
+    """`git config` that writes a key able to redirect a push or define an alias."""
+    pos, reads, writes = [], False, False
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if a in ("-e", "--edit"):
+            return _git_refusal("git config --edit", "an editor session can rewrite any key")
+        if a.startswith("-"):
+            name = a.split("=", 1)[0]
+            reads = reads or name in _GIT_CONFIG_READ_OPTS
+            writes = writes or name in _GIT_CONFIG_WRITE_OPTS
+            j += 2 if a in _GIT_CONFIG_VALUE_OPTS else 1
+            continue
+        pos.append(a)
+        j += 1
+    if pos and pos[0] in ("get", "list"):
+        return None
+    if pos and pos[0] == "edit":
+        return _git_refusal("git config edit", "an editor session can rewrite any key")
+    if pos and pos[0] in ("set", "unset", "rename-section", "remove-section"):
+        keys = pos[1:3] if pos[0] == "rename-section" else pos[1:2]
+    elif writes:
+        keys = pos[:2] if "--rename-section" in args else pos[:1]
+    elif reads or len(pos) < 2:
+        return None
+    else:
+        keys = pos[:1]
+    for key in keys:
+        if _config_key_redirects(key):
+            return _git_refusal(f"git config {key}", "this key can redirect what a push "
+                                "updates or define a git alias")
+    return None
+
+
+def _branch_candidates(dst: str) -> list[str] | None:
+    """Branch names a push destination may update, the way git resolves it:
+    `refs/heads/X` is X; an unqualified `heads/X` matches `refs/heads/X` (rule
+    `refs/%s`) or a branch literally named `heads/X`; other `refs/...` are not
+    branches."""
+    if dst.startswith("refs/"):
+        rest = dst[len("refs/"):]
+        return [rest[len("heads/"):]] if rest.startswith("heads/") else None
+    out = [dst]
+    if dst.startswith("heads/"):
+        out.append(dst[len("heads/"):])
+    return out
 
 
 def _push_destinations(args: list[str]) -> list[str] | str:
@@ -400,25 +838,161 @@ def _push_destinations(args: list[str]) -> list[str] | str:
             return _unverifiable_push(f"refspec {spec!r} has no destination")
         if _EXPANSION_CHARS & set(dst):
             return _unverifiable_push(f"refspec {spec!r} names the branch by a shell expansion")
-        if dst.startswith("refs/heads/"):
-            dst = dst[len("refs/heads/"):]
-        elif dst.startswith("refs/"):
+        names = _branch_candidates(dst)
+        if names is None:
             continue  # tags, notes: not a branch
-        if dst in ("HEAD", "@") or "*" in dst or "@{" in dst or not dst:
-            return _unverifiable_push(f"refspec {spec!r} does not name the branch")
-        dests.append(dst)
+        for name in names:
+            if name in ("HEAD", "@") or "@{" in name or not name:
+                return _unverifiable_push(f"refspec {spec!r} does not name the branch")
+        dests.extend(names)
     return dests
 
 
-def _side_door_verb(argv: list[str]) -> str | None:
-    for i, tok in enumerate(argv):
-        if _basename(tok) != "hermes":
+def _git_rules(argv: list[str], cmd_index: int | None) -> list[str] | str:
+    """Push destinations named in argv, or a refusal."""
+    for tok in argv:
+        if _GIT_CONFIG_ENV.match(tok):
+            name = tok.split("=", 1)[0]
+            return _git_refusal(name, "GIT_CONFIG_* variables inject config, including "
+                                "aliases and push refspecs")
+    dests: list[str] = []
+    for i, config, sub, args, dashed in _git_calls(argv):
+        for entry in config:
+            if _config_key_redirects(entry):
+                key = entry.split("=", 1)[0]
+                return _git_refusal(f"git -c {key}", "this key can redirect what a push "
+                                    "updates or define a git alias")
+        if sub is None:
             continue
-        pos = _positional(argv[i + 1:])
-        if "kanban" in pos:
-            for p in pos[pos.index("kanban") + 1:]:
-                if p in _SIDE_DOOR_VERBS:
-                    return p
+        if any(c in sub for c in "$`") or _EXPANSION_CHARS & set(sub):
+            return _git_refusal(f"git {sub}", "the subcommand is a shell expansion")
+        if sub in _GIT_REMOTE_WRITERS:
+            return _git_refusal(f"git {sub}", "it updates remote refs directly")
+        if sub == "subtree" and "push" in _positional(args):
+            return _git_refusal("git subtree push", "it pushes to a branch the guard cannot "
+                                "check")
+        if sub == "config":
+            msg = _git_config_refusal(args)
+            if msg:
+                return msg
+        if sub == "branch":
+            for a in args:
+                if a in ("-u", "--set-upstream", "--set-upstream-to") or a.startswith(
+                        "--set-upstream-to="):
+                    return _git_refusal("git branch --set-upstream-to", "with push.default="
+                                        "upstream a plain push follows the upstream branch")
+        if sub == "push":
+            if any(_basename(t) in ("xargs", "parallel") for t in argv[:i]):
+                return _unverifiable_push("xargs may append refspecs")
+            found = _push_destinations(args)
+            if isinstance(found, str):
+                return found
+            dests.extend(found)
+        elif (not dashed and i == cmd_index and sub not in _GIT_BUILTINS
+              and sub not in _GIT_EXTERNAL_OK):
+            return _git_refusal(f"git {sub}", "it is not a git builtin, so it may be an alias "
+                                "for push")
+    return dests
+
+
+def _unverifiable(what: str) -> str:
+    return (
+        f"guard: {what}, so the guard cannot see what it runs; refusing. Run the "
+        f"command directly (sh -c '...' is fine), with no stdin script or expansion."
+    )
+
+
+def _env_refusal(args: list[str]) -> str | None:
+    """`env` options: -S (split string), -i / - (clear the environment), -u HERMES_*."""
+    j = 0
+    while j < len(args):
+        a = args[j]
+        if _ASSIGNMENT.match(a):
+            j += 1
+            continue
+        if not a.startswith("-"):
+            return None
+        if a == "-" or a == "--ignore-environment":
+            return _fence_refusal("env -i clears HERMES_* variables")
+        if a.startswith("--split-string"):
+            return _unverifiable("`env -S` re-splits a string into a command")
+        unset = None
+        if a == "--unset" or a == "-u":
+            unset = args[j + 1] if j + 1 < len(args) else ""
+            j += 1
+        elif a.startswith("--unset="):
+            unset = a.split("=", 1)[1]
+        elif not a.startswith("--"):
+            cluster = a[1:]
+            for k, ch in enumerate(cluster):
+                if ch == "S":
+                    return _unverifiable("`env -S` re-splits a string into a command")
+                if ch == "i":
+                    return _fence_refusal("env -i clears HERMES_* variables")
+                if ch in "uC":
+                    value = cluster[k + 1:] or (args[j + 1] if j + 1 < len(args) else "")
+                    if not cluster[k + 1:]:
+                        j += 1
+                    if ch == "u":
+                        unset = value
+                    break
+        if unset is not None and _HERMES_NAME.match(unset):
+            return _fence_refusal(f"env -u {unset}")
+        j += 1
+    return None
+
+
+def _fence_refusal(what: str) -> str:
+    return (
+        f"guard: `{what}` removes or overrides a Hermes fence (HERMES_* variables carry "
+        f"this worker's identity and Hermes' own guards); refusing. A fence that blocks "
+        f"you is a reason to kanban_block(kind=\"needs_input\") and ask, never something "
+        f"to remove."
+    )
+
+
+def _fence(argv: list[str]) -> str | None:
+    for i, tok in enumerate(argv):
+        if _HERMES_ASSIGN.match(tok):
+            return _fence_refusal(tok)
+        base = _basename(tok)
+        if base in _ENV_DECLARERS:
+            for a in argv[i + 1:]:
+                if _HERMES_NAME.match(a):
+                    return _fence_refusal(f"{base} {a}")
+        elif base == "env":
+            msg = _env_refusal(argv[i + 1:])
+            if msg:
+                return msg
+    return None
+
+
+def _shell_bypass(argv: list[str], cmd_index: int | None) -> str | None:
+    if cmd_index is None:
+        return None
+    word = argv[cmd_index]
+    if "$" in word or "`" in word:
+        return _unverifiable(f"the command name `{word}` is a shell expansion")
+    base = _basename(word)
+    rest = argv[cmd_index + 1:]
+    if base in _SHELLS:
+        if _shell_c_script(rest) is None and _shell_reads_stdin(rest):
+            return _unverifiable(f"`{base}` reads its script from stdin or a here-string")
+    elif base in _POWERSHELLS:
+        kind, _ = _powershell_script(rest)
+        if kind in ("stdin", "encoded"):
+            return _unverifiable(f"`{base}` runs an {kind} script")
+    elif base in ("source", "."):
+        if not rest or rest[0].startswith(_STDIN_PATHS):
+            return _unverifiable(f"`{base}` reads its script from stdin or a here-string")
+    else:
+        kind = _interpreter(base)
+        if kind:
+            mode, code = _interpreter_mode(kind, rest)
+            if mode == "stdin":
+                return _unverifiable(f"`{base}` reads its script from stdin or a here-string")
+            if mode == "inline" and code and _SUSPECT_INLINE.search(code):
+                return _unverifiable(f"`{base}` inline code mentions push/merge/kanban/HERMES_")
     return None
 
 
@@ -479,23 +1053,125 @@ class _CardState:
         return self._protected
 
 
-def check_terminal(board: Board, task_id: str | None, command: str) -> str | None:
+def _side_doors(argv: list[str]) -> list[tuple[str, str | None, list[str]]]:
+    """(verb, board named in argv or None, target card ids) for every
+    `hermes [opts] kanban [--board b] <verb> ...` in argv."""
+    out = []
+    for i, tok in enumerate(argv):
+        if _basename(tok) != "hermes":
+            continue
+        rest = argv[i + 1:]
+        if "kanban" not in rest:
+            continue
+        j = rest.index("kanban") + 1
+        board = None
+        while j < len(rest) and rest[j].startswith("-"):
+            if rest[j] == "--board":
+                board = rest[j + 1] if j + 1 < len(rest) else ""
+                j += 2
+                continue
+            if rest[j].startswith("--board="):
+                board = rest[j].split("=", 1)[1]
+            j += 1
+        if j >= len(rest) or rest[j] not in _SIDE_DOOR_VERBS:
+            continue
+        verb, values = rest[j], _SIDE_DOOR_VALUE_OPTS[rest[j]]
+        targets, k, wants_help = [], j + 1, False
+        while k < len(rest):
+            a = rest[k]
+            if a in ("-h", "--help"):
+                wants_help = True
+                break
+            if a == "--":
+                targets.extend(rest[k + 1:])
+                break
+            if a.startswith("-") and len(a) > 1:
+                k += 2 if a in values else 1
+                continue
+            targets.append(a)
+            k += 1
+        if wants_help:
+            continue
+        if verb in _SIDE_DOOR_ONE_TARGET:
+            targets = targets[:1]
+        out.append((verb, board, targets))
+    return out
+
+
+def _check_side_door(verb: str, board: Board, targets: list[str]) -> None:
+    """Refuse a side-door verb unless every TARGET card can be read and is not
+    a dev-team card (and, for unblock, is not waiting on a human)."""
+    if not targets:
+        raise _Refuse(f"guard: cannot tell which card `hermes kanban {verb}` targets; refusing")
+    for target in targets:
+        if not _CARD_ID.match(target):
+            raise _Refuse(
+                f"guard: cannot tell which card `hermes kanban {verb} {target}` targets "
+                f"(not a literal card id); refusing")
+        try:
+            view = board.task(target)
+            if view is None:
+                raise LookupError("not found on the board")
+            stage = stage_from_skills(view.skills)
+        except Exception as exc:
+            raise _Refuse(
+                f"guard: cannot verify card {target} for `hermes kanban {verb}`, refusing "
+                f"({_describe(exc)})") from None
+        if stage is not None:
+            raise _Refuse(
+                f"guard: `hermes kanban {verb}` is not allowed on dev-team card {target}: "
+                f"it would bypass the stage checks. Finish with the kanban_complete tool, "
+                f"or stop with kanban_block.")
+        if verb == "unblock":
+            if view.status is None:
+                raise _Refuse(
+                    f"guard: cannot tell how card {target} is blocked; refusing "
+                    f"`hermes kanban unblock`")
+            if view.status == "blocked" and view.block_kind == "needs_input":
+                raise _Refuse(
+                    f"guard: card {target} is blocked waiting for a human (kind needs_input); "
+                    f"only the operator unblocks it. A fence that blocks you is a reason to "
+                    f"block and ask, never something to remove.")
+
+
+def check_terminal(
+    board: Board, task_id: str | None, command: str,
+    open_board: Callable[[str | None], Board] | None = None,
+) -> str | None:
     """Rules: merge and deploy commands always block; `git push` whose
     destination is the default branch (or cannot be read from argv) always
-    blocks; on a guarded card, `hermes kanban complete|request-changes|edit|
-    unblock|reopen-review` and an unparseable command block too."""
+    blocks, as do git config/alias tricks that could redirect it; commands the
+    guard cannot see into (stdin scripts, expansions as the command name,
+    `env -S`) block; overriding a HERMES_* variable blocks; `hermes kanban
+    complete|request-changes|edit|unblock|reopen-review` blocks when its TARGET
+    card is a dev-team card, cannot be read, or (unblock) waits on a human; on
+    a guarded card an unparseable command blocks too.
+
+    `open_board(name)` opens a board named in argv (`hermes kanban --board`);
+    `board` is used when argv names none, or when no `open_board` is given
+    (`pre_tool_call` always passes one)."""
     try:
-        return _check_terminal(board, task_id, command)
+        return _check_terminal(board, task_id, command, open_board)
     except _Refuse as refusal:
         return str(refusal)
     except Exception as exc:  # fail closed
         return f"guard: cannot check the command, refusing ({_describe(exc)})"
 
 
-def _check_terminal(board, task_id, command):
+def _check_terminal(board, task_id, command, open_board=None):
     if not isinstance(command, str):
         raise _Refuse("guard: terminal command is not a string, refusing")
     card = _CardState(board, task_id)
+
+    # Raw-text rules: things argv does not show.
+    m = _RAW_FENCE.search(command)
+    if m:
+        return _fence_refusal(m.group(0).strip())
+    if _RAW_FUNCTION.search(command):
+        return _unverifiable("the command defines a shell function")
+    if _RAW_SUBST_COMMAND.search(command):
+        return _unverifiable("a command substitution is the command name")
+
     parse_error = None
     try:
         commands = _simple_commands(command)
@@ -503,19 +1179,20 @@ def _check_terminal(board, task_id, command):
         parse_error = exc
         commands = _lenient_commands(command)
 
-    # Always-block rules first: they need no board.
-    for argv in commands:
-        msg = _merge_or_deploy(argv)
-        if msg:
-            return msg
+    # Rules that need no board.
     pushes = []
     for argv in commands:
-        args = _git_push_args(argv)
-        if args is not None:
-            dests = _push_destinations(args)
-            if isinstance(dests, str):
-                return dests
-            pushes.extend(dests)
+        cmd_index = _command_index(argv)
+        for msg in (_fence(argv), _merge_or_deploy(argv), _api_write(argv)):
+            if msg:
+                return msg
+        found = _git_rules(argv, cmd_index)
+        if isinstance(found, str):
+            return found
+        pushes.extend(found)
+        msg = _shell_bypass(argv, cmd_index)
+        if msg:
+            return msg
     if pushes:
         protected = card.protected()
         for dst in pushes:
@@ -531,13 +1208,12 @@ def _check_terminal(board, task_id, command):
             f"({parse_error}); refusing. Quote it so it tokenises."
         )
     for argv in commands:
-        verb = _side_door_verb(argv)
-        if verb and card.guarded():
-            raise _Refuse(
-                f"guard: `hermes kanban {verb}` is not allowed on dev-team card {task_id}: "
-                f"it would bypass the stage checks. Finish with the kanban_complete tool, "
-                f"or stop with kanban_block."
-            )
+        for verb, board_name, targets in _side_doors(argv):
+            if board_name is None or open_board is None:
+                target_board = board
+            else:
+                target_board = open_board(board_name)
+            _check_side_door(verb, target_board, targets)
     return None
 
 
@@ -612,7 +1288,7 @@ def pre_tool_call(tool_name, args, **kw):
             if command is None:
                 return None
             task_id = os.environ.get("HERMES_KANBAN_TASK") or None
-            msg = check_terminal(_make_board(None), task_id, command)
+            msg = check_terminal(_make_board(None), task_id, command, open_board=_make_board)
     except Exception as exc:  # fail closed, with our label rather than Hermes' generic one
         msg = f"guard: {tool_name} check failed, refusing ({_describe(exc)})"
     return _block(msg) if msg else None

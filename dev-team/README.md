@@ -162,17 +162,45 @@ default, so amend only that one field afterward if it differs — never hand-wri
 record. Exit 2 with `"ambiguous: pass --pr-adapter"` means devops decides and re-runs with
 `--pr-adapter`/`--ci-adapter` explicitly.
 
-**Give the team a forge token without merge rights.** The guard blocks known merge and deploy
-commands (`gh pr merge`, `glab mr merge`, `tea pr merge`, `kubectl apply/rollout`, `helm
-upgrade/install`, `terraform apply`, `docker push`, and a `git push` to the default branch) on
-every `terminal` call in a dev-team profile — guarded card or not, and even before any board
-lookup — tokenised, not matched by substring, so it catches shell nesting, `sh -c`, `eval` and
-command substitution too. (Only the `hermes kanban` side-door verbs, like `complete` and
-`request-changes`, are limited to guarded cards.) It is still a best-effort
-guard in front of an irreversible action: **token scope is the real boundary.** Provision the
-forge credential the team authenticates with (via each vendor CLI's own login, or the
-operator's `secret` store) so it cannot merge or deploy at all, independent of anything the
-plugin catches.
+**Branch protection on the default branch is REQUIRED.** Without it, the team's token needs
+write access to push feature branches, and that same access can update the default branch.
+Protect the default branch on the forge (no direct pushes, no force pushes, changes only
+through a reviewed PR) before the first card runs, and give the team a forge token without
+merge rights. Those two settings are the real boundary; the guard below is best-effort.
+
+**What the guard covers.** It checks every `terminal` call in a dev-team profile — guarded
+card or not, and even before any board lookup — tokenised, not matched by substring, so it
+catches shell nesting, `sh -c`, `eval`, aliases and command substitution too. It refuses:
+
+- merge and deploy commands: `gh pr merge`, `glab mr merge`, `tea pr merge`, `gh|glab|tea api`
+  and `curl`/`wget` writes to a `/merge` or `git/refs` endpoint, `kubectl
+  apply|rollout|delete|patch|replace|scale|edit|set image`, `helm
+  upgrade|install|rollback|uninstall`, `terraform apply|destroy`, `docker|podman push`,
+  `docker buildx build|bake --push`;
+- a `git push` to the default branch (normalised the way git resolves it: `heads/main` and
+  `refs/heads/main` are `main`) or to a branch argv cannot name; `git subtree push`, `git
+  send-pack`, `git-push` and other dashed builtins; `git -c` / `--config-env` / `GIT_CONFIG_*`
+  and `git config` writes of `alias.*`, `remote.*`, `push.*`, `branch.*`, `include.*` and
+  `url.*`; `git branch --set-upstream-to`; and a `git` subcommand that is not a builtin
+  (it may be an alias);
+- commands it cannot see into: a script fed to a shell or interpreter on stdin or a
+  here-string (`… | sh`, `bash <<<…`, `python3 - <<EOF`), a command name that is a shell
+  expansion (`$g push …`), `env -S`, shell function definitions, inline interpreter code that
+  mentions push/merge/kanban;
+- removing a fence: `env -u HERMES_*`, `env -i`, `unset HERMES_*`, `HERMES_*=… cmd`,
+  `export HERMES_*=`, and the PowerShell equivalents;
+- `hermes kanban complete|request-changes|edit|unblock|reopen-review` when the **target** card
+  (read from argv, on the board argv names) is a dev-team card or cannot be read, from any
+  caller; and `hermes kanban unblock` of a card blocked with kind `needs_input`, which only the
+  operator may unblock.
+
+**What it does not cover.** Only the `terminal` tool is checked. Tools other than `terminal`
+— code execution (`execute_code`-style tools), file-writing tools that edit `.git/config` or a
+script run later, browser or HTTP tools — are not inspected at all, and neither is git config
+set outside the team (for example a global `push.default=upstream`). Provision the forge
+credential the team authenticates with (via each vendor CLI's own login, or the operator's
+`secret` store) so it cannot merge or deploy at all, independent of anything the plugin
+catches.
 
 ## Running it
 

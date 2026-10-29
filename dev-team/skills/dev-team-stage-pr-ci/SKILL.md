@@ -108,12 +108,13 @@ a different, unguarded profile of that name. If the file is missing or empty,
 ## Irreversible actions
 
 `forge` has no merge or deploy subcommand, by design — you cannot accidentally reach for one.
-The guard additionally blocks `git push` to the project's default branch and known merge/deploy
-CLIs (`gh pr merge`, `glab mr merge`, `tea pr merge`, `kubectl apply/rollout`, `helm upgrade/
-install`, `terraform apply`, `docker push`, and more) on every `terminal` call on this card, and
-on the side-door kanban verbs (`complete`, `request-changes`, `edit`, `unblock`,
-`reopen-review`) run through `hermes kanban` directly instead of the tool. Stop at a ready PR;
-the operator merges.
+The guard additionally blocks `git push` to the project's default branch, known merge/deploy
+CLIs and API calls, git config or aliases that could redirect a push, and scripts it cannot see
+into (a script piped into a shell, a `$var` as the command name, `env -S`), on every `terminal`
+call on this card — see "What the guard covers" in the dev-team README for the full list. It
+also blocks the side-door kanban verbs (`complete`, `request-changes`, `edit`, `unblock`,
+`reopen-review`) run through `hermes kanban` against any dev-team card, whoever runs them. Stop
+at a ready PR; the operator merges.
 
 ## Ending
 

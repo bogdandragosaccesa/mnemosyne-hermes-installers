@@ -25,6 +25,9 @@ class TaskView:
     skills: list[str] = field(default_factory=list)
     parents: list[str] = field(default_factory=list)
     children: list[str] = field(default_factory=list)
+    # None means unknown; the guard treats unknown as "cannot verify".
+    status: str | None = None
+    block_kind: str | None = None
 
 
 class Board(Protocol):
@@ -72,6 +75,8 @@ class KanbanBoard:
                 skills=list(t.skills or []),
                 parents=list(kanban_db.parent_ids(conn, id)),
                 children=list(kanban_db.child_ids(conn, id)),
+                status=getattr(t, "status", None),
+                block_kind=getattr(t, "block_kind", None),
             )
 
     def last_metadata(self, id: str) -> dict | None:
