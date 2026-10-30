@@ -14,7 +14,10 @@ label.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -199,6 +202,14 @@ def _check_green_pr(board, task_id, md, ci_status, pr_status):
             f"pr: not-in-project: {claimed} is not a pull request of project {slug}; its "
             f"forge reports {pr.get('pr_url')!r} for that number"
         )
+    # (a.5) the PR must be open: a closed or merged PR cannot be completed
+    # green even if its head, CI and ready flag all still look fine (#7/N7).
+    state = pr.get("state")
+    if not isinstance(state, str) or state.strip().lower() not in ("open", "opened"):
+        raise _Refuse(
+            f"pr: not-open: {claimed} has state {pr.get('state')!r}, not open/opened; "
+            f"completion with ci=green refused"
+        )
     # (b) the PR's head is the SHA review approved and CI is read for.
     head = pr.get("head_sha")
     if not isinstance(head, str) or not head.lower().startswith(sha.lower()):
@@ -269,18 +280,75 @@ _ALWAYS_BLOCK: dict[str, list[tuple[frozenset[str] | None, frozenset[str]]]] = {
 # Image builders whose `build`/`bake` can push with a flag.
 _IMAGE_BUILDERS = frozenset({"docker", "podman", "buildah", "nerdctl"})
 
-# `hermes kanban <verb>` that would move a card without the `kanban_complete`
-# hook (design: "The terminal is not a side door"), with each verb's options
-# that take a separate value. The target card ids are the positionals.
+# `hermes kanban <verb>` that would move a card (or release a needs_input
+# block) without the `kanban_complete` hook (design: "The terminal is not a
+# side door"). The target card ids are read with Hermes' own `kanban`
+# argparse tree when `hermes_cli` can be imported (`_hermes_kanban_parser`);
+# that is the only way to match argparse's option abbreviations (`--ti` means
+# `--title`) exactly. Without it, `_SIDE_DOOR_VALUE_OPTS`/`_MULTI`/`_FLAG`
+# below are an EXACT allowlist: any `--option` not listed there makes the
+# whole call unparseable, so an abbreviation is refused rather than
+# misread as a bare flag.
+_SIDE_DOOR_VERBS = frozenset({
+    "complete", "request-changes", "edit", "unblock", "reopen-review",
+    "promote", "request-review", "archive", "assign", "reassign", "reclaim",
+    "link", "unlink",
+})
+# Verbs with exactly one target positional (others, like `complete`, take
+# every remaining positional as a target -- see `_SIDE_DOOR_TARGET_ATTRS` and
+# the fallback parser).
+_SIDE_DOOR_ONE_TARGET = frozenset({
+    "request-changes", "edit", "request-review", "promote", "assign", "reassign", "reclaim",
+})
+# Verbs with exactly two positional targets (parent_id, child_id).
+_SIDE_DOOR_TWO_TARGETS = frozenset({"link", "unlink"})
+# Verbs that release a `needs_input` block the same way `unblock` does.
+_SIDE_DOOR_NEEDS_INPUT_VERBS = frozenset({"unblock", "promote"})
+
+# Real-parser path: the argparse attribute(s) holding target card ids, per verb.
+_SIDE_DOOR_TARGET_ATTRS: dict[str, tuple[str, ...]] = {
+    "complete": ("task_ids",),
+    "request-changes": ("task_id",),
+    "edit": ("task_id",),
+    "unblock": ("task_ids",),
+    "reopen-review": ("task_ids",),
+    "promote": ("task_id", "ids"),
+    "request-review": ("task_id",),
+    "archive": ("task_ids", "purge_ids"),
+    "assign": ("task_id",),
+    "reassign": ("task_id",),
+    "reclaim": ("task_id",),
+    "link": ("parent_id", "child_id"),
+    "unlink": ("parent_id", "child_id"),
+}
+# Fallback path: exact long options each verb accepts, by how they consume
+# argv. `_VALUE`: one following word. `_MULTI`: every following word up to
+# the next option (`--ids a b`). `_FLAG`: no value.
 _SIDE_DOOR_VALUE_OPTS: dict[str, frozenset[str]] = {
     "complete": frozenset({"--result", "--summary", "--metadata"}),
     "request-changes": frozenset(),
     "edit": frozenset({"--title", "--body", "--priority", "--result", "--summary", "--metadata"}),
     "unblock": frozenset({"--reason"}),
     "reopen-review": frozenset({"--reason"}),
+    "promote": frozenset(),
+    "request-review": frozenset({"--summary", "--reviewer", "--metadata"}),
+    "archive": frozenset(),
+    "assign": frozenset(),
+    "reassign": frozenset({"--reason"}),
+    "reclaim": frozenset({"--reason"}),
+    "link": frozenset(),
+    "unlink": frozenset(),
 }
-_SIDE_DOOR_VERBS = frozenset(_SIDE_DOOR_VALUE_OPTS)
-_SIDE_DOOR_ONE_TARGET = frozenset({"request-changes", "edit"})
+_SIDE_DOOR_MULTI_OPTS: dict[str, frozenset[str]] = {
+    "promote": frozenset({"--ids"}),
+    "archive": frozenset({"--rm"}),
+}
+_SIDE_DOOR_FLAG_OPTS: dict[str, frozenset[str]] = {
+    "complete": frozenset({"--force"}),
+    "promote": frozenset({"--dry-run", "--json"}),
+    "request-review": frozenset({"--force"}),
+    "reassign": frozenset({"--reclaim"}),
+}
 _CARD_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # Branch names protected even when no project record says otherwise.
@@ -386,8 +454,8 @@ _API_VALUE_OPTS = frozenset({"-X", "--method", "-f", "-F", "--field", "--raw-fie
                              "-R", "--repo", "--cache", "-p", "--preview", "-d", "--data",
                              "--login", "--remote"})
 _API_DATA_OPTS = frozenset({"-f", "-F", "--field", "--raw-field", "--input", "-d", "--data"})
-_MERGE_OR_REF_PATH = re.compile(r"(?:^|/)merges?(?=$|[/?#])|git/refs", re.IGNORECASE)
-_GRAPHQL_WRITE = re.compile(r"merge|updateRefs?|createRef|deleteRef", re.IGNORECASE)
+_MERGE_OR_REF_PATH = re.compile(r"(?:^|/)merges?(?=$|[/?#])|git/refs|/contents/", re.IGNORECASE)
+_GRAPHQL_WRITE = re.compile(r"merge|updateRefs?|createRef|deleteRef|createCommitOnBranch", re.IGNORECASE)
 _CURL_VALUE_OPTS = frozenset({"-X", "--request", "-d", "--data", "--data-raw", "--data-binary",
                               "--data-urlencode", "--json", "-F", "--form", "-T", "--upload-file",
                               "-H", "--header", "-o", "--output", "-u", "--user", "--url",
@@ -395,6 +463,14 @@ _CURL_VALUE_OPTS = frozenset({"-X", "--request", "-d", "--data", "--data-raw", "
                               "-c", "--cookie-jar", "-m", "--max-time", "--connect-timeout"})
 _CURL_DATA_OPTS = frozenset({"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
                              "--json", "-F", "--form", "-T", "--upload-file"})
+# curl short option letters that take a value (joined in the cluster, as in
+# `-sXPUT`, or the next word, as in `-sd '{}'`); every other letter in a
+# cluster is a bare flag (`-s`, `-S`, `-L`, `-k`, `-v`, `-i`, ...).
+_CURL_SHORT_VALUE = frozenset("XdFTHoeAucbm")
+_CURL_SHORT_TO_LONG = {
+    "X": "-X", "d": "-d", "F": "-F", "T": "-T", "H": "-H", "o": "-o", "e": "-e",
+    "A": "-A", "u": "-u", "c": "-c", "b": "-b", "m": "-m",
+}
 
 # Fences: HERMES_* variables carry the worker's identity and Hermes' own
 # guards (HERMES_KANBAN_TASK, HERMES_DELEGATED_CHILD_CONTEXT, ...).
@@ -422,6 +498,17 @@ _PROTECTED_PATHS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"forge\.cmd(?![\w.-])",
     r"dev-team/projects(?![\w.-])",
     r"plugins/dev-team-gate(?![\w.-])",
+))
+# `dev-team/forge` and `dev-team/plugin` are also the real paths of two
+# directories any clone of THIS repo has (the team works on the guard and
+# the forge adapters here), so an unanchored substring match over-blocks
+# ordinary development (N5): a commit message, `git diff -- dev-team/forge/`,
+# `python3 -m unittest discover -s dev-team/forge/tests`, `git add
+# dev-team/plugin/...`. Require a path separator right before the match (an
+# absolute path, `~/...`, `$HOME/...`, `$HERMES_HOME/...`, or any other
+# nested path) so a bare relative word at the start of the argv token is
+# never enough, while `cp x ~/.hermes/dev-team/forge/forge_core.py` still is.
+_PROTECTED_PATHS_ANCHORED = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"dev-team/plugin(?:/|$)",
     r"dev-team/forge(?![\w.-])",
 ))
@@ -778,27 +865,58 @@ def _http_write(base: str, args: list[str]) -> str | None:
                 urls.append(a)
             j += 1
             continue
-        if a.startswith("--") and "=" in a:
-            name, value = a.split("=", 1)
-            joined = True
-        elif a.startswith("-") and not a.startswith("--") and len(a) > 2 and a[:2] in _CURL_VALUE_OPTS:
-            name, value, joined = a[:2], a[2:], True
-        else:
-            name, value, joined = a, (args[j + 1] if j + 1 < len(args) else ""), False
-        if name in ("-X", "--request"):
-            method = value
-        if name in _CURL_DATA_OPTS:
-            data = True
-        if name == "--url":
-            urls.append(value)
-        if name.startswith("-") and len(name) > 1:
-            j += 1 if joined or name not in _CURL_VALUE_OPTS else 2
+        if a.startswith("--"):
+            if "=" in a:
+                name, value = a.split("=", 1)
+            else:
+                name, value = a, (args[j + 1] if j + 1 < len(args) else "")
+            if name in ("-X", "--request"):
+                method = value
+            if name in _CURL_DATA_OPTS:
+                data = True
+            if name == "--url":
+                urls.append(value)
+            j += 1 if "=" in a else (2 if name in _CURL_VALUE_OPTS else 1)
+            continue
+        if a.startswith("-") and len(a) > 1:
+            # A short option cluster, walked letter by letter (`-sXPUT`,
+            # `-sd '{}'`): the first value-taking letter consumes the rest of
+            # the cluster, or the next word when the cluster ends there.
+            consumed_next = False
+            for k, ch in enumerate(a[1:], 1):
+                if ch in _CURL_SHORT_VALUE:
+                    value = a[k + 1:]
+                    if not value and j + 1 < len(args):
+                        value = args[j + 1]
+                        consumed_next = True
+                    name = _CURL_SHORT_TO_LONG[ch]
+                    if name == "-X":
+                        method = value
+                    if name in _CURL_DATA_OPTS:
+                        data = True
+                    break
+            j += 2 if consumed_next else 1
             continue
         urls.append(a)
         j += 1
     writes = method.upper() not in ("GET", "HEAD") if method else data
     if writes and any(_MERGE_OR_REF_PATH.search(u) for u in urls):
         return _merge_label(f"{base} {method or 'POST'} to a merge or git-ref endpoint")
+    return None
+
+
+def _gh_alias_merge(argv: list[str]) -> str | None:
+    """`gh alias set NAME 'pr merge ...'`: the alias body is never run by the
+    guard, so a merge hidden behind an alias name is refused at definition
+    time (N4)."""
+    for i, tok in enumerate(argv):
+        if _basename(tok) != "gh":
+            continue
+        pos = _positional(argv[i + 1:])
+        if pos[:2] == ["alias", "set"] and len(pos) > 2:
+            body = " ".join(pos[3:])
+            if re.search(r"\bpr\s+merge\b", body, re.IGNORECASE):
+                return _merge_label(f"gh alias set {pos[2]} '{body}'")
     return None
 
 
@@ -1092,8 +1210,24 @@ def _shell_bypass(argv: list[str], cmd_index: int | None) -> str | None:
 
 
 def _protected_path(token: str) -> bool:
+    """True when `token` names a path under a trusted location (#4).
+
+    `_PROTECTED_PATHS` matches anywhere (as before): those filenames
+    (`.local/bin/forge`, `forge.cmd`, `dev-team/projects`,
+    `plugins/dev-team-gate`) do not collide with ordinary relative
+    development paths. `_PROTECTED_PATHS_ANCHORED` additionally requires a
+    path separator right before the match, since `dev-team/forge` and
+    `dev-team/plugin` are also real relative paths inside any clone of this
+    repo (N5): see the comment above `_PROTECTED_PATHS_ANCHORED`.
+    """
     text = token.replace("\\", "/")
-    return any(p.search(text) for p in _PROTECTED_PATHS)
+    if any(p.search(text) for p in _PROTECTED_PATHS):
+        return True
+    for pattern in _PROTECTED_PATHS_ANCHORED:
+        for m in pattern.finditer(text):
+            if m.start() > 0 and text[m.start() - 1] == "/":
+                return True
+    return False
 
 
 def _trust_refusal(what: str) -> str:
@@ -1190,54 +1324,164 @@ class _CardState:
         return self._protected
 
 
-def _side_doors(argv: list[str]) -> list[tuple[str, str | None, list[str]]]:
-    """(verb, board named in argv or None, target card ids) for every
-    `hermes [opts] kanban [--board b] <verb> ...` in argv."""
+_KANBAN_ARGPARSER: object = None  # lazily built; False once import fails, None if an argparser
+
+
+def _hermes_kanban_parser():
+    """The real `hermes kanban` argparse tree (`hermes_cli.kanban_parser`),
+    or None when `hermes_cli` (the agent's own CLI) cannot be imported. Built
+    once: a throwaway top-level parser just holds the `kanban` subcommand so
+    `parse_known_args` sees the exact same option abbreviations Hermes does."""
+    global _KANBAN_ARGPARSER
+    if _KANBAN_ARGPARSER is None:
+        try:
+            from hermes_cli import kanban_parser as kp
+        except Exception:
+            _KANBAN_ARGPARSER = False
+        else:
+            top = argparse.ArgumentParser(prog="hermes", add_help=False)
+            kp.build_parser(top.add_subparsers(dest="_cmd"))
+            _KANBAN_ARGPARSER = top
+    return _KANBAN_ARGPARSER or None
+
+
+def _hermes_entry_points(argv: list[str]) -> list[int]:
+    """Index right before `kanban ...` may start: the `hermes` token itself,
+    or the `hermes_cli.main` module name right after `python3 -m` (so
+    `python3 -m hermes_cli.main kanban ...` is covered too)."""
     out = []
     for i, tok in enumerate(argv):
-        if _basename(tok) != "hermes":
+        base = _basename(tok)
+        if base == "hermes":
+            out.append(i)
+        elif _interpreter(base) == "python":
+            for j in range(i + 1, len(argv) - 1):
+                if argv[j] == "-m" and argv[j + 1] == "hermes_cli.main":
+                    out.append(j + 1)
+                    break
+    return out
+
+
+def _side_door_via_real_parser(parser, argv_from_kanban: list[str]):
+    """(verb, board, targets, handled) using Hermes' own argparse tree, or
+    raises _Refuse when the call cannot be parsed at all (fail closed)."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+            ns, _extra = parser.parse_known_args(argv_from_kanban)
+    except SystemExit as exc:
+        if exc.code in (0, None):  # --help or similar: nothing to check
+            return None, None, [], False
+        # A required positional missing (no reason, no task id, ...) is not
+        # an option-abbreviation ambiguity: fall back to the strict allowlist
+        # parse, which still finds the verb and whatever targets ARE given
+        # and fails closed on any option it cannot place exactly.
+        return _side_door_via_fallback(argv_from_kanban)
+    verb = getattr(ns, "kanban_action", None)
+    if verb not in _SIDE_DOOR_VERBS:
+        return None, None, [], False
+    board = getattr(ns, "board", None)
+    targets: list[str] = []
+    for attr in _SIDE_DOOR_TARGET_ATTRS[verb]:
+        value = getattr(ns, attr, None)
+        if value is None:
             continue
+        targets.extend(str(v) for v in value) if isinstance(value, list) else targets.append(str(value))
+    return verb, board, targets, True
+
+
+def _side_door_via_fallback(argv_from_kanban: list[str]):
+    """(verb, board, targets, handled): a strict, exact-allowlist parse used
+    only when `hermes_cli` cannot be imported. Any `--option` not on the
+    verb's exact allowlist makes the call unparseable (raises _Refuse):
+    argparse's abbreviations (`--ti` means `--title`) cannot be replicated
+    here, so an unrecognised option is never assumed to be a bare flag."""
+    rest = argv_from_kanban[1:]  # past "kanban"
+    board = None
+    j = 0
+    while j < len(rest) and rest[j].startswith("-") and rest[j] not in ("-h", "--help"):
+        if rest[j] == "--board":
+            board = rest[j + 1] if j + 1 < len(rest) else ""
+            j += 2
+            continue
+        if rest[j].startswith("--board="):
+            board = rest[j].split("=", 1)[1]
+            j += 1
+            continue
+        raise _Refuse(
+            f"guard: `hermes kanban` option `{rest[j]}` is not on the exact allowlist "
+            f"(Hermes' own parser is unavailable to check it); refusing"
+        )
+    if j >= len(rest):
+        return None, None, [], False
+    verb = rest[j]
+    if verb not in _SIDE_DOOR_VERBS:
+        return None, None, [], False
+    value_opts = _SIDE_DOOR_VALUE_OPTS.get(verb, frozenset())
+    multi_opts = _SIDE_DOOR_MULTI_OPTS.get(verb, frozenset())
+    flag_opts = _SIDE_DOOR_FLAG_OPTS.get(verb, frozenset())
+    targets: list[str] = []
+    k = j + 1
+    while k < len(rest):
+        a = rest[k]
+        if a in ("-h", "--help"):
+            return None, None, [], False
+        if a == "--":
+            targets.extend(rest[k + 1:])
+            break
+        if a.startswith("--"):
+            name = a.split("=", 1)[0]
+            if name in value_opts:
+                k += 1 if "=" in a else 2
+                continue
+            if name in multi_opts:
+                k += 1
+                while k < len(rest) and not rest[k].startswith("-"):
+                    targets.append(rest[k])
+                    k += 1
+                continue
+            if name in flag_opts:
+                k += 1
+                continue
+            raise _Refuse(
+                f"guard: `hermes kanban {verb}` option `{name}` is not on the exact "
+                f"allowlist (Hermes' own parser is unavailable to check an abbreviation "
+                f"like this); refusing"
+            )
+        targets.append(a)
+        k += 1
+    if verb in _SIDE_DOOR_ONE_TARGET:
+        targets = targets[:1]
+    elif verb in _SIDE_DOOR_TWO_TARGETS:
+        targets = targets[:2]
+    return verb, board, targets, True
+
+
+def _side_doors(argv: list[str]) -> list[tuple[str, str | None, list[str]]]:
+    """(verb, board named in argv or None, target card ids) for every
+    `hermes [opts] kanban [--board b] <verb> ...` in argv, `python3 -m
+    hermes_cli.main kanban ...` included. Checks EVERY positional target, not
+    just the first (N1)."""
+    out = []
+    parser = _hermes_kanban_parser()
+    for i in _hermes_entry_points(argv):
         rest = argv[i + 1:]
         if "kanban" not in rest:
             continue
-        j = rest.index("kanban") + 1
-        board = None
-        while j < len(rest) and rest[j].startswith("-"):
-            if rest[j] == "--board":
-                board = rest[j + 1] if j + 1 < len(rest) else ""
-                j += 2
-                continue
-            if rest[j].startswith("--board="):
-                board = rest[j].split("=", 1)[1]
-            j += 1
-        if j >= len(rest) or rest[j] not in _SIDE_DOOR_VERBS:
-            continue
-        verb, values = rest[j], _SIDE_DOOR_VALUE_OPTS[rest[j]]
-        targets, k, wants_help = [], j + 1, False
-        while k < len(rest):
-            a = rest[k]
-            if a in ("-h", "--help"):
-                wants_help = True
-                break
-            if a == "--":
-                targets.extend(rest[k + 1:])
-                break
-            if a.startswith("-") and len(a) > 1:
-                k += 2 if a in values else 1
-                continue
-            targets.append(a)
-            k += 1
-        if wants_help:
-            continue
-        if verb in _SIDE_DOOR_ONE_TARGET:
-            targets = targets[:1]
-        out.append((verb, board, targets))
+        argv_from_kanban = rest[rest.index("kanban"):]
+        if parser is not None:
+            verb, board, targets, handled = _side_door_via_real_parser(parser, argv_from_kanban)
+        else:
+            verb, board, targets, handled = _side_door_via_fallback(argv_from_kanban)
+        if handled:
+            out.append((verb, board, targets))
     return out
 
 
 def _check_side_door(verb: str, board: Board, targets: list[str]) -> None:
-    """Refuse a side-door verb unless every TARGET card can be read and is not
-    a dev-team card (and, for unblock, is not waiting on a human)."""
+    """Refuse a side-door verb unless every TARGET card can be read and is
+    not a dev-team card (and, for `unblock`/`promote`, is not waiting on a
+    human with kind `needs_input`: `promote` is also an unblock)."""
     if not targets:
         raise _Refuse(f"guard: cannot tell which card `hermes kanban {verb}` targets; refusing")
     for target in targets:
@@ -1259,16 +1503,16 @@ def _check_side_door(verb: str, board: Board, targets: list[str]) -> None:
                 f"guard: `hermes kanban {verb}` is not allowed on dev-team card {target}: "
                 f"it would bypass the stage checks. Finish with the kanban_complete tool, "
                 f"or stop with kanban_block.")
-        if verb == "unblock":
+        if verb in _SIDE_DOOR_NEEDS_INPUT_VERBS:
             if view.status is None:
                 raise _Refuse(
                     f"guard: cannot tell how card {target} is blocked; refusing "
-                    f"`hermes kanban unblock`")
+                    f"`hermes kanban {verb}`")
             if view.status == "blocked" and view.block_kind == "needs_input":
                 raise _Refuse(
                     f"guard: card {target} is blocked waiting for a human (kind needs_input); "
-                    f"only the operator unblocks it. A fence that blocks you is a reason to "
-                    f"block and ask, never something to remove.")
+                    f"only the operator releases it (`hermes kanban {verb}` refused). A fence "
+                    f"that blocks you is a reason to block and ask, never something to remove.")
 
 
 def check_terminal(
@@ -1326,7 +1570,7 @@ def _check_terminal(board, task_id, command, open_board=None):
     for argv in commands:
         cmd_index = _command_index(argv)
         for msg in (_fence(argv), _protected_write(argv, cmd_index), _merge_or_deploy(argv),
-                    _api_write(argv)):
+                    _api_write(argv), _gh_alias_merge(argv)):
             if msg:
                 return msg
         found = _git_rules(argv, cmd_index)

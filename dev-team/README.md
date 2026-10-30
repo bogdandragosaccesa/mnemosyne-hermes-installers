@@ -179,19 +179,40 @@ if that ref is missing). Never hand-edit the record. `detect` refuses to overwri
 record unless the operator passes `--force`. Exit 2 with `"ambiguous: pass --pr-adapter"`
 means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly.
 
-**Branch protection on the default branch is REQUIRED.** Without it, the team's token needs
-write access to push feature branches, and that same access can update the default branch.
-Protect the default branch on the forge (no direct pushes, no force pushes, changes only
-through a reviewed PR) before the first card runs, and give the team a forge token without
-merge rights. Those two settings are the real boundary; the guard below is best-effort.
+**The terminal guard is a seatbelt against mistakes, not a security boundary.** It reads
+shell commands as text — tokenised, not matched by substring, so it catches shell nesting,
+`sh -c`, `eval`, aliases and command substitution — but text analysis of a command string can
+never be a complete barrier against a determined or merely creative agent. Treat every refusal
+below as "this mistake is now hard to make by accident", not as "this is impossible".
+
+**Required controls (the real boundary).** These are the operator's responsibility, not the
+plugin's, and the pipeline is not safe to run without them:
+
+- **Branch protection on the default branch, with no bypass.** No direct pushes, no force
+  pushes, changes only through a reviewed PR, and no "administrators can bypass" exception —
+  a bypass available to anyone is available to an agent that finds it.
+- **A team forge token without merge rights.** A bot account scoped to open PRs and push
+  feature branches, never one that can merge or push to the default branch. Provision it via
+  each vendor CLI's own login or the operator's `secret` store, independent of anything the
+  plugin catches.
+- **`forge/`, the plugin, the project records and `kanban.db` owned by the operator and
+  read-only to the agents' user.** The guard trusts `dev-team/forge/` (the CI/PR adapters it
+  imports), the `dev-team-gate` plugin (including its symlink in each profile) and
+  `$HERMES_HOME/dev-team/projects/*.json` (the project records: `default_branch`, forge
+  adapters, CI hints) to decide what "the default branch" and "green CI" even mean. Anything
+  that can write those files as the agents' own user can rewrite those decisions, and no text
+  check from inside the same process can defend against that — OS-level read-only permissions
+  (or a sandboxed agents' user) are what actually stop it. Running the agents' user and the
+  operator's own shell as the same OS user defeats this regardless of what the guard refuses.
 
 **What the guard covers.** It checks every `terminal` call in a dev-team profile — guarded
-card or not, and even before any board lookup — tokenised, not matched by substring, so it
-catches shell nesting, `sh -c`, `eval`, aliases and command substitution too. It refuses:
+card or not, and even before any board lookup. It refuses:
 
 - merge and deploy commands: `gh pr merge`, `glab mr merge`, `tea pr merge`, `gh|glab|tea api`
-  and `curl`/`wget` writes to a `/merge` or `git/refs` endpoint, `kubectl
-  apply|rollout|delete|patch|replace|scale|edit|set image`, `helm
+  and `curl`/`wget` writes to a `/merge`, `git/refs` or `/contents/` endpoint (walking `curl`'s
+  short-option clusters letter by letter, e.g. `-sXPUT`), a `gh api graphql` mutation that
+  merges or rewrites a ref (including `createCommitOnBranch`), `gh alias set` whose body
+  contains `pr merge`, `kubectl apply|rollout|delete|patch|replace|scale|edit|set image`, `helm
   upgrade|install|rollback|uninstall`, `terraform apply|destroy`, `docker|podman push`,
   `docker buildx build|bake --push`;
 - a `git push` to the default branch (normalised the way git resolves it: `heads/main` and
@@ -206,18 +227,35 @@ catches shell nesting, `sh -c`, `eval`, aliases and command substitution too. It
   mentions push/merge/kanban;
 - removing a fence: `env -u HERMES_*`, `env -i`, `unset HERMES_*`, `HERMES_*=… cmd`,
   `export HERMES_*=`, and the PowerShell equivalents;
-- `hermes kanban complete|request-changes|edit|unblock|reopen-review` when the **target** card
-  (read from argv, on the board argv names) is a dev-team card or cannot be read, from any
-  caller; and `hermes kanban unblock` of a card blocked with kind `needs_input`, which only the
-  operator may unblock.
+- `hermes kanban complete|request-changes|edit|unblock|reopen-review|promote|request-review|
+  archive|assign|reassign|reclaim|link|unlink`, in any form (including `python3 -m
+  hermes_cli.main kanban …`), when **any** target card (every positional, parsed with Hermes'
+  own `kanban` argparse tree so an abbreviated option like `--ti` cannot shift the target) is a
+  dev-team card or cannot be read, from any caller; `hermes kanban unblock|promote` of a card
+  blocked with kind `needs_input` additionally refuses regardless of whether that card is a
+  dev-team card at all, since `promote` is also an unblock and only the operator releases a
+  `needs_input` block.
 
-**What it does not cover.** Only the `terminal` tool is checked. Tools other than `terminal`
-— code execution (`execute_code`-style tools), file-writing tools that edit `.git/config` or a
-script run later, browser or HTTP tools — are not inspected at all, and neither is git config
-set outside the team (for example a global `push.default=upstream`). Provision the forge
-credential the team authenticates with (via each vendor CLI's own login, or the operator's
-`secret` store) so it cannot merge or deploy at all, independent of anything the plugin
-catches.
+**Known uncovered classes (not fixed, by design).** These remain open; do not rely on the
+guard for them:
+
+- **Writes to git config files.** `.git/config`, `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
+  and `.git/hooks/*` can redirect a `git push` or define an alias just as effectively as `git
+  config`/`git -c`, but an ordinary file write to those paths (`printf … >> .git/config`, a
+  text editor, `sed -i`) is not inspected.
+- **Relative-path writes to a trusted location.** The guard's own protected-path check only
+  fires on an absolute-looking path (`/…`, `~/…`, `$HOME/…`, `$HERMES_HOME/…`); `cd
+  $HERMES_HOME/dev-team && echo '{}' > projects/widgets.json` reaches the same file through a
+  relative path and is not caught (this is also why `dev-team/forge/` and `dev-team/plugin/`
+  are only refused when they appear after a path separator, not as a bare relative word — see
+  the guard's own `_protected_path`, which exists so ordinary work on *this* repository, like
+  `git diff -- dev-team/forge/` or `git add dev-team/plugin/dev-team-gate/guard.py`, is not
+  itself blocked).
+- **Script files.** `sh p.sh`, `python3 script.py`, `./run.sh` run whatever the file contains
+  with no inspection at all; only a stdin script or a `-c`/`-e` inline script is checked.
+- **Non-terminal tools.** Only the `terminal` tool is checked. Code execution
+  (`execute_code`-style tools), file-writing tools, browser or HTTP tools, and any MCP tool
+  that is not `terminal` or `kanban_complete` are not inspected at all.
 
 ## Running it
 
