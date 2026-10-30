@@ -230,7 +230,9 @@ card or not, and even before any board lookup. It refuses:
 - `hermes kanban complete|request-changes|edit|unblock|reopen-review|promote|request-review|
   archive|assign|reassign|reclaim|link|unlink`, in any form (including `python3 -m
   hermes_cli.main kanban …`), when **any** target card (every positional, parsed with Hermes'
-  own `kanban` argparse tree so an abbreviated option like `--ti` cannot shift the target) is a
+  own `kanban` argparse tree when `hermes_cli` can be imported, so an abbreviated option like
+  `--ti` cannot shift the target; otherwise with a strict fallback that refuses any option not
+  on an exact allowlist) is a
   dev-team card or cannot be read, from any caller; `hermes kanban unblock|promote` of a card
   blocked with kind `needs_input` additionally refuses regardless of whether that card is a
   dev-team card at all, since `promote` is also an unblock and only the operator releases a
@@ -243,14 +245,17 @@ guard for them:
   and `.git/hooks/*` can redirect a `git push` or define an alias just as effectively as `git
   config`/`git -c`, but an ordinary file write to those paths (`printf … >> .git/config`, a
   text editor, `sed -i`) is not inspected.
-- **Relative-path writes to a trusted location.** The guard's own protected-path check only
-  fires on an absolute-looking path (`/…`, `~/…`, `$HOME/…`, `$HERMES_HOME/…`); `cd
-  $HERMES_HOME/dev-team && echo '{}' > projects/widgets.json` reaches the same file through a
-  relative path and is not caught (this is also why `dev-team/forge/` and `dev-team/plugin/`
-  are only refused when they appear after a path separator, not as a bare relative word — see
-  the guard's own `_protected_path`, which exists so ordinary work on *this* repository, like
-  `git diff -- dev-team/forge/` or `git add dev-team/plugin/dev-team-gate/guard.py`, is not
-  itself blocked).
+- **Relative-path writes to a trusted location.** The protected-path check is text matching on
+  each argv word. `.local/bin/forge`, `forge.cmd`, `dev-team/projects` and
+  `plugins/dev-team-gate` are refused wherever they appear. `dev-team/forge` and
+  `dev-team/plugin` are refused only when a path separator precedes them, so a bare relative
+  word such as `git diff -- dev-team/forge/` stays allowed for ordinary work on *this*
+  repository. Two consequences follow:
+  - `cd $HERMES_HOME/dev-team && echo '{}' > projects/widgets.json` reaches a protected file
+    through a relative path and is not caught.
+  - Ordinary paths written with a separator in front, such as `./dev-team/forge/` or an
+    absolute path into a clone of this repository, are refused even though they are harmless.
+    Use the bare relative form.
 - **Script files.** `sh p.sh`, `python3 script.py`, `./run.sh` run whatever the file contains
   with no inspection at all; only a stdin script or a `-c`/`-e` inline script is checked.
 - **Non-terminal tools.** Only the `terminal` tool is checked. Code execution

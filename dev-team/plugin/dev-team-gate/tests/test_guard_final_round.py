@@ -46,11 +46,19 @@ class SideDoorParserTests(_Base):
         # value; the real target is the second positional, t_impl1.
         self.refused("hermes kanban edit --ti t_misc t_impl1")
 
+    @unittest.skipUnless(guard_mod._hermes_kanban_parser(),
+                         "hermes_cli not importable; the fallback parser refuses abbreviations")
     def test_abbreviated_option_target_still_allowed_when_real_target_unguarded(self):
-        # Same abbreviation, but the real target (second positional) is the
-        # unguarded t_misc card: must be allowed, proving the guard reads
-        # the correct (second) positional rather than the first.
+        # With Hermes' own parser, --ti expands to --title and consumes
+        # t_impl1 as its value, so the real target is the unguarded t_misc:
+        # allowed, proving the guard reads the correct (second) positional.
         self.allowed("hermes kanban edit --ti t_impl1 t_misc")
+
+    def test_fallback_parser_refuses_abbreviated_option(self):
+        # Without hermes_cli (the CI case) the guard cannot know how Hermes
+        # would expand an abbreviation, so it must refuse rather than guess.
+        with mock.patch.object(guard_mod, "_hermes_kanban_parser", return_value=None):
+            self.refused("hermes kanban edit --ti t_impl1 t_misc")
 
     def test_promote_refused_on_guarded_card(self):
         self.refused("hermes kanban promote t_impl1")
