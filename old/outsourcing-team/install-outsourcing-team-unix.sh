@@ -115,7 +115,7 @@ selected() {
 
 command -v hermes >/dev/null 2>&1 || {
     echo "hermes not found on PATH." >&2
-    echo "Install Hermes and Mnemosyne first: ../install-mnemosyne-hermes-unix.sh" >&2
+    echo "Install Hermes and Mnemosyne first: ../../install-mnemosyne-hermes-unix.sh" >&2
     echo "If it is installed, add ~/.local/bin to PATH." >&2
     exit 1
 }
@@ -149,7 +149,7 @@ MNEMO_HOME="${MNEMOSYNE_HOME:-$HERMES_ROOT/mnemosyne}"
 
 if [[ ! -d $PLUGIN_SRC ]]; then
     echo "Mnemosyne plugin not found at $PLUGIN_SRC." >&2
-    echo "Run ../install-mnemosyne-hermes-unix.sh first." >&2
+    echo "Run ../../install-mnemosyne-hermes-unix.sh first." >&2
     exit 1
 fi
 
@@ -160,7 +160,7 @@ fi
 PROVIDER="$(hermes config get memory.provider 2>/dev/null || true)"
 if [[ $PROVIDER != mnemosyne ]]; then
     echo "memory.provider on the root profile is '${PROVIDER:-unset}', not 'mnemosyne'." >&2
-    echo "Run ../install-mnemosyne-hermes-unix.sh --disable-builtin-memory first," >&2
+    echo "Run ../../install-mnemosyne-hermes-unix.sh --disable-builtin-memory first," >&2
     echo "so the profiles clone a config that already points at Mnemosyne." >&2
     exit 1
 fi
