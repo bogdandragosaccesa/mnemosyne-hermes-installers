@@ -10,7 +10,9 @@ the outbound request; everything printed is redacted first.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import os
 import socket
 import sys
 import urllib.error
@@ -35,9 +37,18 @@ DEFAULT_MODELS = {
     "decide": "liquid/d1.1",
     "extract": "scaledown/extract",
     "summarize": "scaledown/summarize",
+    "tier": "liquid/d1.1",
 }
 
 TIMEOUT_S = 60.0
+
+# Plan-stage tier rule (design, "Plan-stage tier proposal"). Consequence of
+# missing the threshold either way: too low sends an uncertain card to a
+# cheaper model and costs a rework round; too high escalates a routine card
+# and costs money. 0.65 is a starting value, not a calibrated one -- the
+# spike's evidence for it is weak (see PROBES.md).
+TIER_CONFIDENT = 0.65
+TIERS = ("fast", "standard", "deep")
 
 
 class DecidersError(Exception):
@@ -98,6 +109,83 @@ def urllib_transport(url: str, headers: dict, body: dict, timeout: float) -> dic
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise DecidersError("deciders: bad-response", str(exc)) from exc
+
+
+def ledger_path(home: Path) -> Path:
+    """Shared spend ledger, under the team home (not per-profile)."""
+    return home / "dev-team" / "deciders-ledger.jsonl"
+
+
+def append_ledger(
+    home: Path, env: Mapping[str, str], subcommand: str, model: str, cost: float
+) -> None:
+    """Append one spend record as a single atomic write() of one JSON line.
+
+    Opened with ``O_APPEND`` and written in one ``os.write`` call so
+    concurrent appenders (multiple profiles, multiple processes) each land
+    a whole, valid line -- never an interleaved partial write.
+    """
+    record = {
+        "ts": datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z"),
+        "board": env.get("HERMES_KANBAN_BOARD") or None,
+        "task_id": env.get("HERMES_KANBAN_TASK") or None,
+        "subcommand": subcommand,
+        "model": model,
+        "cost": cost,
+    }
+    path = ledger_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(record) + "\n").encode("utf-8")
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def choose_tier(probabilities) -> str:
+    """The plan's tier rule: top prob >= TIER_CONFIDENT wins outright;
+    otherwise uncertainty resolves to the larger of the two leading tiers.
+
+    Never guesses: an unknown option or probabilities that don't sum to
+    about 1 is a `bad-response`, not a tier (Review Focus item 4).
+    """
+    if not isinstance(probabilities, dict) or set(probabilities.keys()) != set(TIERS):
+        raise DecidersError("deciders: bad-response", "unknown tier option(s)")
+    values = list(probabilities.values())
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values):
+        raise DecidersError("deciders: bad-response", "probability is not a number")
+    total = sum(values)
+    if abs(total - 1.0) > 0.02:
+        raise DecidersError(
+            "deciders: bad-response", f"probabilities sum to {total}, not 1"
+        )
+
+    top_tier = max(TIERS, key=lambda t: probabilities[t])
+    if probabilities[top_tier] >= TIER_CONFIDENT:
+        return top_tier
+
+    leading_two = sorted(TIERS, key=lambda t: probabilities[t], reverse=True)[:2]
+    return max(leading_two, key=TIERS.index)
+
+
+def _tier_override(home: Path, tier: str):
+    """({provider, model}, None) from model-tiers.json, or (None, reason)."""
+    path = home / "dev-team" / "model-tiers.json"
+    try:
+        text = path.read_text()
+    except OSError:
+        return None, "no tier table"
+    try:
+        table = json.loads(text)
+    except json.JSONDecodeError:
+        return None, "no tier table"
+    entry = table.get(tier) if isinstance(table, dict) else None
+    if entry is None:
+        return None, f"no entry for {tier}"
+    return entry, None
 
 
 def scrub(text: str, key: str | None) -> str:
@@ -234,10 +322,53 @@ def _cmd_summarize(args, key: str, transport: Transport) -> dict:
     }
 
 
+def _cmd_tier(args, key: str, transport: Transport) -> dict:
+    spec_text = _read_text(args.spec)[:20000]
+    model = args.model or DEFAULT_MODELS["tier"]
+    state = {"title": args.title, "spec": spec_text}
+    questions = [
+        {
+            "id": "tier",
+            "type": "choice",
+            "instructions": (
+                "Which model tier does this software task need to be done "
+                "right the first time?"
+            ),
+            "criteria": {
+                "fast": "mechanical moves, renames, small doc edits",
+                "standard": "routine implementation from a precise spec",
+                "deep": (
+                    "security-sensitive code, subtle failure handling, or "
+                    "design judgment the spec leaves open"
+                ),
+            },
+        }
+    ]
+    body = {"model": model, "state": state, "questions": questions}
+    data = _require_dict(_call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S))
+
+    answers = data.get("answers")
+    resp_model = data.get("model")
+    if not isinstance(answers, dict) or not isinstance(resp_model, str):
+        raise DecidersError("deciders: bad-response")
+    answer = answers.get("tier")
+    if not isinstance(answer, dict):
+        raise DecidersError("deciders: bad-response")
+    probabilities = answer.get("probabilities")
+    tier = choose_tier(probabilities)
+    return {
+        "tier": tier,
+        "probabilities": probabilities,
+        "model": resp_model,
+        "cost": _cost(data),
+    }
+
+
 _DISPATCH = {
     "decide": _cmd_decide,
     "extract": _cmd_extract,
     "summarize": _cmd_summarize,
+    "tier": _cmd_tier,
 }
 
 
@@ -258,6 +389,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_summarize = sub.add_parser("summarize")
     p_summarize.add_argument("--input")
     p_summarize.add_argument("--model")
+
+    p_tier = sub.add_parser("tier")
+    p_tier.add_argument("--title", required=True)
+    p_tier.add_argument("--spec", required=True)
+    p_tier.add_argument("--model")
 
     return parser
 
@@ -283,6 +419,10 @@ def main(
             raise DecidersError("deciders: no-key")
         handler = _DISPATCH[args.command]
         result = handler(args, key, transport)
+        if args.command == "tier":
+            override, override_reason = _tier_override(home, result["tier"])
+            result = dict(result, override=override, override_reason=override_reason)
+        append_ledger(home, env, args.command, result["model"], result["cost"])
     except Exception as exc:  # catch-all: never let an exception escape unredacted
         _emit(out, {"error": scrub(str(exc), key)})
         return EXIT_UNANSWERED
