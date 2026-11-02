@@ -151,6 +151,84 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertFalse((self.root / "profiles").exists())
         self.assertFalse((self.home / ".local" / "bin" / "forge").exists())
 
+    def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
+        # Without `secret` on PATH the installer used to say "add
+        # OPENROUTER_DECIDERS_KEY to each profile's .env" -- eight plaintext
+        # copies of the key for the default team.
+        no_secret_bin = self.tmp / "no-secret-bin"
+        no_secret_bin.mkdir()
+        for name in ("hermes",):
+            src = Path(self.env["PATH"].split(":")[0]) / name
+            dst = no_secret_bin / name
+            shutil.copy(src, dst)
+            dst.chmod(dst.stat().st_mode | stat.S_IXUSR)
+        proc = self.install(PATH=f"{no_secret_bin}:/usr/bin:/bin")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn(".env", proc.stdout)
+        self.assertIn("OPENROUTER_DECIDERS_KEY", proc.stdout)
+
+    def test_M8_refuses_an_empty_model_with_a_colon(self):
+        # "--tier-fast anthropic:" has a colon (passes the PROVIDER:MODEL
+        # shape check) but an empty model -- must not silently write
+        # {"provider": "anthropic", "model": ""} to model-tiers.json.
+        proc = self.install("--tier-fast", "anthropic:")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--tier-fast", proc.stderr)
+        self.assertFalse((self.root / "dev-team" / "model-tiers.json").exists())
+
+    def test_refuses_a_decisions_only_model_as_a_tier(self):
+        # liquid/d1.1 and pplx-decider only answer /api/alpha/decisions; an
+        # agent worker on a card routed to one of them cannot run at all.
+        for flag, value in (("--tier-fast", "openrouter:liquid/d1.1"),
+                            ("--tier-standard", "openrouter:perplexity/pplx-decider-v1.2"),
+                            ("--tier-deep", "openrouter:liquid/d1.1-20261027")):
+            with self.subTest(flag=flag):
+                proc = self.install(flag, value)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("decisions-only", proc.stderr)
+                self.assertIn(flag, proc.stderr)
+                self.assertFalse((self.root / "profiles").exists())
+                self.assertFalse((self.root / "dev-team" / "model-tiers.json").exists())
+
+    def test_I3_refuses_additional_decision_models_and_the_pplx_family(self):
+        for flag, value in (
+            ("--tier-fast", "typesafe:jev-1.13"),
+            ("--tier-standard", "upstage:solar-decide-flash"),
+            ("--tier-deep", "perplexity:pplx-decider-v2"),  # family, not just v1.2
+        ):
+            with self.subTest(flag=flag, value=value):
+                proc = self.install(flag, value)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("decisions-only", proc.stderr)
+
+    def test_I3_refuses_a_variant_suffix_on_a_decision_model(self):
+        proc = self.install("--tier-fast", "openrouter:liquid/d1.1:nitro")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("decisions-only", proc.stderr)
+
+    def test_I3_refuses_a_decisions_only_model_via_the_model_flag(self):
+        # self.install() always prepends --skip-model (which contradicts
+        # --model), so invoke the installer directly here.
+        proc = subprocess.run(
+            ["bash", str(INSTALLER), "--model", "liquid/d1.1"],
+            env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("decisions-only", proc.stderr)
+        self.assertIn("--model", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_default_fast_tier_is_a_chat_model(self):
+        proc = self.install("--only", "pm")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        import json
+        table = json.loads((self.root / "dev-team" / "model-tiers.json").read_text())
+        self.assertEqual(table["fast"], {"provider": "anthropic", "model": "claude-haiku-4-5"})
+
+    def test_help_does_not_suggest_a_decisions_model_for_a_tier(self):
+        proc = self.install("--help")
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("liquid", proc.stdout)
+
     def test_only_installs_the_named_roles(self):
         proc = self.install("--only", "qa,devops")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

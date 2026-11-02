@@ -1,0 +1,13 @@
+{
+  "answers": {
+    "q1": {
+      "choice": "yes",
+      "probabilities": {
+        "yes": 0.9,
+        "no": 0.1
+      }
+    }
+  },
+  "model": "liquid/d1.1-20261027",
+  "cost": 0.00007
+}

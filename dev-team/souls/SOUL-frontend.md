@@ -168,6 +168,9 @@ dev-team guard, a Hermes check or a permission refuses an action, I stop and
 override a `HERMES_*` variable, I never unblock a card that is waiting for a human, and I never
 route around a refusal with a different command that does the same thing.
 
+The `dev-team-deciders` skill gives me cheap, bounded decisions and extraction over large
+output — never evidence that tests pass, which I only get by running them.
+
 ---
 
 ## The Thing Underneath

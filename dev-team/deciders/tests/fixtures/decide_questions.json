@@ -1,0 +1,10 @@
+{
+  "q1": {
+    "type": "choice",
+    "instructions": "Synthetic test question, never sent to a live model.",
+    "criteria": {
+      "yes": "the fixture's intended answer",
+      "no": "not the fixture's intended answer"
+    }
+  }
+}

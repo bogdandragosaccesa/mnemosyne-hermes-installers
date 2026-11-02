@@ -30,6 +30,9 @@ jobs:
       - name: dev-team-gate unit tests
         run: python3 -m unittest discover -s dev-team/plugin/dev-team-gate/tests
 
+      - name: deciders unit tests
+        run: python3 -m unittest discover -s dev-team/deciders/tests
+
   install-linux:
     runs-on: ubuntu-latest
     steps:
@@ -43,6 +46,8 @@ jobs:
 
       - name: Install Mnemosyne memory
         run: ./install-mnemosyne-hermes-unix.sh --disable-builtin-memory
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Create qa collision canary (old-team profile name)
         run: hermes profile create qa --clone
@@ -132,6 +137,8 @@ jobs:
       - name: Install Mnemosyne memory
         shell: pwsh
         run: .\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Create qa collision canary (old-team profile name)
         shell: pwsh
@@ -199,6 +206,8 @@ jobs:
       - name: Install Mnemosyne memory
         shell: powershell
         run: .\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Runs under Windows PowerShell 5.1
         shell: powershell

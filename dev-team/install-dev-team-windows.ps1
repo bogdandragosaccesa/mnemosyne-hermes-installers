@@ -45,6 +45,20 @@
 .PARAMETER DryRun
     Print what would happen and change nothing.
 
+.PARAMETER TierFast
+    deciders tier table entry for the fast tier, as PROVIDER:MODEL (e.g.
+    anthropic:claude-haiku-4-5). Default: $FastModel split on its first '/'.
+    Every -Tier* model must be a chat model an agent can run on; a
+    decisions-only model is refused.
+
+.PARAMETER TierStandard
+    deciders tier table entry for the standard tier. Default: $MidModel
+    split on its first '/'.
+
+.PARAMETER TierDeep
+    deciders tier table entry for the deep tier. Default: $FrontierModel
+    split on its first '/'.
+
 .EXAMPLE
     .\install-dev-team-windows.ps1
 
@@ -60,7 +74,10 @@ param(
     [switch]   $SkipModel,
     [switch]   $KeepSoul,
     [switch]   $SeparateMemory,
-    [switch]   $DryRun
+    [switch]   $DryRun,
+    [string]   $TierFast,
+    [string]   $TierStandard,
+    [string]   $TierDeep
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,6 +90,10 @@ $ErrorActionPreference = 'Stop'
 # added: their cost is out of all proportion to the work these profiles do.
 $FrontierModel = 'anthropic/claude-opus-5'
 $MidModel      = 'anthropic/claude-sonnet-5'
+# Default for the deciders tier table's fast tier only (no profile uses it).
+# Must be a chat model an agent worker can run on: never a decisions-only
+# model such as deciders' own tier/decide models (see DECISION_MODELS).
+$FastModel     = 'anthropic/claude-haiku-4-5'
 $ModelExplicit = $PSBoundParameters.ContainsKey('Model')
 # The profile a human talks to. It gets the pipeline-orchestration skill and
 # the budget script; every other profile is a worker the dispatcher spawns.
@@ -88,12 +109,110 @@ if (-not $Prefix -or $Prefix -notmatch '^[a-zA-Z0-9_-]+$') {
     exit 2
 }
 
+function Split-TierPM {
+    <#
+      Splits "$Value" on its FIRST ':' into a two-element array
+      (provider, model). Exits 2, naming $FlagName, when there is no ':' -
+      same contract as the Unix installer's --tier-* flags.
+    #>
+    param([string] $Value, [string] $FlagName)
+    if ($Value -notmatch ':') {
+        [Console]::Error.WriteLine("$FlagName must be PROVIDER:MODEL (got '$Value')")
+        exit 2
+    }
+    $idx = $Value.IndexOf(':')
+    return @($Value.Substring(0, $idx), $Value.Substring($idx + 1))
+}
+
+function Split-ProviderModel {
+    <# Splits "$Value" (e.g. $MidModel) on its first '/' into (provider, model). #>
+    param([string] $Value)
+    $idx = $Value.IndexOf('/')
+    if ($idx -lt 0) { return @($Value, '') }
+    return @($Value.Substring(0, $idx), $Value.Substring($idx + 1))
+}
+
+# deciders tier table. -TierFast/-TierStandard/-TierDeep default from
+# $FastModel/$MidModel/$FrontierModel, split on their first '/'.
+if ($PSBoundParameters.ContainsKey('TierFast')) {
+    $parts = Split-TierPM $TierFast '-TierFast'
+    $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
+} else {
+    $parts = Split-ProviderModel $FastModel
+    $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
+}
+
+if ($PSBoundParameters.ContainsKey('TierStandard')) {
+    $parts = Split-TierPM $TierStandard '-TierStandard'
+    $TierStandardProvider = $parts[0]; $TierStandardModel = $parts[1]
+} else {
+    $parts = Split-ProviderModel $MidModel
+    $TierStandardProvider = $parts[0]; $TierStandardModel = $parts[1]
+}
+
+if ($PSBoundParameters.ContainsKey('TierDeep')) {
+    $parts = Split-TierPM $TierDeep '-TierDeep'
+    $TierDeepProvider = $parts[0]; $TierDeepModel = $parts[1]
+} else {
+    $parts = Split-ProviderModel $FrontierModel
+    $TierDeepProvider = $parts[0]; $TierDeepModel = $parts[1]
+}
+
 $ScriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SoulsDir       = Join-Path $ScriptDir 'souls'
 $SkillsDir      = Join-Path $ScriptDir 'skills'
 $PluginSrcGate  = Join-Path $ScriptDir 'plugin\dev-team-gate'
 $ForgePy        = Join-Path $ScriptDir 'forge\forge.py'
 $KanbanBudgetPy = Join-Path $ScriptDir 'scripts\kanban-budget.py'
+$DecidersPy       = Join-Path $ScriptDir 'deciders\deciders.py'
+$DecidersSkillDir = Join-Path $SkillsDir 'dev-team-deciders'
+
+# Refuse a decisions-only model in the tier table before anything is
+# written: an agent worker on a card routed to it could not run at all. The
+# list is deciders_core.py's one-line DECISION_MODELS tuple, so it has one
+# owner; a dated variant ("<id>-20261027") is refused too. Two Join-Paths
+# rather than one backslash path, so the check also runs under pwsh on Linux.
+$DecidersCorePy = Join-Path (Join-Path $ScriptDir 'deciders') 'deciders_core.py'
+$DecisionModels = @()
+if (Test-Path -LiteralPath $DecidersCorePy) {
+    $line = Get-Content -LiteralPath $DecidersCorePy | Where-Object { $_ -like 'DECISION_MODELS = (*' } | Select-Object -First 1
+    if ($line) { $DecisionModels = @([regex]::Matches($line, '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value }) }
+}
+if ($DecisionModels.Count -eq 0) {
+    [Console]::Error.WriteLine("cannot read DECISION_MODELS from $DecidersCorePy")
+    exit 2
+}
+function Assert-NotDecisionModel {
+    param([string] $FlagName, [string] $Provider, [string] $ModelId)
+    # Strip an OpenRouter ":variant" suffix, e.g. "<provider>/<model>:nitro"
+    # (OpenRouter's variant syntax), before comparing, same as
+    # deciders_core.py's _is_decision_model.
+    $bareModel = $ModelId.Split(':')[0]
+    foreach ($m in $DecisionModels) {
+        foreach ($candidate in @($bareModel, "$Provider/$bareModel")) {
+            $isMatch = $false
+            if ($m.EndsWith('*')) {
+                # A family prefix entry, e.g. "perplexity/pplx-decider-*".
+                $prefix = $m.Substring(0, $m.Length - 1)
+                $isMatch = $candidate.StartsWith($prefix)
+            } else {
+                $isMatch = ($candidate -eq $m -or $candidate.StartsWith("$m-"))
+            }
+            if ($isMatch) {
+                [Console]::Error.WriteLine("$FlagName $Provider`:$ModelId is a decisions-only model (it only answers /api/alpha/decisions); an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5.")
+                exit 2
+            }
+        }
+    }
+}
+Assert-NotDecisionModel '-TierFast' $TierFastProvider $TierFastModel
+Assert-NotDecisionModel '-TierStandard' $TierStandardProvider $TierStandardModel
+Assert-NotDecisionModel '-TierDeep' $TierDeepProvider $TierDeepModel
+# I3: -Model sets every profile's own model; it must be refused the same
+# way a decisions-only tier-table entry is, or an agent worker ends up
+# unable to run at all.
+$ModelParts = Split-ProviderModel $Model
+Assert-NotDecisionModel '-Model' $ModelParts[0] $ModelParts[1]
 
 # Profile name -> the description the kanban decomposer routes tasks on.
 # Ordered so the output prints in a stable order. Kept in lockstep with the
@@ -111,6 +230,8 @@ $Profiles = [ordered]@{
 
 if (-not (Test-Path -LiteralPath $PluginSrcGate)) { Write-Error "Missing $PluginSrcGate"; exit 1 }
 if (-not (Test-Path -LiteralPath $ForgePy))       { Write-Error "Missing $ForgePy"; exit 1 }
+if (-not (Test-Path -LiteralPath $DecidersPy))       { Write-Error "Missing $DecidersPy"; exit 1 }
+if (-not (Test-Path -LiteralPath $DecidersSkillDir)) { Write-Error "Missing $DecidersSkillDir"; exit 1 }
 foreach ($role in $Profiles.Keys) {
     $soul = Join-Path $SoulsDir "SOUL-$role.md"
     if (-not (Test-Path -LiteralPath $soul)) { Write-Error "Missing $soul"; exit 1 }
@@ -291,6 +412,19 @@ if (Test-Path -LiteralPath $forgeCmdPath) {
         exit 1
     }
 }
+# deciders.cmd goes beside forge.cmd, same guard.
+$DecidersMarker  = 'REM dev-team deciders wrapper (install-dev-team-windows.ps1)'
+$decidersCmdPath = Join-Path $hermesDir 'deciders.cmd'
+if (Test-Path -LiteralPath $decidersCmdPath) {
+    $currentDeciders = Get-Content -LiteralPath $decidersCmdPath -Raw -ErrorAction SilentlyContinue
+    $oursDeciders = $currentDeciders -and (
+        $currentDeciders.Contains($DecidersMarker) -or
+        ($currentDeciders -match '(?m)^python "[^"]*\\dev-team\\deciders\\deciders\.py" %\*'))
+    if (-not $oursDeciders) {
+        [Console]::Error.WriteLine("$decidersCmdPath already exists and was not written by this installer.`nRefusing to overwrite another tool's 'deciders'. Move it aside, then re-run.")
+        exit 1
+    }
+}
 Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"
@@ -299,6 +433,29 @@ Write-Host "Name prefix:   $Prefix"
 $memLabel = if ($SeparateMemory) { 'separate per profile' } else { "shared bank at $MnemoHome" }
 Write-Host "Memory:        $memLabel"
 Write-Host "Team state:    $DevTeamHome (shared across every profile)"
+Write-Host ''
+
+# deciders tier table: $DevTeamHome\model-tiers.json is the same file
+# $HERMES_HOME\dev-team\model-tiers.json resolves to in every installed
+# profile, via the dev-team junction each profile gets below (step 7).
+$ModelTiersPath = Join-Path $DevTeamHome 'model-tiers.json'
+$ModelTiers = [ordered]@{}
+if ($TierFastProvider) { $ModelTiers['fast'] = [ordered]@{ provider = $TierFastProvider; model = $TierFastModel } }
+$ModelTiers['standard'] = [ordered]@{ provider = $TierStandardProvider; model = $TierStandardModel }
+$ModelTiers['deep']     = [ordered]@{ provider = $TierDeepProvider; model = $TierDeepModel }
+$ModelTiersJson = $ModelTiers | ConvertTo-Json -Depth 4
+Write-Host 'Tier table:'
+$fastLabel = if ($TierFastProvider) { "$TierFastProvider`:$TierFastModel" } else { '(absent)' }
+Write-Host "  fast:     $fastLabel"
+Write-Host "  standard: $TierStandardProvider`:$TierStandardModel"
+Write-Host "  deep:     $TierDeepProvider`:$TierDeepModel"
+if ($DryRun) {
+    Write-Host "  would write: $ModelTiersPath"
+    ($ModelTiersJson -split "`r?`n") | ForEach-Object { Write-Host "    $_" }
+} else {
+    New-Item -ItemType Directory -Path $DevTeamHome -Force | Out-Null
+    Set-Content -LiteralPath $ModelTiersPath -Value $ModelTiersJson -Encoding ascii
+}
 Write-Host ''
 
 $created  = 0
@@ -373,6 +530,7 @@ foreach ($role in $Profiles.Keys) {
         foreach ($stageDir in (Get-ChildItem -LiteralPath $SkillsDir -Directory -Filter 'dev-team-stage-*' -ErrorAction SilentlyContinue)) {
             Write-Host "  would install skill: dev-team\$($stageDir.Name)"
         }
+        Write-Host '  would install skill: dev-team\dev-team-deciders'
         continue
     }
 
@@ -494,12 +652,15 @@ foreach ($role in $Profiles.Keys) {
 
     # 8. Pipeline stage skills: every dev-team-stage-* skill, for every
     # role, since the guard identifies a card's stage from the skill the
-    # card itself carries, not from the completing profile's role.
+    # card itself carries, not from the completing profile's role. Plus
+    # dev-team-deciders, beside the stage skills, for every profile - the
+    # design asks that every role be able to decide/extract/summarize.
     $stageSkillsDir = Join-Path $profileDir 'skills\dev-team'
     New-Item -ItemType Directory -Path $stageSkillsDir -Force | Out-Null
     foreach ($stageDir in (Get-ChildItem -LiteralPath $SkillsDir -Directory -Filter 'dev-team-stage-*' -ErrorAction SilentlyContinue)) {
         Copy-Item -LiteralPath $stageDir.FullName -Destination $stageSkillsDir -Recurse -Force
     }
+    Copy-Item -LiteralPath $DecidersSkillDir -Destination $stageSkillsDir -Recurse -Force
 }
 
 if ($DryRun) {
@@ -507,6 +668,10 @@ if ($DryRun) {
     Write-Host '  would install: running-the-pipeline skill + bin\kanban-budget.py'
     Write-Host "                 into the '$Prefix$EntryProfile' profile"
     Write-Host '  would install: forge.cmd next to hermes.exe on PATH'
+    Write-Host '  would install: deciders.cmd next to hermes.exe on PATH'
+    Write-Host ''
+    Write-Host "OpenRouter key for deciders: set a user environment variable, e.g.:"
+    Write-Host "  setx OPENROUTER_DECIDERS_KEY <key>"
     Write-Host 'Dry run: nothing was changed.'
     exit 0
 }
@@ -533,17 +698,69 @@ if (Test-Selected $EntryProfile) {
     }
 }
 
+# The wrappers name an absolute python.exe. A bare `python` resolves, on a
+# machine without a system Python, to the Microsoft Store alias stub in
+# WindowsApps, which prints 'Python was not found' and exits 9009 (seen in
+# CI on both runners). Prefer the interpreter Hermes itself installed, then
+# the py launcher's Python 3, then a real python.exe on PATH.
+function Resolve-WrapperPython {
+    $toolsDir = Join-Path $env:LOCALAPPDATA 'hermes\tools'
+    if (Test-Path -LiteralPath $toolsDir) {
+        $hermesPy = Get-ChildItem -LiteralPath $toolsDir -Directory -Filter 'python-3*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($hermesPy) { return $hermesPy }
+    }
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        # 'Continue' locally: under 'Stop', PS 5.1 turns a native command's
+        # redirected stderr (py with no Python 3 installed) into a terminating
+        # error, which would abort the install instead of falling through.
+        $savedEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $launched = & py -3 -c 'import sys; print(sys.executable)' 2>$null } finally { $ErrorActionPreference = $savedEap }
+        if ($LASTEXITCODE -eq 0 -and $launched -and (Test-Path -LiteralPath $launched.Trim())) { return $launched.Trim() }
+    }
+    $onPath = Get-Command python -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and $_.Source -notmatch '\\WindowsApps\\' } | Select-Object -First 1
+    if ($onPath) { return $onPath.Source }
+    return $null
+}
+$WrapperPython = Resolve-WrapperPython
+if (-not $WrapperPython) {
+    [Console]::Error.WriteLine("No Python 3 found for the forge and deciders wrappers (looked in $env:LOCALAPPDATA\hermes\tools, the py launcher, and PATH outside WindowsApps). Install Hermes or Python 3, then re-run.")
+    exit 1
+}
+Write-Host "wrapper python: $WrapperPython"
+
 # forge on a PATH the gateway sees. On Windows that is the same directory
 # hermes.exe itself resolves from on PATH - the lesson from the graft plugin
 # work, carried over from the Unix installer's ~/.local/bin/forge. A thin
 # .cmd wrapper so every profile's own `python` need not be found separately
 # - the forge directory holds its own imports (adapters, forge_core) that
 # resolve off the script's own path, so the wrapper only needs to point
-# python at forge.py itself.
-$forgeCmdContent = "@echo off`r`n$ForgeMarker`r`npython `"$ForgePy`" %*`r`n"
+# the resolved python at forge.py itself.
+$forgeCmdContent = "@echo off`r`n$ForgeMarker`r`n`"$WrapperPython`" `"$ForgePy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
 Set-Content -LiteralPath $forgeCmdPath -Value $forgeCmdContent -NoNewline -Encoding ascii
 Write-Host ''
 Write-Host "forge installed: $forgeCmdPath"
+
+# deciders.cmd on the same PATH, same wrapper shape as forge.cmd above.
+# `exit /b %ERRORLEVEL%` is explicit on purpose: without it, a caller that
+# launches the .cmd as other than the last command in its own cmd.exe
+# session (or under a shell that does not treat a bare batch-file
+# ERRORLEVEL as its own exit code) sees exit 0 regardless of python's real
+# exit code. python's own exit code is the whole point of this check.
+$decidersCmdContent = "@echo off`r`n$DecidersMarker`r`n`"$WrapperPython`" `"$DecidersPy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+Set-Content -LiteralPath $decidersCmdPath -Value $decidersCmdContent -NoNewline -Encoding ascii
+Write-Host "deciders installed: $decidersCmdPath"
+
+# The OpenRouter key for deciders: this installer never reads, prompts for
+# or writes it. There is no secret store on Windows, so the only note is a
+# user environment variable -- never a per-profile plaintext dotfile (I5):
+# one `setx` is a single copy, not eight.
+Write-Host ''
+Write-Host "OpenRouter key for deciders: set a user environment variable, e.g.:"
+Write-Host "  setx OPENROUTER_DECIDERS_KEY <key>"
 
 # The checks below can race the plugin reload right after `plugins enable`
 # (Task 12: a first run exited 1 although the plugin was enabled). Each is
@@ -558,10 +775,70 @@ function Test-Eventually([scriptblock] $Check) {
     return $false
 }
 
+function Invoke-CheckedCommand {
+    <#
+      Runs $FilePath with $Arguments and returns @{ Code = <exit code>;
+      Output = <combined stdout+stderr as one string> }, never throwing on
+      a non-zero exit.
+
+      Windows PowerShell 5.1 writes a native command's stderr as
+      ErrorRecords as soon as any stream is redirected (here, folding
+      stderr into stdout with 2>&1), and $ErrorActionPreference = 'Stop'
+      turns those into terminating errors even though the command itself
+      ran and exited normally. Drop to 'Continue' for the call so a
+      failing child process is reported through its exit code and output,
+      the way a verification check needs, rather than as a PowerShell
+      exception that a bare try/catch collapses into an unexplained
+      "FAILED". See also Invoke-Hermes above, which has the same guard for
+      the same reason.
+    #>
+    param([string] $FilePath, [string[]] $Arguments)
+    $previousEA = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = (& $FilePath @Arguments 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+    } catch {
+        # e.g. the file cannot be launched at all (missing, not executable)
+        $output = $_.Exception.Message
+        $code = 1
+    } finally {
+        $ErrorActionPreference = $previousEA
+    }
+    return @{ Code = $code; Output = $output }
+}
+
+function Write-CheckFailure([string] $Label, [string] $Output) {
+    <# Prints the captured output of a failed check, indented, so a future
+       failure explains itself instead of only saying "FAILED". #>
+    Write-Host "  $Label`: FAILED"
+    if ($Output) {
+        ($Output -split "`r?`n") | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "    $_" }
+    }
+}
+
 Write-Host ''
 Write-Host 'Verifying'
 Write-Host ('-' * 40)
 $failed = 0
+
+# deciders + model-tiers.json: one check, not per-profile - both are shared
+# installs, not something each profile wires separately.
+$decidersResult = Invoke-CheckedCommand -FilePath $decidersCmdPath -Arguments @('--help')
+if ($decidersResult.Code -eq 0) {
+    Write-Host '  deciders --help: ok'
+} else {
+    Write-CheckFailure 'deciders --help' $decidersResult.Output
+    $failed++
+}
+try {
+    Get-Content -LiteralPath $ModelTiersPath -Raw | ConvertFrom-Json | Out-Null
+    Write-Host '  model-tiers.json: parses'
+} catch {
+    Write-Host '  model-tiers.json: FAILED to parse'
+    $failed++
+}
+
 foreach ($role in $Profiles.Keys) {
     if (-not (Test-Selected $role)) { continue }
     $name = "$Prefix$role"

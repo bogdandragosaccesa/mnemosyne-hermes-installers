@@ -60,7 +60,10 @@ Once your parent `review` card has approved `head_sha`:
    not an attention item by itself.
 4. On `green` (exit `0`): `forge mark-ready --slug <repo-slug> --pr <pr-number>`, then complete
    as below.
-5. On `red` (exit `1`): judge per Outcomes below.
+5. On `red` (exit `1`): run `deciders extract` (see `dev-team-deciders`) over the CI log to find
+   failing tests and file:line before you look at anything else — it is a pointer into the log,
+   not a verdict. Then judge "caused by this change vs. a flake" yourself, using those spans as
+   your starting point, and act per Outcomes below.
 6. On `none`, or `pending` that never resolves within your poll bound: block per Outcomes.
 
 ## Required `metadata` on `kanban_complete`

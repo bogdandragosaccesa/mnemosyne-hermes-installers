@@ -1,0 +1,11 @@
+{
+  "model": "scaledown/summarize",
+  "cost": 0.0002,
+  "choices": [
+    {
+      "message": {
+        "content": "Synthetic summary text for test fixtures only."
+      }
+    }
+  ]
+}

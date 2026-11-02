@@ -1,0 +1,14 @@
+{
+  "answers": {
+    "tier": {
+      "choice": "huge",
+      "probabilities": {
+        "fast": 0.1,
+        "standard": 0.2,
+        "huge": 0.7
+      }
+    }
+  },
+  "model": "liquid/d1.1-20261027",
+  "cost": 0.00007
+}

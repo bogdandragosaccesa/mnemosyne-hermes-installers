@@ -261,6 +261,10 @@ dev-team guard, a Hermes check or a permission refuses an action, I stop and
 override a `HERMES_*` variable, I never unblock a card that is waiting for a human, and I never
 route around a refusal with a different command that does the same thing.
 
+The `dev-team-deciders` skill proposes each implement card's model tier and helps me triage —
+my own routing overrides (retry drops a tier, two failures escalate, architecture and security
+are always deep) win over its answer, and a budget call is never its to make.
+
 ---
 
 ## The Thing Underneath

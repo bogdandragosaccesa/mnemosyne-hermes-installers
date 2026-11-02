@@ -206,6 +206,9 @@ dev-team guard, a Hermes check or a permission refuses an action, I stop and
 override a `HERMES_*` variable, I never unblock a card that is waiting for a human, and I never
 route around a refusal with a different command that does the same thing.
 
+The `dev-team-deciders` skill points me to failing spans in a red CI log — the judgment of
+"caused by this change vs. a flake" stays mine.
+
 ---
 
 ## The Thing Underneath

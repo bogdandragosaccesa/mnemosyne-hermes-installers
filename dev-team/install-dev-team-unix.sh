@@ -18,6 +18,10 @@ MODEL="anthropic/claude-sonnet-5"
 # added: their cost is out of all proportion to the work these profiles do.
 FRONTIER_MODEL="anthropic/claude-opus-5"
 MID_MODEL="anthropic/claude-sonnet-5"
+# Default for the deciders tier table's fast tier only (no profile uses it).
+# Must be a chat model an agent worker can run on: never a decisions-only
+# model such as deciders' own tier/decide models (see DECISION_MODELS).
+FAST_MODEL="anthropic/claude-haiku-4-5"
 # Set when the caller passes --model, so one explicit model beats the table.
 MODEL_EXPLICIT=""
 ONLY=""
@@ -26,6 +30,12 @@ KEEP_SOUL=0
 DRY_RUN=0
 PREFIX="dev-"
 SHARED_DATA=1
+# deciders tier table: PROVIDER:MODEL per tier, raw --tier-* values before
+# the colon split below. Unset unless the caller passes the flag (each tier
+# then defaults from FAST_MODEL/MID_MODEL/FRONTIER_MODEL).
+TIER_FAST_PM=""
+TIER_STANDARD_PM=""
+TIER_DEEP_PM=""
 # The profile a human talks to. It gets the pipeline-orchestration skill and
 # the budget script; every other profile is a worker the dispatcher spawns.
 ENTRY_PROFILE="pm"
@@ -46,6 +56,15 @@ Usage: install-dev-team-unix.sh [options]
                      sharing the root one. Roles then cannot read each
                      other's notes, so the board no longer hands work
                      between them.
+  --tier-fast P:M     deciders tier table entry for the fast tier, as
+                     PROVIDER:MODEL (e.g. anthropic:claude-haiku-4-5).
+                     Default: $FAST_MODEL split on its first '/'.
+                     Every --tier-* model must be a chat model an agent
+                     can run on; a decisions-only model is refused.
+  --tier-standard P:M deciders tier table entry for the standard tier.
+                     Default: $MID_MODEL split on its first '/'.
+  --tier-deep P:M     deciders tier table entry for the deep tier.
+                     Default: $FRONTIER_MODEL split on its first '/'.
   --dry-run          Print what would happen and change nothing
   -h, --help         Show help
 
@@ -61,6 +80,21 @@ while [[ $# -gt 0 ]]; do
         --skip-model) SKIP_MODEL=1; shift ;;
         --keep-soul)  KEEP_SOUL=1;  shift ;;
         --separate-memory) SHARED_DATA=""; shift ;;
+        --tier-fast)
+            TIER_FAST_PM="${2:-}"
+            [[ -n $TIER_FAST_PM ]] || { echo "--tier-fast needs a value" >&2; exit 2; }
+            [[ $TIER_FAST_PM == *:* ]] || { echo "--tier-fast must be PROVIDER:MODEL (got '$TIER_FAST_PM')" >&2; exit 2; }
+            shift 2 ;;
+        --tier-standard)
+            TIER_STANDARD_PM="${2:-}"
+            [[ -n $TIER_STANDARD_PM ]] || { echo "--tier-standard needs a value" >&2; exit 2; }
+            [[ $TIER_STANDARD_PM == *:* ]] || { echo "--tier-standard must be PROVIDER:MODEL (got '$TIER_STANDARD_PM')" >&2; exit 2; }
+            shift 2 ;;
+        --tier-deep)
+            TIER_DEEP_PM="${2:-}"
+            [[ -n $TIER_DEEP_PM ]] || { echo "--tier-deep needs a value" >&2; exit 2; }
+            [[ $TIER_DEEP_PM == *:* ]] || { echo "--tier-deep must be PROVIDER:MODEL (got '$TIER_DEEP_PM')" >&2; exit 2; }
+            shift 2 ;;
         --dry-run)    DRY_RUN=1;    shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -80,12 +114,116 @@ if [[ -n $PREFIX && ! $PREFIX =~ ^[a-zA-Z0-9_-]+$ ]]; then
     exit 2
 fi
 
+# deciders tier table: --tier-fast/standard/deep were already validated as
+# PROVIDER:MODEL above. Each tier defaults from FAST_MODEL/MID_MODEL/
+# FRONTIER_MODEL, split on its first '/'.
+if [[ -n $TIER_FAST_PM ]]; then
+    TIER_FAST_PROVIDER="${TIER_FAST_PM%%:*}"
+    TIER_FAST_MODEL="${TIER_FAST_PM#*:}"
+    # M8: "anthropic:" (empty model, but still has a colon) must be
+    # refused, not silently written as {"provider": "anthropic", "model": ""}.
+    [[ -n $TIER_FAST_PROVIDER && -n $TIER_FAST_MODEL ]] || { echo "--tier-fast must be PROVIDER:MODEL with both non-empty (got '$TIER_FAST_PM')" >&2; exit 2; }
+else
+    TIER_FAST_PROVIDER="${FAST_MODEL%%/*}"
+    TIER_FAST_MODEL="${FAST_MODEL#*/}"
+fi
+
+if [[ -n $TIER_STANDARD_PM ]]; then
+    TIER_STANDARD_PROVIDER="${TIER_STANDARD_PM%%:*}"
+    TIER_STANDARD_MODEL="${TIER_STANDARD_PM#*:}"
+    [[ -n $TIER_STANDARD_PROVIDER && -n $TIER_STANDARD_MODEL ]] || { echo "--tier-standard must be PROVIDER:MODEL with both non-empty (got '$TIER_STANDARD_PM')" >&2; exit 2; }
+else
+    TIER_STANDARD_PROVIDER="${MID_MODEL%%/*}"
+    TIER_STANDARD_MODEL="${MID_MODEL#*/}"
+fi
+
+if [[ -n $TIER_DEEP_PM ]]; then
+    TIER_DEEP_PROVIDER="${TIER_DEEP_PM%%:*}"
+    TIER_DEEP_MODEL="${TIER_DEEP_PM#*:}"
+    [[ -n $TIER_DEEP_PROVIDER && -n $TIER_DEEP_MODEL ]] || { echo "--tier-deep must be PROVIDER:MODEL with both non-empty (got '$TIER_DEEP_PM')" >&2; exit 2; }
+else
+    TIER_DEEP_PROVIDER="${FRONTIER_MODEL%%/*}"
+    TIER_DEEP_MODEL="${FRONTIER_MODEL#*/}"
+fi
+
+# Minimal JSON string escaping (backslash, then quote) — provider/model
+# values are plain model ids, but this keeps model-tiers.json valid even if
+# an operator passes something unusual.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+# Builds the model-tiers.json body. Any tier may be absent (fast, with no
+# --tier-fast). Format matches the pm's `deciders tier` reader:
+# {"fast": {"provider": ..., "model": ...}, "standard": {...}, "deep": {...}}.
+build_model_tiers_json() {
+    local body="" sep=""
+    if [[ -n $TIER_FAST_PROVIDER ]]; then
+        body="${body}${sep}  \"fast\": {\"provider\": \"$(json_escape "$TIER_FAST_PROVIDER")\", \"model\": \"$(json_escape "$TIER_FAST_MODEL")\"}"
+        sep=$',\n'
+    fi
+    if [[ -n $TIER_STANDARD_PROVIDER ]]; then
+        body="${body}${sep}  \"standard\": {\"provider\": \"$(json_escape "$TIER_STANDARD_PROVIDER")\", \"model\": \"$(json_escape "$TIER_STANDARD_MODEL")\"}"
+        sep=$',\n'
+    fi
+    if [[ -n $TIER_DEEP_PROVIDER ]]; then
+        body="${body}${sep}  \"deep\": {\"provider\": \"$(json_escape "$TIER_DEEP_PROVIDER")\", \"model\": \"$(json_escape "$TIER_DEEP_MODEL")\"}"
+        sep=$',\n'
+    fi
+    printf '{\n%s\n}\n' "$body"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOULS_DIR="$SCRIPT_DIR/souls"
 SKILLS_DIR="$SCRIPT_DIR/skills"
 PLUGIN_SRC_GATE="$SCRIPT_DIR/plugin/dev-team-gate"
 FORGE_PY="$SCRIPT_DIR/forge/forge.py"
 KANBAN_BUDGET_PY="$SCRIPT_DIR/scripts/kanban-budget.py"
+DECIDERS_PY="$SCRIPT_DIR/deciders/deciders.py"
+DECIDERS_SKILL_DIR="$SKILLS_DIR/dev-team-deciders"
+
+# Refuse a decisions-only model in the tier table before anything is
+# written: an agent worker on a card routed to it could not run at all. The
+# list is deciders_core.py's one-line DECISION_MODELS tuple, so it has one
+# owner; a dated variant ("<id>-20261027") is refused too.
+DECIDERS_CORE_PY="$SCRIPT_DIR/deciders/deciders_core.py"
+DECISION_MODELS_LIST="$(grep -m1 '^DECISION_MODELS = (' "$DECIDERS_CORE_PY" 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)"
+if [[ -z $DECISION_MODELS_LIST ]]; then
+    echo "cannot read DECISION_MODELS from $DECIDERS_CORE_PY" >&2
+    exit 2
+fi
+refuse_decision_model() {  # flag provider model
+    local flag="$1" full="$2/$3" bare="$3" m prefix
+    # Strip an OpenRouter ":variant" suffix (e.g. "liquid/d1.1:nitro")
+    # before comparing, same as deciders_core.py's _is_decision_model.
+    bare="${bare%%:*}"
+    full="${full%%:*}"
+    while IFS= read -r m; do
+        [[ -n $m ]] || continue
+        if [[ $m == *'*' ]]; then
+            # A family prefix entry, e.g. "perplexity/pplx-decider-*":
+            # quoting "$m" in a case pattern disables globbing, so match
+            # the prefix explicitly instead.
+            prefix="${m%\*}"
+            case "$bare" in "$prefix"*) ;; *) case "$full" in "$prefix"*) ;; *) continue ;; esac ;; esac
+        else
+            case "$bare" in "$m"|"$m"-*) ;; *) case "$full" in "$m"|"$m"-*) ;; *) continue ;; esac ;; esac
+        fi
+        echo "$flag ${4:-$2:$3} is a decisions-only model (it only answers /api/alpha/decisions);" >&2
+        echo "an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5." >&2
+        exit 2
+    done <<< "$DECISION_MODELS_LIST"
+}
+refuse_decision_model --tier-fast "$TIER_FAST_PROVIDER" "$TIER_FAST_MODEL"
+refuse_decision_model --tier-standard "$TIER_STANDARD_PROVIDER" "$TIER_STANDARD_MODEL"
+refuse_decision_model --tier-deep "$TIER_DEEP_PROVIDER" "$TIER_DEEP_MODEL"
+# I3: --model sets every profile's own model; it must be refused the same
+# way a decisions-only tier-table entry is, or an agent worker ends up
+# unable to run at all.
+refuse_decision_model --model "${MODEL%%/*}" "${MODEL#*/}" "$MODEL"
 
 # Profile name, then the description the kanban decomposer routes tasks on.
 # Parallel arrays rather than an associative array: bash 3.2 (stock macOS)
@@ -142,6 +280,8 @@ for f in "${NAMES[@]}"; do
 done
 [[ -d $PLUGIN_SRC_GATE ]] || { echo "Missing $PLUGIN_SRC_GATE" >&2; exit 1; }
 [[ -f $FORGE_PY ]] || { echo "Missing $FORGE_PY" >&2; exit 1; }
+[[ -f $DECIDERS_PY ]] || { echo "Missing $DECIDERS_PY" >&2; exit 1; }
+[[ -d $DECIDERS_SKILL_DIR ]] || { echo "Missing $DECIDERS_SKILL_DIR" >&2; exit 1; }
 
 # `forge` goes to ~/.local/bin. Another tool may already own that name
 # (Laravel Forge, Foundry's forge): never overwrite a file this installer did
@@ -154,6 +294,17 @@ if [[ -e $FORGE_BIN || -L $FORGE_BIN ]]; then
             && ! grep -qE '^exec python3 ".*/dev-team/forge/forge\.py" "\$@"$' "$FORGE_BIN" 2>/dev/null; then
         echo "$FORGE_BIN already exists and was not written by this installer." >&2
         echo "Refusing to overwrite another tool's 'forge'. Move it aside, then re-run." >&2
+        exit 1
+    fi
+fi
+# `deciders` goes to ~/.local/bin, same guard as `forge` above.
+DECIDERS_BIN="$HOME/.local/bin/deciders"
+DECIDERS_MARKER="# dev-team deciders wrapper (install-dev-team-unix.sh)"
+if [[ -e $DECIDERS_BIN || -L $DECIDERS_BIN ]]; then
+    if ! grep -qF "$DECIDERS_MARKER" "$DECIDERS_BIN" 2>/dev/null \
+            && ! grep -qE '^exec python3 ".*/dev-team/deciders/deciders\.py" "\$@"$' "$DECIDERS_BIN" 2>/dev/null; then
+        echo "$DECIDERS_BIN already exists and was not written by this installer." >&2
+        echo "Refusing to overwrite another tool's 'deciders'. Move it aside, then re-run." >&2
         exit 1
     fi
 fi
@@ -218,6 +369,24 @@ say "Model:         $( ((SKIP_MODEL)) && echo '(unchanged)' || echo "$MODEL" )"
 [[ -n $PREFIX ]] && say "Name prefix:   $PREFIX"
 say "Memory:        $( [[ -n $SHARED_DATA ]] && echo "shared bank at $MNEMO_HOME" || echo 'separate per profile' )"
 say "Team state:    $DEV_TEAM_HOME (shared across every profile)"
+say ""
+
+# deciders tier table: $DEV_TEAM_HOME/model-tiers.json is the same file
+# $HERMES_HOME/dev-team/model-tiers.json resolves to in every installed
+# profile, via the dev-team symlink each profile gets below (step 7b).
+MODEL_TIERS_PATH="$DEV_TEAM_HOME/model-tiers.json"
+MODEL_TIERS_JSON="$(build_model_tiers_json)"
+say "Tier table:"
+say "  fast:     $( [[ -n $TIER_FAST_PROVIDER ]] && echo "$TIER_FAST_PROVIDER:$TIER_FAST_MODEL" || echo '(absent)' )"
+say "  standard: $TIER_STANDARD_PROVIDER:$TIER_STANDARD_MODEL"
+say "  deep:     $TIER_DEEP_PROVIDER:$TIER_DEEP_MODEL"
+if (( DRY_RUN )); then
+    say "  would write: $MODEL_TIERS_PATH"
+    printf '%s\n' "$MODEL_TIERS_JSON" | sed 's/^/    /'
+else
+    mkdir -p "$DEV_TEAM_HOME"
+    printf '%s' "$MODEL_TIERS_JSON" > "$MODEL_TIERS_PATH"
+fi
 say ""
 
 created=0; updated=0; unshared=""
@@ -361,25 +530,44 @@ for i in "${!NAMES[@]}"; do
     # 7. Pipeline stage skills: every dev-team-stage-* skill, for every role,
     # since the guard identifies a card's stage from the skill the card
     # itself carries, not from the completing profile's role.
+    # Plus dev-team-deciders, beside the stage skills, for every profile —
+    # the design asks that every role be able to decide/extract/summarize.
     run mkdir -p "$profile_dir/skills/dev-team"
     if (( DRY_RUN )); then
         for stage_dir in "$SKILLS_DIR"/dev-team-stage-*; do
             [[ -d $stage_dir ]] || continue
             say "  would install skill: dev-team/$(basename "$stage_dir")"
         done
+        say "  would install skill: dev-team/dev-team-deciders"
     else
         for stage_dir in "$SKILLS_DIR"/dev-team-stage-*; do
             [[ -d $stage_dir ]] || continue
             cp -R "$stage_dir" "$profile_dir/skills/dev-team/"
         done
+        cp -R "$DECIDERS_SKILL_DIR" "$profile_dir/skills/dev-team/"
     fi
 done
+
+# The OpenRouter key for deciders: this installer never reads, prompts for
+# or writes it. Only print where to put it -- never a per-profile plaintext
+# file (I5): a shared user environment variable is one copy, not eight.
+deciders_key_note() {
+    if command -v secret >/dev/null 2>&1; then
+        say "OpenRouter key for deciders: store it with \`secret set openrouter/deciders\`"
+    else
+        say "OpenRouter key for deciders: set it as a user environment variable, e.g. in"
+        say "  your shell profile: export OPENROUTER_DECIDERS_KEY=<key>"
+    fi
+}
 
 if (( DRY_RUN )); then
     say ""
     say "  would install: running-the-pipeline skill + bin/kanban-budget.py"
     say "                 into the '$PREFIX$ENTRY_PROFILE' profile"
     say "  would install: ~/.local/bin/forge"
+    say "  would install: ~/.local/bin/deciders"
+    say ""
+    deciders_key_note
     say "Dry run: nothing was changed."
     exit 0
 fi
@@ -419,6 +607,20 @@ chmod +x "$FORGE_BIN"
 say ""
 say "forge installed: $FORGE_BIN"
 
+# `deciders` on the same PATH, same wrapper shape as `forge` above.
+cat > "$DECIDERS_BIN" <<EOF
+#!/usr/bin/env bash
+$DECIDERS_MARKER
+exec python3 "$DECIDERS_PY" "\$@"
+EOF
+chmod +x "$DECIDERS_BIN"
+say "deciders installed: $DECIDERS_BIN"
+
+# The OpenRouter key for deciders: printed by deciders_key_note (defined
+# above, also shown in --dry-run).
+say ""
+deciders_key_note
+
 # A check that can race the gateway's plugin reload right after `plugins
 # enable` (Task 12: the first run exited 1 although the plugin was enabled).
 # Retried a bounded number of times before it counts as a failure.
@@ -445,6 +647,22 @@ say ""
 say "Verifying"
 say "────────────────────────────────────────"
 failed=0
+
+# deciders + model-tiers.json: one check, not per-profile — both are shared
+# installs, not something each profile wires separately.
+if "$DECIDERS_BIN" --help >/dev/null 2>&1; then
+    say "  deciders --help: ok ✓"
+else
+    say "  deciders --help: FAILED ✗"
+    failed=$((failed + 1))
+fi
+if python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$MODEL_TIERS_PATH" >/dev/null 2>&1; then
+    say "  model-tiers.json: parses ✓"
+else
+    say "  model-tiers.json: FAILED to parse ✗"
+    failed=$((failed + 1))
+fi
+
 for role in "${NAMES[@]}"; do
     selected "$role" || continue
     name="$PREFIX$role"
