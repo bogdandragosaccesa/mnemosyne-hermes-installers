@@ -57,8 +57,15 @@ def _env(key=None):
 def _run(argv, transport, env, home=None):
     import io
     out = io.StringIO()
-    code = main(argv, home=home or Path("/tmp/does-not-matter"), env=env,
-                transport=transport, out=out)
+    if home is None:
+        # Never fall back to a fixed real path: every test run would then
+        # share (and keep appending to) one real ledger file outside any
+        # test's sandbox, and would fail with exit 2 wherever that path
+        # isn't writable.
+        with tempfile.TemporaryDirectory() as tmp:
+            code = main(argv, home=Path(tmp), env=env, transport=transport, out=out)
+            return code, out.getvalue()
+    code = main(argv, home=home, env=env, transport=transport, out=out)
     return code, out.getvalue()
 
 
@@ -83,12 +90,60 @@ class ChooseTierTests(unittest.TestCase):
         tier = deciders_core.choose_tier({"fast": 0.5, "standard": 0.45, "deep": 0.05})
         self.assertEqual(tier, "standard")
 
+    def test_choose_tier_rejects_non_finite_even_when_sum_looks_ok(self):
+        # json.loads parses NaN/Infinity; a NaN total makes the naive sum
+        # check `abs(total - 1.0) > 0.02` evaluate to False. Must still
+        # raise rather than silently returning a guessed tier.
+        with self.assertRaises(DecidersError) as ctx:
+            deciders_core.choose_tier({"fast": float("nan"), "standard": 0.7, "deep": 0.3})
+        self.assertEqual(ctx.exception.label, "deciders: bad-response")
+
+    def test_choose_tier_rejects_infinite_probability(self):
+        with self.assertRaises(DecidersError) as ctx:
+            deciders_core.choose_tier(
+                {"fast": float("inf"), "standard": 0.7, "deep": 0.3}
+            )
+        self.assertEqual(ctx.exception.label, "deciders: bad-response")
+
+    def test_choose_tier_rejects_negative_probability(self):
+        # -0.5 + 0.8 + 0.7 == 1.0, so the sum check alone would let this
+        # through; the per-value range check must catch it.
+        with self.assertRaises(DecidersError) as ctx:
+            deciders_core.choose_tier({"fast": -0.5, "standard": 0.8, "deep": 0.7})
+        self.assertEqual(ctx.exception.label, "deciders: bad-response")
+
+    def test_choose_tier_rejects_probability_above_one(self):
+        with self.assertRaises(DecidersError) as ctx:
+            deciders_core.choose_tier({"fast": 1.5, "standard": -0.3, "deep": -0.2})
+        self.assertEqual(ctx.exception.label, "deciders: bad-response")
+
+    def test_choose_tier_rejects_sum_not_close_to_one(self):
+        with self.assertRaises(DecidersError) as ctx:
+            deciders_core.choose_tier({"fast": 0.2, "standard": 0.2, "deep": 0.2})
+        self.assertEqual(ctx.exception.label, "deciders: bad-response")
+
 
 # --- tier subcommand over main ----------------------------------------------
 
 class TierRejectsUnknownOptionTests(unittest.TestCase):
     def test_tier_rejects_unknown_option(self):
         fixture = _load_fixture("tier_unknown_option.json")
+        transport = FakeTransport([fixture])
+        env = _env(_fake_key())
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            spec_path = _write_spec(home)
+            code, stdout = _run(
+                ["tier", "--title", "Rename a variable", "--spec", str(spec_path)],
+                transport, env, home=home,
+            )
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-response"))
+
+    def test_tier_rejects_probabilities_not_summing_to_one(self):
+        # 0.2 + 0.2 + 0.2 == 0.6, well outside the +/-0.02 tolerance. Mutant
+        # M1 (replace the sum check with `if False:`) must fail this test.
+        fixture = _load_fixture("tier_bad_sum.json")
         transport = FakeTransport([fixture])
         env = _env(_fake_key())
         with tempfile.TemporaryDirectory() as tmp:

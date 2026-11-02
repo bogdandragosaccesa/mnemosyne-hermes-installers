@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import socket
 import sys
@@ -157,8 +158,16 @@ def choose_tier(probabilities) -> str:
     values = list(probabilities.values())
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values):
         raise DecidersError("deciders: bad-response", "probability is not a number")
+    # json.loads happily parses NaN/Infinity (transport, line ~109), and a
+    # NaN total makes abs(total - 1.0) > 0.02 evaluate to False -- silently
+    # returning a guessed tier. Reject non-finite and out-of-range values
+    # explicitly rather than relying on the sum check to catch them.
+    if any(not math.isfinite(v) or v < 0.0 or v > 1.0 for v in values):
+        raise DecidersError(
+            "deciders: bad-response", "probability is not finite and in [0, 1]"
+        )
     total = sum(values)
-    if abs(total - 1.0) > 0.02:
+    if not math.isfinite(total) or abs(total - 1.0) > 0.02:
         raise DecidersError(
             "deciders: bad-response", f"probabilities sum to {total}, not 1"
         )

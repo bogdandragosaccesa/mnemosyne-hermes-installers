@@ -63,8 +63,15 @@ def _env(key=None):
 
 def _run(argv, transport, env, home=None):
     out = io.StringIO()
-    code = main(argv, home=home or Path("/tmp/does-not-matter"), env=env,
-                transport=transport, out=out)
+    if home is None:
+        # Never fall back to a fixed real path: every test run would then
+        # share (and keep appending to) one real ledger file outside any
+        # test's sandbox, and would fail with exit 2 wherever that path
+        # isn't writable.
+        with tempfile.TemporaryDirectory() as tmp:
+            code = main(argv, home=Path(tmp), env=env, transport=transport, out=out)
+            return code, out.getvalue()
+    code = main(argv, home=home, env=env, transport=transport, out=out)
     return code, out.getvalue()
 
 
