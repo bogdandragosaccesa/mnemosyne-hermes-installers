@@ -188,15 +188,73 @@ def collect(root: Path, board: str) -> dict:
             if (p, s["id"]) not in claimed:
                 unattributed += float(s["act"] or 0) or float(s["est"] or 0)
 
+    deciders = deciders_spend(root, board)
+    runs_total = sum(r["cost"] for r in runs)
+
     return {
         "board": board,
         "tasks": tasks,
         "runs": runs,
         "per_task": per_task,
         "per_role": per_role,
-        "total": round(sum(r["cost"] for r in runs), 6),
+        "deciders": deciders,
+        "total": round(runs_total + deciders, 6),
         "unattributed": round(unattributed, 6),
     }
+
+
+def ledger_path(root: Path) -> Path:
+    """Shared decision-model spend ledger, written by dev-team/deciders.
+
+    Lives under the Hermes home root (not per-profile, not per-board) because
+    one ledger file is shared by every profile that invokes the deciders CLI;
+    each record carries its own ``board`` field so spend can be filtered back
+    out per board.
+    """
+    return root / "dev-team" / "deciders-ledger.jsonl"
+
+
+def deciders_spend(root: Path, board: str) -> float:
+    """Sum of ``cost`` for ledger records tagged with this board.
+
+    Missing ledger file -> 0.0 (no decider calls made yet, not an error).
+    A line that isn't valid JSON, isn't an object, or has a non-numeric
+    ``cost`` is skipped rather than crashing the whole report; skipped lines
+    are tallied and reported once as a warning so a corrupt ledger is never
+    silently invisible.
+    """
+    path = ledger_path(root)
+    try:
+        text = path.read_text()
+    except OSError:
+        return 0.0
+
+    total = 0.0
+    corrupt = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            corrupt += 1
+            continue
+        if not isinstance(record, dict):
+            corrupt += 1
+            continue
+        if record.get("board") != board:
+            continue
+        try:
+            total += float(record.get("cost") or 0)
+        except (TypeError, ValueError):
+            corrupt += 1
+            continue
+
+    if corrupt:
+        print(f"warning: skipped {corrupt} corrupt line(s) in {path}",
+              file=sys.stderr)
+    return round(total, 6)
 
 
 def budget_file(root: Path, board: str) -> Path:
@@ -253,7 +311,8 @@ def report(data: dict, budget: float | None, reserve_pct: float) -> int:
 
     w("Total")
     w("─" * 62)
-    w(f"  Attributed to cards:  ${data['total']:.4f}")
+    w(f"  Attributed to cards:  ${sum(v['cost'] for v in data['per_task'].values()):.4f}")
+    w(f"  Decision models:      ${data['deciders']:.4f}")
     if data["unattributed"]:
         w(f"  Unattributed:         ${data['unattributed']:.4f}  "
           f"(profile sessions outside any run window — interactive chats, "
