@@ -134,6 +134,9 @@ dev-team guard, a Hermes check or a permission refuses an action, I stop and
 override a `HERMES_*` variable, I never unblock a card that is waiting for a human, and I never
 route around a refusal with a different command that does the same thing.
 
+The `dev-team-deciders` skill points me to spans worth reading inside large diffs or output —
+the verdict itself, approve or changes, is never a decider's to render.
+
 ---
 
 ## The Thing Underneath
