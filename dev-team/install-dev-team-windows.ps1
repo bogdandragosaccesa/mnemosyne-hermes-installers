@@ -45,6 +45,19 @@
 .PARAMETER DryRun
     Print what would happen and change nothing.
 
+.PARAMETER TierFast
+    deciders tier table entry for the fast tier, as PROVIDER:MODEL (e.g.
+    openrouter:liquid/d1.1). No default: absent from model-tiers.json unless
+    given.
+
+.PARAMETER TierStandard
+    deciders tier table entry for the standard tier. Default: $MidModel
+    split on its first '/'.
+
+.PARAMETER TierDeep
+    deciders tier table entry for the deep tier. Default: $FrontierModel
+    split on its first '/'.
+
 .EXAMPLE
     .\install-dev-team-windows.ps1
 
@@ -60,7 +73,10 @@ param(
     [switch]   $SkipModel,
     [switch]   $KeepSoul,
     [switch]   $SeparateMemory,
-    [switch]   $DryRun
+    [switch]   $DryRun,
+    [string]   $TierFast,
+    [string]   $TierStandard,
+    [string]   $TierDeep
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,12 +104,62 @@ if (-not $Prefix -or $Prefix -notmatch '^[a-zA-Z0-9_-]+$') {
     exit 2
 }
 
+function Split-TierPM {
+    <#
+      Splits "$Value" on its FIRST ':' into a two-element array
+      (provider, model). Exits 2, naming $FlagName, when there is no ':' -
+      same contract as the Unix installer's --tier-* flags.
+    #>
+    param([string] $Value, [string] $FlagName)
+    if ($Value -notmatch ':') {
+        [Console]::Error.WriteLine("$FlagName must be PROVIDER:MODEL (got '$Value')")
+        exit 2
+    }
+    $idx = $Value.IndexOf(':')
+    return @($Value.Substring(0, $idx), $Value.Substring($idx + 1))
+}
+
+function Split-ProviderModel {
+    <# Splits "$Value" (e.g. $MidModel) on its first '/' into (provider, model). #>
+    param([string] $Value)
+    $idx = $Value.IndexOf('/')
+    if ($idx -lt 0) { return @($Value, '') }
+    return @($Value.Substring(0, $idx), $Value.Substring($idx + 1))
+}
+
+# deciders tier table. -TierFast has no default (absent from
+# model-tiers.json unless given); -TierStandard/-TierDeep default from
+# $MidModel/$FrontierModel, split on their first '/'.
+$TierFastProvider = $null; $TierFastModel = $null
+if ($TierFast) {
+    $parts = Split-TierPM $TierFast '-TierFast'
+    $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
+}
+
+if ($TierStandard) {
+    $parts = Split-TierPM $TierStandard '-TierStandard'
+    $TierStandardProvider = $parts[0]; $TierStandardModel = $parts[1]
+} else {
+    $parts = Split-ProviderModel $MidModel
+    $TierStandardProvider = $parts[0]; $TierStandardModel = $parts[1]
+}
+
+if ($TierDeep) {
+    $parts = Split-TierPM $TierDeep '-TierDeep'
+    $TierDeepProvider = $parts[0]; $TierDeepModel = $parts[1]
+} else {
+    $parts = Split-ProviderModel $FrontierModel
+    $TierDeepProvider = $parts[0]; $TierDeepModel = $parts[1]
+}
+
 $ScriptDir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SoulsDir       = Join-Path $ScriptDir 'souls'
 $SkillsDir      = Join-Path $ScriptDir 'skills'
 $PluginSrcGate  = Join-Path $ScriptDir 'plugin\dev-team-gate'
 $ForgePy        = Join-Path $ScriptDir 'forge\forge.py'
 $KanbanBudgetPy = Join-Path $ScriptDir 'scripts\kanban-budget.py'
+$DecidersPy       = Join-Path $ScriptDir 'deciders\deciders.py'
+$DecidersSkillDir = Join-Path $SkillsDir 'dev-team-deciders'
 
 # Profile name -> the description the kanban decomposer routes tasks on.
 # Ordered so the output prints in a stable order. Kept in lockstep with the
@@ -111,6 +177,8 @@ $Profiles = [ordered]@{
 
 if (-not (Test-Path -LiteralPath $PluginSrcGate)) { Write-Error "Missing $PluginSrcGate"; exit 1 }
 if (-not (Test-Path -LiteralPath $ForgePy))       { Write-Error "Missing $ForgePy"; exit 1 }
+if (-not (Test-Path -LiteralPath $DecidersPy))       { Write-Error "Missing $DecidersPy"; exit 1 }
+if (-not (Test-Path -LiteralPath $DecidersSkillDir)) { Write-Error "Missing $DecidersSkillDir"; exit 1 }
 foreach ($role in $Profiles.Keys) {
     $soul = Join-Path $SoulsDir "SOUL-$role.md"
     if (-not (Test-Path -LiteralPath $soul)) { Write-Error "Missing $soul"; exit 1 }
@@ -291,6 +359,19 @@ if (Test-Path -LiteralPath $forgeCmdPath) {
         exit 1
     }
 }
+# deciders.cmd goes beside forge.cmd, same guard.
+$DecidersMarker  = 'REM dev-team deciders wrapper (install-dev-team-windows.ps1)'
+$decidersCmdPath = Join-Path $hermesDir 'deciders.cmd'
+if (Test-Path -LiteralPath $decidersCmdPath) {
+    $currentDeciders = Get-Content -LiteralPath $decidersCmdPath -Raw -ErrorAction SilentlyContinue
+    $oursDeciders = $currentDeciders -and (
+        $currentDeciders.Contains($DecidersMarker) -or
+        ($currentDeciders -match '(?m)^python "[^"]*\\dev-team\\deciders\\deciders\.py" %\*'))
+    if (-not $oursDeciders) {
+        [Console]::Error.WriteLine("$decidersCmdPath already exists and was not written by this installer.`nRefusing to overwrite another tool's 'deciders'. Move it aside, then re-run.")
+        exit 1
+    }
+}
 Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"
@@ -299,6 +380,29 @@ Write-Host "Name prefix:   $Prefix"
 $memLabel = if ($SeparateMemory) { 'separate per profile' } else { "shared bank at $MnemoHome" }
 Write-Host "Memory:        $memLabel"
 Write-Host "Team state:    $DevTeamHome (shared across every profile)"
+Write-Host ''
+
+# deciders tier table: $DevTeamHome\model-tiers.json is the same file
+# $HERMES_HOME\dev-team\model-tiers.json resolves to in every installed
+# profile, via the dev-team junction each profile gets below (step 7).
+$ModelTiersPath = Join-Path $DevTeamHome 'model-tiers.json'
+$ModelTiers = [ordered]@{}
+if ($TierFastProvider) { $ModelTiers['fast'] = [ordered]@{ provider = $TierFastProvider; model = $TierFastModel } }
+$ModelTiers['standard'] = [ordered]@{ provider = $TierStandardProvider; model = $TierStandardModel }
+$ModelTiers['deep']     = [ordered]@{ provider = $TierDeepProvider; model = $TierDeepModel }
+$ModelTiersJson = $ModelTiers | ConvertTo-Json -Depth 4
+Write-Host 'Tier table:'
+$fastLabel = if ($TierFastProvider) { "$TierFastProvider`:$TierFastModel" } else { '(absent)' }
+Write-Host "  fast:     $fastLabel"
+Write-Host "  standard: $TierStandardProvider`:$TierStandardModel"
+Write-Host "  deep:     $TierDeepProvider`:$TierDeepModel"
+if ($DryRun) {
+    Write-Host "  would write: $ModelTiersPath"
+    ($ModelTiersJson -split "`r?`n") | ForEach-Object { Write-Host "    $_" }
+} else {
+    New-Item -ItemType Directory -Path $DevTeamHome -Force | Out-Null
+    Set-Content -LiteralPath $ModelTiersPath -Value $ModelTiersJson -Encoding ascii
+}
 Write-Host ''
 
 $created  = 0
@@ -373,6 +477,7 @@ foreach ($role in $Profiles.Keys) {
         foreach ($stageDir in (Get-ChildItem -LiteralPath $SkillsDir -Directory -Filter 'dev-team-stage-*' -ErrorAction SilentlyContinue)) {
             Write-Host "  would install skill: dev-team\$($stageDir.Name)"
         }
+        Write-Host '  would install skill: dev-team\dev-team-deciders'
         continue
     }
 
@@ -494,12 +599,15 @@ foreach ($role in $Profiles.Keys) {
 
     # 8. Pipeline stage skills: every dev-team-stage-* skill, for every
     # role, since the guard identifies a card's stage from the skill the
-    # card itself carries, not from the completing profile's role.
+    # card itself carries, not from the completing profile's role. Plus
+    # dev-team-deciders, beside the stage skills, for every profile - the
+    # design asks that every role be able to decide/extract/summarize.
     $stageSkillsDir = Join-Path $profileDir 'skills\dev-team'
     New-Item -ItemType Directory -Path $stageSkillsDir -Force | Out-Null
     foreach ($stageDir in (Get-ChildItem -LiteralPath $SkillsDir -Directory -Filter 'dev-team-stage-*' -ErrorAction SilentlyContinue)) {
         Copy-Item -LiteralPath $stageDir.FullName -Destination $stageSkillsDir -Recurse -Force
     }
+    Copy-Item -LiteralPath $DecidersSkillDir -Destination $stageSkillsDir -Recurse -Force
 }
 
 if ($DryRun) {
@@ -507,6 +615,7 @@ if ($DryRun) {
     Write-Host '  would install: running-the-pipeline skill + bin\kanban-budget.py'
     Write-Host "                 into the '$Prefix$EntryProfile' profile"
     Write-Host '  would install: forge.cmd next to hermes.exe on PATH'
+    Write-Host '  would install: deciders.cmd next to hermes.exe on PATH'
     Write-Host 'Dry run: nothing was changed.'
     exit 0
 }
@@ -545,6 +654,17 @@ Set-Content -LiteralPath $forgeCmdPath -Value $forgeCmdContent -NoNewline -Encod
 Write-Host ''
 Write-Host "forge installed: $forgeCmdPath"
 
+# deciders.cmd on the same PATH, same wrapper shape as forge.cmd above.
+$decidersCmdContent = "@echo off`r`n$DecidersMarker`r`npython `"$DecidersPy`" %*`r`n"
+Set-Content -LiteralPath $decidersCmdPath -Value $decidersCmdContent -NoNewline -Encoding ascii
+Write-Host "deciders installed: $decidersCmdPath"
+
+# The OpenRouter key for deciders: this installer never reads, prompts for
+# or writes it. There is no secret store on Windows, so the only note is
+# the .env variable name.
+Write-Host ''
+Write-Host "OpenRouter key for deciders: add ``OPENROUTER_DECIDERS_KEY`` to each profile's .env"
+
 # The checks below can race the plugin reload right after `plugins enable`
 # (Task 12: a first run exited 1 although the plugin was enabled). Each is
 # retried a bounded number of times before it counts as a failure.
@@ -562,6 +682,24 @@ Write-Host ''
 Write-Host 'Verifying'
 Write-Host ('-' * 40)
 $failed = 0
+
+# deciders + model-tiers.json: one check, not per-profile - both are shared
+# installs, not something each profile wires separately.
+& $decidersCmdPath '--help' *> $null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host '  deciders --help: ok'
+} else {
+    Write-Host '  deciders --help: FAILED'
+    $failed++
+}
+try {
+    Get-Content -LiteralPath $ModelTiersPath -Raw | ConvertFrom-Json | Out-Null
+    Write-Host '  model-tiers.json: parses'
+} catch {
+    Write-Host '  model-tiers.json: FAILED to parse'
+    $failed++
+}
+
 foreach ($role in $Profiles.Keys) {
     if (-not (Test-Selected $role)) { continue }
     $name = "$Prefix$role"
