@@ -1,0 +1,11 @@
+{
+  "model": "scaledown/extract",
+  "cost": 0.0004,
+  "choices": [
+    {
+      "message": {
+        "content": "{\"entities\": [{\"type\": \"synthetic-secret\", \"text\": \"EXAMPLE-TOKEN-0001\", \"start\": 12, \"end\": 30, \"confidence\": 0.91}]}"
+      }
+    }
+  ]
+}
