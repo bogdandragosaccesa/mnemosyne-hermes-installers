@@ -54,10 +54,12 @@ deep" raised computed tier "standard" to "deep"`.
   the `model-tiers.json` entry for that tier — use it directly.
 - If a soul rule changed the tier, the decider's `override` is for the *wrong* tier and must not
   be used. Instead read `$HERMES_HOME/dev-team/model-tiers.json` yourself and look up the entry
-  for the **final tier**: `{provider, model}`. If the file is missing, isn't valid JSON, or has
-  no entry for the final tier, create the card with no model/provider override and say why in
-  the body (`override_reason: ... (no tier table)` or `... (no entry for <tier>)`) — never guess
-  a model or fall back to the decider's tier's pair.
+  for the **final tier**: `{provider, model}`. If the file is missing, isn't valid JSON, has
+  no entry for the final tier, or the entry names a decisions-only model (deciders'
+  `DECISION_MODELS`, e.g. `liquid/d1.1`, or a dated `<id>-…` variant), create the card with no
+  model/provider override and say why in the body (`override_reason: ... (no tier table)`,
+  `... (no entry for <tier>)` or `... (decisions-only model for <tier>: <provider>/<model>)`) —
+  never guess a model or fall back to the decider's tier's pair.
 
 Put `tier` (the final tier), `probabilities` and `override_reason` in the card body either way,
 so the reviewer can see the reasoning, and note which soul rule (if any) changed the tier right

@@ -251,6 +251,55 @@ class TierOverrideTableTests(unittest.TestCase):
             self.assertIsNone(data["override"])
             self.assertEqual(data["override_reason"], "no entry for deep")
 
+    def test_tier_drops_decisions_only_model_from_table(self):
+        # A hand-edited table can still name a decisions-only model; an
+        # agent worker routed to one cannot run, so no override is given.
+        fixture = _load_fixture("tier_split.json")  # resolves to "deep"
+        env = _env(_fake_key())
+        entries = [
+            {"provider": "openrouter", "model": "liquid/d1.1"},
+            {"provider": "openrouter", "model": "liquid/d1.1-20261027"},
+            {"provider": "liquid", "model": "d1.1"},
+            {"provider": "openrouter", "model": "perplexity/pplx-decider-v1.2"},
+        ]
+        for entry in entries:
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                dev_team = home / "dev-team"
+                dev_team.mkdir()
+                (dev_team / "model-tiers.json").write_text(json.dumps({"deep": entry}))
+                spec_path = _write_spec(home)
+                code, stdout = _run(
+                    ["tier", "--title", "Harden auth", "--spec", str(spec_path)],
+                    FakeTransport([fixture]), env, home=home,
+                )
+                data = json.loads(stdout)
+                self.assertEqual(code, EXIT_OK)
+                self.assertEqual(data["tier"], "deep")
+                self.assertIsNone(data["override"])
+                self.assertEqual(
+                    data["override_reason"],
+                    f"decisions-only model for deep: {entry['provider']}/{entry['model']}",
+                )
+
+    def test_tier_keeps_chat_model_whose_name_only_starts_like_one(self):
+        fixture = _load_fixture("tier_split.json")
+        env = _env(_fake_key())
+        entry = {"provider": "openrouter", "model": "liquid/d1.10"}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "dev-team").mkdir()
+            (home / "dev-team" / "model-tiers.json").write_text(json.dumps({"deep": entry}))
+            spec_path = _write_spec(home)
+            code, stdout = _run(
+                ["tier", "--title", "Harden auth", "--spec", str(spec_path)],
+                FakeTransport([fixture]), env, home=home,
+            )
+        data = json.loads(stdout)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(data["override"], entry)
+        self.assertIsNone(data["override_reason"])
+
 
 # --- ledger -------------------------------------------------------------
 

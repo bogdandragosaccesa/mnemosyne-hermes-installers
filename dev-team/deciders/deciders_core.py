@@ -200,7 +200,17 @@ def _tier_override(home: Path, tier: str):
     entry = table.get(tier) if isinstance(table, dict) else None
     if entry is None:
         return None, f"no entry for {tier}"
+    if isinstance(entry, dict) and _is_decision_model(entry):
+        # The installers refuse these, but a hand-edited table is read as-is.
+        return None, f"decisions-only model for {tier}: {entry.get('provider')}/{entry.get('model')}"
     return entry, None
+
+
+def _is_decision_model(entry: dict) -> bool:
+    """Same rule as the installers: bare or provider/model, exact or `<id>-*`."""
+    model = str(entry.get("model", ""))
+    names = (model, f"{entry.get('provider', '')}/{model}")
+    return any(n == m or n.startswith(m + "-") for n in names for m in DECISION_MODELS)
 
 
 def scrub(text: str, key: str | None) -> str:

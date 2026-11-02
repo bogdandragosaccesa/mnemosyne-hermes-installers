@@ -1,7 +1,8 @@
 # Live acceptance and probes — Task 6
 
 Round 1: 2026-11-02 ~13:15 EET (commit `0ace9e9`). Round 2 (review round 1 fixes, card
-`t_9900788a`): 2026-11-02 13:45–13:55 EET. Repo branch `dev-team-deciders`. Every live call used
+`t_9900788a`): 2026-11-02 13:45–13:55 EET. Round 3 (card `t_74e4149b`): ~14:25 EET, with no
+live calls. Repo branch `dev-team-deciders`. Every live call used
 the operator's OpenRouter key only as
 `secret exec OPENROUTER_DECIDERS_KEY=openrouter/deciders -- ...`, with
 `HERMES_HOME=$HOME/.hermes` for the process, so `deciders` reads
@@ -47,6 +48,49 @@ the operator's OpenRouter key only as
      file is kept at `~/.hermes/profiles/qa/cache/scratch/t6r2/model-tiers.before.json`.
    - New tests: `test_install_unix.py` (refusal for each tier flag, the haiku default, help
      text) and `test_install_windows.py` (refusal run under `pwsh`, plus a static check).
+
+## Round 3 fixes
+
+Card `t_74e4149b`, 2026-11-02 ~14:25 EET. No live API calls in this round, so no spend and no
+ledger rows.
+
+1. **The live team's tier table still had `fast` = `openrouter` / `liquid/d1.1`.**
+   - The round 2 fix rewrote only `~/.hermes/dev-team/model-tiers.json`. The current `dev-`
+     team was installed from the **devops** profile, so its table is
+     `~/.hermes/profiles/devops/dev-team/model-tiers.json` (written 12:40, before the round 2
+     fix).
+   - Every installed `dev-*` profile links to that file: dev-architect, dev-backend-db,
+     dev-devops, dev-frontend, dev-pm, dev-qa, dev-reviewer and dev-uiux. I checked each link
+     with `readlink -f`.
+   - **Fix:** an operator edit of that one file, changing only `fast` to `anthropic` /
+     `claude-haiku-4-5`. `standard` and `deep` are unchanged. I chose this over re-running the
+     installer because a re-run would also rewrite every `dev-*` profile, which this card does
+     not need. The previous file is kept at
+     `~/.hermes/profiles/qa/cache/scratch/t6r3/devops-model-tiers.before.json`.
+   - **Check:** `_tier_override` reads each tier through `profiles/dev-pm`, `profiles/devops`
+     and `~/.hermes` (read-only, no API call). All three give `fast` → haiku, `standard` →
+     sonnet-5 and `deep` → opus-5, each with `override_reason` null. Only two real
+     `model-tiers.json` files exist under `~/.hermes` (the two above), and
+     `grep -l 'liquid/d1.1\|pplx-decider'` matches neither.
+   - **Caveat, for whoever reinstalls:** the installed `dev-pm` skills were copied on Oct 29,
+     before this branch. Its `dev-team-stage-plan/SKILL.md` does not mention `deciders` yet,
+     so today's live `dev-pm` does not call `deciders tier`. It will once the team is
+     reinstalled from this branch. The table had to be fixed anyway, because that reinstall
+     links to this same root, and the `deciders` wrapper on PATH runs the repo copy directly.
+2. **Read-time check (recommended by the reviewer, done).** `_tier_override` now refuses a
+   table entry that names a `DECISION_MODELS` model. It uses the installers' rule: the bare
+   model or `provider/model`, either exact or followed by a dated `-…` suffix.
+   - On a match, `override` is null and `override_reason` is
+     `decisions-only model for <tier>: <provider>/<model>`.
+   - Run against a copy of the pre-fix devops table, `fast` gives
+     `(None, 'decisions-only model for fast: openrouter/liquid/d1.1')`.
+   - New tests in `TierOverrideTableTests`: refusal of `liquid/d1.1`, its dated variant,
+     `liquid` + `d1.1`, and `perplexity/pplx-decider-v1.2`; plus a near miss (`liquid/d1.10`)
+     that is still used. Before the code change, the 4 refusal subtests failed on
+     `assertIsNone(data["override"])`.
+   - `dev-team-stage-plan/SKILL.md` gets the same rule for the pm's own table lookup (the path
+     where a soul rule changed the tier), so that path cannot skip the check.
+   - Suites: deciders 56 OK, forge 88 OK, dev-team-gate 228 OK, skills 4 OK, scripts 5 OK.
 
 ## Step 1: live calls (round 2, all through the shipped CLI)
 
@@ -260,14 +304,22 @@ $ grep -rl "<the OpenRouter key prefix>" ~/.hermes/dev-team/ # 1 match: pending-
    `deciders tier` read.
    - The installer writes it to `$HERMES_ROOT/dev-team/` (the root of the installing process's
      `hermes config path`), and links every installed profile's `dev-team/` to it.
-   - `~/.hermes/dev-team/model-tiers.json` is that table for the default `HERMES_HOME`. Builder
-     calls run with `HERMES_HOME=$HOME/.hermes` use it, and it is kept.
-   - The installer must therefore run with `HERMES_HOME=$HOME/.hermes` (or no override).
-     Run from inside a profile, it writes the table into that profile instead, which is how
-     the stray qa-profile table appeared. The operator has deleted that table.
-3. **The `tier` table is not checked when it is read.** The installers now refuse
-   decisions-only models, but a hand-edited `model-tiers.json` can still name one. Not in scope
-   for this round.
+   - **The current `dev-` install is rooted at the devops profile.** Its table is
+     `~/.hermes/profiles/devops/dev-team/model-tiers.json`, and every installed `dev-*`
+     profile's `dev-team/model-tiers.json` links there. That is the table the team reads.
+     Round 3 corrected its `fast` entry (see Round 3 fixes).
+   - `~/.hermes/dev-team/model-tiers.json` is a separate table, for the default `HERMES_HOME`.
+     Only builder calls run with `HERMES_HOME=$HOME/.hermes` (this build's probes) read it. It
+     is kept, and its content now matches the devops table.
+   - So a fix to the team's table must go to the root it was installed from. A reinstall must
+     run from that same `HERMES_HOME` (devops today), or the new table lands in a different
+     root and the team keeps reading the old one. Run from any other profile, the installer
+     writes the table into that profile, which is how the stray qa-profile table appeared. The
+     operator has deleted that table.
+3. **The `tier` table is checked when it is read: closed in round 3.** A hand-edited entry that
+   names a decisions-only model now gets no override, and `override_reason` says why. Other
+   wrong entries (an unknown provider, a misspelled chat model) are still passed through as
+   they are.
 4. **The ledger's `task_id` is null** on round-2 rows, because `HERMES_KANBAN_TASK` is not set
    in this worker's terminal environment. `board` is set. The operator's Step 3 ledger line has
    the same gap: the worker env passes no task id to `deciders`. Known gap, not a blocker.
