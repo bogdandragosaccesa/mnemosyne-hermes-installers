@@ -457,6 +457,78 @@ class LedgerWrittenOnSuccessTests(unittest.TestCase):
             self.assertEqual(len(lines_after), 1)
 
 
+class DispatchedWorkerTaskIdTests(unittest.TestCase):
+    """T3: proves the real root cause and its fix.
+
+    A dispatched worker's *subprocess* environment (what `deciders` is
+    actually invoked with, via a plain shell or `secret exec`) was probed
+    directly on a live dispatched task: HERMES_KANBAN_BOARD,
+    HERMES_KANBAN_WORKSPACE and sibling vars were present, but
+    HERMES_KANBAN_TASK was not -- `printenv HERMES_KANBAN_TASK` failed
+    even with no `secret exec` involved. So `env.get("HERMES_KANBAN_TASK")`
+    alone can never populate the ledger's task_id from that process. This
+    test models exactly that environment (board set, task env var absent)
+    and proves the `--task-id` flag is what makes task_id non-null.
+    """
+
+    def test_task_id_env_var_absent_still_yields_non_null_task_id_via_flag(self):
+        fixture = _load_fixture("decide_ok.json")
+        # Models the probed dispatched-worker subprocess env exactly:
+        # board present, task id genuinely absent (not just empty).
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_BOARD"] = "dev-team-followups"
+        self.assertNotIn("HERMES_KANBAN_TASK", env)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json"),
+                 "--task-id", "t_a77c9659"],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["board"], "dev-team-followups")
+            self.assertEqual(record["task_id"], "t_a77c9659")
+
+    def test_task_id_flag_wins_over_env_var_when_both_present(self):
+        fixture = _load_fixture("decide_ok.json")
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_TASK"] = "t_stale_env_value"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, _ = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json"),
+                 "--task-id", "t_explicit"],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["task_id"], "t_explicit")
+
+    def test_no_task_id_flag_falls_back_to_env_var(self):
+        # Backward compatible: callers that still rely on the env var
+        # (e.g. a non-dispatched interactive session where it happens to
+        # be set) keep working with no flag passed at all.
+        fixture = _load_fixture("decide_ok.json")
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_TASK"] = "t_from_env"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, _ = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["task_id"], "t_from_env")
+
+
 class M1LedgerWrittenOnFailedValidationTests(unittest.TestCase):
     """M1: the transport returned (and was billed), but validation after
     that still fails -- a ledger line must be written anyway, with

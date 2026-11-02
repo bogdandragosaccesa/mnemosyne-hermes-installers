@@ -320,9 +320,19 @@ $ grep -rl "<the OpenRouter key prefix>" ~/.hermes/dev-team/ # 1 match: pending-
    names a decisions-only model now gets no override, and `override_reason` says why. Other
    wrong entries (an unknown provider, a misspelled chat model) are still passed through as
    they are.
-4. **The ledger's `task_id` is null** on round-2 rows, because `HERMES_KANBAN_TASK` is not set
-   in this worker's terminal environment. `board` is set. The operator's Step 3 ledger line has
-   the same gap: the worker env passes no task id to `deciders`. Known gap, not a blocker.
+4. **Fixed (T3 followup, `dev-team-followups`).** The ledger's `task_id` was null on round-2
+   rows because `HERMES_KANBAN_TASK` is not set in this worker's terminal environment, while
+   `board` is. Root-caused by probing a live dispatched task's actual shell env directly
+   (`printenv HERMES_KANBAN_TASK` with no `secret exec` involved): `HERMES_KANBAN_BOARD`,
+   `HERMES_KANBAN_WORKSPACE`, `HERMES_KANBAN_DB` and others were all present, but
+   `HERMES_KANBAN_TASK` was absent — ruling out `secret exec` scrubbing (it `export`s then
+   `exec`s, inheriting the full environment) and pointing instead at the harness never handing
+   that one variable to the subprocess a dispatched worker's shell commands run in, even though
+   the worker's own tool-calling context (and therefore the calling agent) does know its task
+   id. Fix: `deciders` now takes an explicit `--task-id` flag on every subcommand, which
+   `append_ledger` prefers over `$HERMES_KANBAN_TASK`; the skill instructs always passing it
+   with the agent's own known task id. The env var remains a fallback for callers that don't
+   pass the flag.
 5. **Fixed in round 2 (operator request):** the `dev-team-gate` failure
    `test_prefixed_assignees.test_no_line_about_assignees_names_a_bare_role`, failing since
    `aeb21ca`. `dev-team-deciders/SKILL.md` said "**Plan stage (pm):**". It now says

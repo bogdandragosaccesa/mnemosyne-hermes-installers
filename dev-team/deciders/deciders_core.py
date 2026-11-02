@@ -127,20 +127,37 @@ def ledger_path(home: Path) -> Path:
 
 
 def append_ledger(
-    home: Path, env: Mapping[str, str], subcommand: str, model: str, cost: float
+    home: Path,
+    env: Mapping[str, str],
+    subcommand: str,
+    model: str,
+    cost: float,
+    *,
+    task_id: "str | None" = None,
 ) -> None:
     """Append one spend record as a single atomic write() of one JSON line.
 
     Opened with ``O_APPEND`` and written in one ``os.write`` call so
     concurrent appenders (multiple profiles, multiple processes) each land
     a whole, valid line -- never an interleaved partial write.
+
+    ``task_id``, when given, is the explicit ``--task-id`` CLI value and
+    always wins. ``$HERMES_KANBAN_TASK`` is read only as a fallback: a
+    dispatched worker's own harness process knows its task id, but that
+    variable is not reliably present in the environment a *subprocess*
+    (such as this CLI, invoked via `secret exec` or a plain shell command)
+    inherits -- proved by probing a real dispatched-worker shell, where
+    sibling vars like HERMES_KANBAN_BOARD and HERMES_KANBAN_WORKSPACE were
+    set but HERMES_KANBAN_TASK was not. Callers that know their task id
+    (the skill instructs passing it explicitly) should always pass it.
     """
+    resolved_task_id = task_id if task_id else (env.get("HERMES_KANBAN_TASK") or None)
     record = {
         "ts": datetime.datetime.now(datetime.timezone.utc)
         .isoformat(timespec="milliseconds")
         .replace("+00:00", "Z"),
         "board": env.get("HERMES_KANBAN_BOARD") or None,
-        "task_id": env.get("HERMES_KANBAN_TASK") or None,
+        "task_id": resolved_task_id,
         "subcommand": subcommand,
         "model": model,
         "cost": cost,
@@ -529,20 +546,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_decide.add_argument("--state", required=True)
     p_decide.add_argument("--questions", required=True)
     p_decide.add_argument("--model")
+    p_decide.add_argument("--task-id")
 
     p_extract = sub.add_parser("extract")
     p_extract.add_argument("--entities", required=True)
     p_extract.add_argument("--input")
     p_extract.add_argument("--model")
+    p_extract.add_argument("--task-id")
 
     p_summarize = sub.add_parser("summarize")
     p_summarize.add_argument("--input")
     p_summarize.add_argument("--model")
+    p_summarize.add_argument("--task-id")
 
     p_tier = sub.add_parser("tier")
     p_tier.add_argument("--title", required=True)
     p_tier.add_argument("--spec", required=True)
     p_tier.add_argument("--model")
+    p_tier.add_argument("--task-id")
 
     return parser
 
@@ -562,6 +583,7 @@ def main(
 ) -> int:
     key = None
     ledger_info: dict = {}
+    task_id: "str | None" = None
     try:
         try:
             args = _build_parser().parse_args(argv)
@@ -582,13 +604,19 @@ def main(
         key = (env.get("OPENROUTER_DECIDERS_KEY") or "").strip() or None
         if not key:
             raise DecidersError("deciders: no-key")
+        # The explicit --task-id flag always wins over $HERMES_KANBAN_TASK:
+        # see append_ledger's docstring for why the env var alone is not
+        # trustworthy in a dispatched worker's subprocess environment.
+        task_id = (getattr(args, "task_id", None) or "").strip() or None
         handler = _DISPATCH[args.command]
         result = handler(args, key, transport, ledger_info)
         if args.command == "tier":
             override, override_reason = _tier_override(home, result["tier"])
             result = dict(result, override=override, override_reason=override_reason)
         ledger_info["success_write_attempted"] = True
-        append_ledger(home, env, args.command, result["model"], result["cost"])
+        append_ledger(
+            home, env, args.command, result["model"], result["cost"], task_id=task_id
+        )
     except Exception as exc:  # catch-all: never let an exception escape unredacted
         # M1: the transport may have returned (and been billed) even though
         # a later validation step raised -- write that spend too, cost 0.0
@@ -602,6 +630,7 @@ def main(
                     home, env, ledger_info.get("command", "?"),
                     ledger_info.get("model") or "unknown",
                     ledger_info.get("cost", 0.0),
+                    task_id=task_id,
                 )
             except OSError as le:
                 ledger_error = le
