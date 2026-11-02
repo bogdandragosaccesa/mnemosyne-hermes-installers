@@ -472,6 +472,14 @@ class ResponseShapeTests(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(json.loads(stdout)["cost"], 0.0003)
 
+    def test_non_finite_or_negative_cost_is_bad_response(self):
+        # I1: a NaN, infinite or negative cost must never reach the ledger
+        # (it would poison the board's budget gate -- see kanban-budget.py).
+        for cost in (float("nan"), float("inf"), float("-inf"), -50, -0.001):
+            with self.subTest(cost=cost):
+                response = dict(_load_fixture("decide_ok.json"), cost=cost)
+                self._assert_bad_response(self._decide(response))
+
 
 class EmptyInputTests(unittest.TestCase):
     """No --input (or an empty one) must not send an empty prompt to a paid model."""

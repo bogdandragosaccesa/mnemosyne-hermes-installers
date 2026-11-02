@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -60,6 +61,25 @@ def hermes_root() -> Path:
             return cfg
     except (OSError, subprocess.SubprocessError):
         pass
+    return Path.home() / ".hermes"
+
+
+def resolve_team_home() -> Path:
+    """Where ``dev-team/`` actually resolves from this process's own
+    environment -- mirrors ``deciders.py``'s ``_home()`` exactly: plain
+    ``$HERMES_HOME``, never climbed out of a profile.
+
+    I2: ``hermes_root()`` above climbs out of ``profiles/<name>`` because
+    board databases live at the true Hermes root. But when the team was
+    *installed* while a profile-scoped ``HERMES_HOME`` was active, the
+    installer wrote (or linked) ``dev-team/`` inside that profile, not at
+    the climbed root -- and that is exactly where ``deciders`` itself reads
+    and writes the ledger, through ``$HERMES_HOME/dev-team/...``, same as
+    here. Climbing here would silently read a different, unrelated file.
+    """
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        return Path(home)
     return Path.home() / ".hermes"
 
 
@@ -119,7 +139,15 @@ def load_sessions(root: Path, profile: str) -> list[sqlite3.Row]:
         con.close()
 
 
-def collect(root: Path, board: str) -> dict:
+def collect(root: Path, board: str, team_home: Path | None = None) -> dict:
+    """``root`` is the Hermes root a board's kanban.db and sessions live
+    under. ``team_home`` is where ``dev-team/deciders-ledger.jsonl`` is
+    read from; it defaults to ``root`` (the historical behaviour), but the
+    live team home is actually ``$HERMES_HOME`` un-climbed (see
+    ``team_home()``) -- I2: when the install was rooted at a profile, that
+    is not the same path ``root`` resolves to, and ``main()`` passes the
+    correct one.
+    """
     con = ro(board_db(root, board))
     if con is None:
         sys.exit(f"No kanban database for board '{board}' "
@@ -188,7 +216,12 @@ def collect(root: Path, board: str) -> dict:
             if (p, s["id"]) not in claimed:
                 unattributed += float(s["act"] or 0) or float(s["est"] or 0)
 
-    deciders = deciders_spend(root, board)
+    deciders_amount, deciders_corrupt = deciders_spend_detailed(
+        team_home if team_home is not None else root, board)
+    if deciders_corrupt:
+        print(f"warning: skipped {deciders_corrupt} corrupt line(s) in "
+              f"{ledger_path(team_home if team_home is not None else root)}",
+              file=sys.stderr)
     runs_total = sum(r["cost"] for r in runs)
 
     return {
@@ -197,8 +230,9 @@ def collect(root: Path, board: str) -> dict:
         "runs": runs,
         "per_task": per_task,
         "per_role": per_role,
-        "deciders": deciders,
-        "total": round(runs_total + deciders, 6),
+        "deciders": deciders_amount,
+        "deciders_corrupt": deciders_corrupt,
+        "total": round(runs_total + deciders_amount, 6),
         "unattributed": round(unattributed, 6),
     }
 
@@ -214,20 +248,47 @@ def ledger_path(root: Path) -> Path:
     return root / "dev-team" / "deciders-ledger.jsonl"
 
 
+def _parse_cost(value) -> float | None:
+    """A ledger cost must be a finite, non-negative, non-bool int/float.
+
+    Returns the parsed float, or None if the value is corrupt (NaN,
+    +/-Infinity, negative, a bool, or anything that is not a plain number
+    -- including a numeric-looking string: `float("-1e9")` would otherwise
+    silently succeed and poison the total, see I1).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
 def deciders_spend(root: Path, board: str) -> float:
     """Sum of ``cost`` for ledger records tagged with this board.
 
     Missing ledger file -> 0.0 (no decider calls made yet, not an error).
-    A line that isn't valid JSON, isn't an object, or has a non-numeric
-    ``cost`` is skipped rather than crashing the whole report; skipped lines
-    are tallied and reported once as a warning so a corrupt ledger is never
-    silently invisible.
+    A line that isn't valid JSON, isn't an object, or has a ``cost`` that
+    is not a finite, non-negative number is corrupt: skipped rather than
+    crashing the whole report, but tallied and warned once so a corrupt
+    ledger is never silently invisible. See also ``deciders_spend_detailed``,
+    which a caller that must fail closed on corruption (I1) should use.
     """
+    total, corrupt = deciders_spend_detailed(root, board)
+    if corrupt:
+        print(f"warning: skipped {corrupt} corrupt line(s) in {ledger_path(root)}",
+              file=sys.stderr)
+    return total
+
+
+def deciders_spend_detailed(root: Path, board: str) -> tuple[float, int]:
+    """Like ``deciders_spend``, but also returns the corrupt-line count
+    (without printing), so a caller can fail closed on it (I1)."""
     path = ledger_path(root)
     try:
         text = path.read_text()
     except OSError:
-        return 0.0
+        return 0.0, 0
 
     total = 0.0
     corrupt = 0
@@ -245,16 +306,13 @@ def deciders_spend(root: Path, board: str) -> float:
             continue
         if record.get("board") != board:
             continue
-        try:
-            total += float(record.get("cost") or 0)
-        except (TypeError, ValueError):
+        cost = _parse_cost(record.get("cost", 0))
+        if cost is None:
             corrupt += 1
             continue
+        total += cost
 
-    if corrupt:
-        print(f"warning: skipped {corrupt} corrupt line(s) in {path}",
-              file=sys.stderr)
-    return round(total, 6)
+    return round(total, 6), corrupt
 
 
 def budget_file(root: Path, board: str) -> Path:
@@ -318,6 +376,15 @@ def report(data: dict, budget: float | None, reserve_pct: float) -> int:
           f"(profile sessions outside any run window — interactive chats, "
           f"other boards)")
 
+    # I1: a corrupt ledger line (NaN/inf/negative/non-numeric cost) must not
+    # let the gate look healthy just because the parseable total is low --
+    # fail closed regardless of budget math.
+    if data.get("deciders_corrupt"):
+        w("")
+        w(f"  ** {data['deciders_corrupt']} corrupt decider-ledger line(s) — "
+          f"failing closed. Inspect the ledger before trusting this total. **")
+        return 2
+
     rc = 0
     if budget:
         spent = data["total"]
@@ -375,7 +442,7 @@ def main() -> int:
         print(f"Recorded in {p}")
         return 0
 
-    data = collect(root, board)
+    data = collect(root, board, team_home=resolve_team_home())
     rec = read_budget(root, board)
     budget = args.budget if args.budget is not None else rec.get("budget_usd")
     reserve = args.reserve_pct if args.reserve_pct != 15.0 else rec.get(
@@ -389,7 +456,8 @@ def main() -> int:
             data["remaining_usable"] = round(
                 max(budget * (1 - reserve / 100) - data["total"], 0), 6)
         print(json.dumps(data, indent=2, default=str))
-        return 0
+        # I1: a corrupt ledger line fails closed here too, same as report().
+        return 2 if data.get("deciders_corrupt") else 0
 
     return report(data, budget, reserve)
 

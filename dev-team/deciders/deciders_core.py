@@ -280,7 +280,13 @@ def _cost(data: dict) -> float:
             cost = usage.get("cost")
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
         raise DecidersError("deciders: bad-response", "cost missing or not a number")
-    return float(cost)
+    cost = float(cost)
+    # I1: NaN/inf/negative must never reach the ledger -- a NaN total makes
+    # the board budget gate's spent >= budget check silently False, and a
+    # negative cost quietly refunds spend no call actually returned.
+    if not math.isfinite(cost) or cost < 0:
+        raise DecidersError("deciders: bad-response", "cost is not finite and non-negative")
+    return cost
 
 
 def _require_input(text: str) -> str:
