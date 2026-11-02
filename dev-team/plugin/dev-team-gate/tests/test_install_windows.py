@@ -662,6 +662,27 @@ class WorkflowTests(unittest.TestCase):
         self.has("mnemosyne.db", job, "no Mnemosyne DB check")
         self.has("dev-team-gate\\guard.py", job, "no guard.py check")
 
+    def test_windows_powershell_51_job_tests_junction_based_migration(self):
+        # D6 (review): the scan loop and the junction relink had no test
+        # exercising them, even with pwsh. Must build a junction-based old
+        # home under a profile, run the installer, and assert the data
+        # moved, the junctions point at the root, the old path still
+        # resolves (D3), and the backup is intact.
+        job = self.job("install-windows-ps51")
+        self.has("New-Item -ItemType Junction -Path (Join-Path $pmDir 'dev-team')", job,
+                  "no junction-based old home built under a profile")
+        self.has("deciders-ledger.jsonl", job, "no data-moved assertion")
+        self.has("LinkType", job, "no junction-points-at-the-root assertion")
+        self.has("D3: old path", job, "no old-path-still-resolves (D3) assertion")
+        self.has("pre-root-migration-", job, "no backup-intact assertion")
+        # The migration test runs between the two installer invocations.
+        first_run = job.index("install-dev-team-windows.ps1")
+        junction_build = job.index("New-Item -ItemType Junction -Path (Join-Path $pmDir 'dev-team')")
+        second_run = job.rindex("install-dev-team-windows.ps1")
+        self.assertLess(junction_build, first_run, "old home must be built before the first run")
+        self.assertLess(first_run, job.index("D3: old path"), "D3 assertion must run after the first (migrating) run")
+        self.assertLess(job.index("D3: old path"), second_run, "D6 assertions must run before the idempotency re-run")
+
     def test_linux_job_asserts_first_run_exit_0_and_shared_mnemosyne_links(self):
         job = self.job("install-linux")
         self.has("first run must exit 0", job, "no first-run exit check")

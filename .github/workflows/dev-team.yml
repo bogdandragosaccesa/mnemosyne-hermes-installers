@@ -214,11 +214,59 @@ jobs:
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 5) { Write-Error "expected 5.1, got $($PSVersionTable.PSVersion)"; exit 1 }
 
+      # D6 (review): the scan loop and the junction relink had no test
+      # exercising them, even with pwsh. Build a junction-based old team
+      # home under dev-pm (mirroring the historical T4 bug: a profile's
+      # dev-team junction pointing at a real directory that still holds
+      # the live data) before the first real run, so that run has to
+      # detect and migrate it.
+      - name: Build a junction-based old team home under dev-pm (D6)
+        shell: powershell
+        run: |
+          hermes profile create dev-pm --clone
+          $pmDir = Split-Path -Parent (hermes -p dev-pm config path | Select-Object -Last 1)
+          $oldHome = Join-Path $env:RUNNER_TEMP 'old-root\dev-team'
+          New-Item -ItemType Directory -Path $oldHome -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $oldHome 'deciders-ledger.jsonl') -Value 'ledger-data' -NoNewline
+          New-Item -ItemType Junction -Path (Join-Path $pmDir 'dev-team') -Target $oldHome | Out-Null
+          "OLD_TEAM_HOME=$oldHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PM_DIR=$pmDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: dev-team install (run 1, 5.1)
         shell: powershell
         run: |
           dev-team\install-dev-team-windows.ps1 -SkipModel
           if ($LASTEXITCODE -ne 0) { Write-Error "first run must exit 0 on a fresh machine"; exit 1 }
+
+      - name: junction-based old home migrated to the root (D6)
+        shell: powershell
+        run: |
+          $root = Split-Path -Parent (hermes config path | Select-Object -Last 1)
+          $newHome = Join-Path $root 'dev-team'
+          $ledger = Join-Path $newHome 'deciders-ledger.jsonl'
+          if (-not (Test-Path -LiteralPath $ledger)) { Write-Error "D6: data did not move to the root ($ledger missing)"; exit 1 }
+          if ((Get-Content -LiteralPath $ledger -Raw).Trim() -ne 'ledger-data') { Write-Error "D6: ledger content lost in migration"; exit 1 }
+
+          $pmLink = Get-Item -LiteralPath (Join-Path $env:PM_DIR 'dev-team') -Force
+          if (-not $pmLink.LinkType) { Write-Error "D6: dev-pm/dev-team is not a junction after migration"; exit 1 }
+          $pmTarget = (($pmLink.Target | Select-Object -First 1)).TrimEnd('\')
+          if ($pmTarget -ne $newHome.TrimEnd('\')) { Write-Error "D6: dev-pm/dev-team junction points at $pmTarget, not the root $newHome"; exit 1 }
+
+          # D3: the old physical path must still resolve, through a junction left behind.
+          if (-not (Test-Path -LiteralPath $env:OLD_TEAM_HOME)) { Write-Error "D3: old path $env:OLD_TEAM_HOME no longer resolves"; exit 1 }
+          $oldItem = Get-Item -LiteralPath $env:OLD_TEAM_HOME -Force
+          if (-not $oldItem.LinkType) { Write-Error "D3: old path is not a junction after migration"; exit 1 }
+          if ((Get-Content -LiteralPath (Join-Path $env:OLD_TEAM_HOME 'deciders-ledger.jsonl') -Raw).Trim() -ne 'ledger-data') {
+            Write-Error "D3: old path no longer resolves to the data"; exit 1
+          }
+
+          # The backup must be intact.
+          $backupParent = Split-Path -Parent $env:OLD_TEAM_HOME
+          $backup = Get-ChildItem -Path $backupParent -Filter 'dev-team.pre-root-migration-*' -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $backup) { Write-Error "D6: no backup directory found under $backupParent"; exit 1 }
+          if ((Get-Content -LiteralPath (Join-Path $backup.FullName 'deciders-ledger.jsonl') -Raw).Trim() -ne 'ledger-data') {
+            Write-Error "D6: backup is missing or corrupt"; exit 1
+          }
 
       - name: dev-team install (run 2, 5.1 - replaces every link)
         shell: powershell
