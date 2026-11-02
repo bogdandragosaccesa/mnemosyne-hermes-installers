@@ -132,6 +132,34 @@ class WindowsInstallerTests(unittest.TestCase):
             self.assertIn("decisions-only", proc.stderr)
             self.assertIn("-Model", proc.stderr)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_M8_refuses_an_empty_tier_fast_value(self):
+        # -TierFast '' used to be treated as "not passed" ($TierFast is
+        # falsy for an empty string in PowerShell) and silently default --
+        # must now refuse, same as the Unix installer's empty-model case.
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1),
+                 "-DryRun", "-TierFast", ""],
+                capture_output=True, text=True, timeout=120,
+                env={"HOME": tmp, "PATH": "/usr/bin:/bin:/snap/bin",
+                     "USERPROFILE": tmp})
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("-TierFast", proc.stderr)
+
+    def test_wrappers_name_a_resolved_python_not_a_bare_python(self):
+        # A bare `python` hits the Microsoft Store alias stub on machines with
+        # no system Python ("Python was not found", exit 9009), which failed
+        # both Windows CI jobs. Both wrappers must call the resolved
+        # interpreter, and the installer must refuse when none is found.
+        for var in ("forgeCmdContent", "decidersCmdContent"):
+            line = re.search(var + r" = (.*)", self.text).group(1)
+            self.assertIn("$WrapperPython", line, f"{var} does not use $WrapperPython")
+            self.assertNotRegex(line, r"`r`npython ", f"{var} still calls a bare python")
+        self.assertIn("function Resolve-WrapperPython", self.text)
+        self.assertIn("WindowsApps", self.text, "resolver does not skip the Store alias stub")
+        self.assertIn("No Python 3 found for the forge and deciders wrappers", self.text)
+
     def test_deciders_cmd_propagates_exit_code_explicitly(self):
         # install-windows-ps51 (run 41451251672): `deciders --help` FAILED
         # with no explanation, because (a) the .cmd wrapper let cmd.exe's

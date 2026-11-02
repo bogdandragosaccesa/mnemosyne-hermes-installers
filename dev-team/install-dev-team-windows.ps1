@@ -134,7 +134,7 @@ function Split-ProviderModel {
 
 # deciders tier table. -TierFast/-TierStandard/-TierDeep default from
 # $FastModel/$MidModel/$FrontierModel, split on their first '/'.
-if ($TierFast) {
+if ($PSBoundParameters.ContainsKey('TierFast')) {
     $parts = Split-TierPM $TierFast '-TierFast'
     $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
 } else {
@@ -142,7 +142,7 @@ if ($TierFast) {
     $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
 }
 
-if ($TierStandard) {
+if ($PSBoundParameters.ContainsKey('TierStandard')) {
     $parts = Split-TierPM $TierStandard '-TierStandard'
     $TierStandardProvider = $parts[0]; $TierStandardModel = $parts[1]
 } else {
@@ -150,7 +150,7 @@ if ($TierStandard) {
     $TierStandardProvider = $parts[0]; $TierStandardModel = $parts[1]
 }
 
-if ($TierDeep) {
+if ($PSBoundParameters.ContainsKey('TierDeep')) {
     $parts = Split-TierPM $TierDeep '-TierDeep'
     $TierDeepProvider = $parts[0]; $TierDeepModel = $parts[1]
 } else {
@@ -698,14 +698,44 @@ if (Test-Selected $EntryProfile) {
     }
 }
 
+# The wrappers name an absolute python.exe. A bare `python` resolves, on a
+# machine without a system Python, to the Microsoft Store alias stub in
+# WindowsApps, which prints 'Python was not found' and exits 9009 (seen in
+# CI on both runners). Prefer the interpreter Hermes itself installed, then
+# the py launcher's Python 3, then a real python.exe on PATH.
+function Resolve-WrapperPython {
+    $toolsDir = Join-Path $env:LOCALAPPDATA 'hermes\tools'
+    if (Test-Path -LiteralPath $toolsDir) {
+        $hermesPy = Get-ChildItem -LiteralPath $toolsDir -Directory -Filter 'python-3*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($hermesPy) { return $hermesPy }
+    }
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $launched = & py -3 -c 'import sys; print(sys.executable)' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $launched -and (Test-Path -LiteralPath $launched.Trim())) { return $launched.Trim() }
+    }
+    $onPath = Get-Command python -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and $_.Source -notmatch '\\WindowsApps\\' } | Select-Object -First 1
+    if ($onPath) { return $onPath.Source }
+    return $null
+}
+$WrapperPython = Resolve-WrapperPython
+if (-not $WrapperPython) {
+    [Console]::Error.WriteLine("No Python 3 found for the forge and deciders wrappers (looked in $env:LOCALAPPDATA\hermes\tools, the py launcher, and PATH outside WindowsApps). Install Hermes or Python 3, then re-run.")
+    exit 1
+}
+Write-Host "wrapper python: $WrapperPython"
+
 # forge on a PATH the gateway sees. On Windows that is the same directory
 # hermes.exe itself resolves from on PATH - the lesson from the graft plugin
 # work, carried over from the Unix installer's ~/.local/bin/forge. A thin
 # .cmd wrapper so every profile's own `python` need not be found separately
 # - the forge directory holds its own imports (adapters, forge_core) that
 # resolve off the script's own path, so the wrapper only needs to point
-# python at forge.py itself.
-$forgeCmdContent = "@echo off`r`n$ForgeMarker`r`npython `"$ForgePy`" %*`r`n"
+# the resolved python at forge.py itself.
+$forgeCmdContent = "@echo off`r`n$ForgeMarker`r`n`"$WrapperPython`" `"$ForgePy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
 Set-Content -LiteralPath $forgeCmdPath -Value $forgeCmdContent -NoNewline -Encoding ascii
 Write-Host ''
 Write-Host "forge installed: $forgeCmdPath"
@@ -716,7 +746,7 @@ Write-Host "forge installed: $forgeCmdPath"
 # session (or under a shell that does not treat a bare batch-file
 # ERRORLEVEL as its own exit code) sees exit 0 regardless of python's real
 # exit code. python's own exit code is the whole point of this check.
-$decidersCmdContent = "@echo off`r`n$DecidersMarker`r`npython `"$DecidersPy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
+$decidersCmdContent = "@echo off`r`n$DecidersMarker`r`n`"$WrapperPython`" `"$DecidersPy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
 Set-Content -LiteralPath $decidersCmdPath -Value $decidersCmdContent -NoNewline -Encoding ascii
 Write-Host "deciders installed: $decidersCmdPath"
 
