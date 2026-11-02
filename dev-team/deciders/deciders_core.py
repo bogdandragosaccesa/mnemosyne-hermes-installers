@@ -203,7 +203,16 @@ def _tier_override(home: Path, tier: str):
     entry = table.get(tier) if isinstance(table, dict) else None
     if entry is None:
         return None, f"no entry for {tier}"
-    if isinstance(entry, dict) and _is_decision_model(entry):
+    # M8: a string entry, or {"provider": "anthropic", "model": ""}, must
+    # never be returned as a usable override -- require a dict with both
+    # provider and model as non-empty strings.
+    if (
+        not isinstance(entry, dict)
+        or not isinstance(entry.get("provider"), str) or not entry.get("provider")
+        or not isinstance(entry.get("model"), str) or not entry.get("model")
+    ):
+        return None, f"invalid entry for {tier} (must be {{provider, model}} with non-empty strings)"
+    if _is_decision_model(entry):
         # The installers refuse these, but a hand-edited table is read as-is.
         return None, f"decisions-only model for {tier}: {entry.get('provider')}/{entry.get('model')}"
     return entry, None
@@ -356,21 +365,51 @@ def _require_entities_record(entities) -> dict:
     return entities
 
 
-def _cmd_decide(args, key: str, transport: Transport) -> dict:
+def _mark_received(ledger_info: dict, command: str, requested_model: str, raw) -> None:
+    """M1: record that the transport returned, with a best-effort model
+    and cost, before any further validation that might raise -- so
+    `main()` can still write a ledger line (cost 0.0 if it doesn't parse)
+    even when validation fails after a call that was already billed."""
+    ledger_info["received"] = True
+    ledger_info["command"] = command
+    ledger_info["model"] = requested_model
+    if not isinstance(raw, dict):
+        return
+    resp_model = raw.get("model")
+    if isinstance(resp_model, str) and resp_model:
+        ledger_info["model"] = resp_model
+    cost = raw.get("cost")
+    if cost is None:
+        usage = raw.get("usage")
+        if isinstance(usage, dict):
+            cost = usage.get("cost")
+    if (
+        not isinstance(cost, bool) and isinstance(cost, (int, float))
+        and math.isfinite(cost) and cost >= 0
+    ):
+        ledger_info["cost"] = float(cost)
+
+
+def _cmd_decide(args, key: str, transport: Transport, ledger_info: dict) -> dict:
     state = _read_json(args.state)
     questions = _require_questions_record(_read_json(args.questions))
     model = args.model or DEFAULT_MODELS["decide"]
     body = {"model": model, "state": state, "questions": questions}
-    data = _require_dict(_call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S))
+    raw = _call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S)
+    _mark_received(ledger_info, "decide", model, raw)
+    data = _require_dict(raw)
 
     answers = data.get("answers")
     resp_model = data.get("model")
     if not isinstance(answers, dict) or not isinstance(resp_model, str):
         raise DecidersError("deciders: bad-response")
-    return {"answers": answers, "model": resp_model, "cost": _cost(data)}
+    cost = _cost(data)
+    ledger_info["model"] = resp_model
+    ledger_info["cost"] = cost
+    return {"answers": answers, "model": resp_model, "cost": cost}
 
 
-def _cmd_extract(args, key: str, transport: Transport) -> dict:
+def _cmd_extract(args, key: str, transport: Transport, ledger_info: dict) -> dict:
     entities_spec = _require_entities_record(_read_json(args.entities))
     input_text = _require_input(_read_text(args.input) if args.input else "")
     model = args.model or DEFAULT_MODELS["extract"]
@@ -379,7 +418,9 @@ def _cmd_extract(args, key: str, transport: Transport) -> dict:
         "messages": [{"role": "user", "content": input_text}],
         "provider": {"options": {"scaledown": {"entities": entities_spec}}},
     }
-    data = _require_dict(_call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S))
+    raw = _call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S)
+    _mark_received(ledger_info, "extract", model, raw)
+    data = _require_dict(raw)
 
     content = _chat_content(data)
     try:
@@ -392,28 +433,36 @@ def _cmd_extract(args, key: str, transport: Transport) -> dict:
     resp_model = data.get("model")
     if not isinstance(resp_model, str):
         raise DecidersError("deciders: bad-response")
-    return {"entities": entities, "model": resp_model, "cost": _cost(data)}
+    cost = _cost(data)
+    ledger_info["model"] = resp_model
+    ledger_info["cost"] = cost
+    return {"entities": entities, "model": resp_model, "cost": cost}
 
 
-def _cmd_summarize(args, key: str, transport: Transport) -> dict:
+def _cmd_summarize(args, key: str, transport: Transport, ledger_info: dict) -> dict:
     input_text = _require_input(_read_text(args.input) if args.input else "")
     model = args.model or DEFAULT_MODELS["summarize"]
     body = {"model": model, "messages": [{"role": "user", "content": input_text}]}
-    data = _require_dict(_call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S))
+    raw = _call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S)
+    _mark_received(ledger_info, "summarize", model, raw)
+    data = _require_dict(raw)
 
     content = _chat_content(data)
     resp_model = data.get("model")
     if not isinstance(resp_model, str):
         raise DecidersError("deciders: bad-response")
+    cost = _cost(data)
+    ledger_info["model"] = resp_model
+    ledger_info["cost"] = cost
     return {
         "summary": content,
         "evidence": False,
         "model": resp_model,
-        "cost": _cost(data),
+        "cost": cost,
     }
 
 
-def _cmd_tier(args, key: str, transport: Transport) -> dict:
+def _cmd_tier(args, key: str, transport: Transport, ledger_info: dict) -> dict:
     spec_text = _read_text(args.spec)[:20000]
     model = args.model or DEFAULT_MODELS["tier"]
     state = {"title": args.title, "spec": spec_text}
@@ -437,22 +486,30 @@ def _cmd_tier(args, key: str, transport: Transport) -> dict:
         }
     }
     body = {"model": model, "state": state, "questions": questions}
-    data = _require_dict(_call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S))
+    raw = _call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S)
+    # M1: mark received (and capture model/cost) before choose_tier, which
+    # can still raise on an unknown option or a bad probability sum -- a
+    # billed call that fails only there must still write a ledger line.
+    _mark_received(ledger_info, "tier", model, raw)
+    data = _require_dict(raw)
 
     answers = data.get("answers")
     resp_model = data.get("model")
     if not isinstance(answers, dict) or not isinstance(resp_model, str):
         raise DecidersError("deciders: bad-response")
+    ledger_info["model"] = resp_model
     answer = answers.get("tier")
     if not isinstance(answer, dict):
         raise DecidersError("deciders: bad-response")
     probabilities = answer.get("probabilities")
+    cost = _cost(data)
+    ledger_info["cost"] = cost
     tier = choose_tier(probabilities)
     return {
         "tier": tier,
         "probabilities": probabilities,
         "model": resp_model,
-        "cost": _cost(data),
+        "cost": cost,
     }
 
 
@@ -504,19 +561,50 @@ def main(
     out=sys.stdout,
 ) -> int:
     key = None
+    ledger_info: dict = {}
     try:
-        args = _build_parser().parse_args(argv)
+        try:
+            args = _build_parser().parse_args(argv)
+        except SystemExit as exc:
+            # argparse also raises SystemExit(0) for --help/-h, which is
+            # not an error and must exit cleanly with no stdout wrapper --
+            # only its genuine error path (a truthy/nonzero code) becomes
+            # the labelled bad-input contract below.
+            if not exc.code:
+                raise
+            # M2: argparse's own error path calls sys.exit(2), which
+            # `except Exception` below does not catch -- nothing would be
+            # printed to stdout at all. Convert to the same labelled
+            # contract as every other input problem.
+            raise DecidersError(
+                "deciders: bad-input", f"argument error (exit code {exc.code})"
+            ) from exc
         key = env.get("OPENROUTER_DECIDERS_KEY")
         if not key:
             raise DecidersError("deciders: no-key")
         handler = _DISPATCH[args.command]
-        result = handler(args, key, transport)
+        result = handler(args, key, transport, ledger_info)
         if args.command == "tier":
             override, override_reason = _tier_override(home, result["tier"])
             result = dict(result, override=override, override_reason=override_reason)
         append_ledger(home, env, args.command, result["model"], result["cost"])
     except Exception as exc:  # catch-all: never let an exception escape unredacted
-        _emit(out, {"error": scrub(str(exc), key)})
+        # M1: the transport may have returned (and been billed) even though
+        # a later validation step raised -- write that spend too, cost 0.0
+        # if it never parsed, rather than silently dropping it.
+        if ledger_info.get("received"):
+            append_ledger(
+                home, env, ledger_info.get("command", "?"),
+                ledger_info.get("model") or "unknown",
+                ledger_info.get("cost", 0.0),
+            )
+        # M2: a bare ValueError (e.g. http.client's "Invalid header value"
+        # for a malformed key) must not reach stdout unlabelled.
+        if isinstance(exc, ValueError) and not isinstance(exc, DecidersError):
+            message = f"deciders: bad-input: {exc}"
+        else:
+            message = str(exc)
+        _emit(out, {"error": scrub(message, key)})
         return EXIT_UNANSWERED
     _emit(out, result)
     return EXIT_OK

@@ -167,6 +167,15 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertNotIn(".env", proc.stdout)
         self.assertIn("OPENROUTER_DECIDERS_KEY", proc.stdout)
 
+    def test_M8_refuses_an_empty_model_with_a_colon(self):
+        # "--tier-fast anthropic:" has a colon (passes the PROVIDER:MODEL
+        # shape check) but an empty model -- must not silently write
+        # {"provider": "anthropic", "model": ""} to model-tiers.json.
+        proc = self.install("--tier-fast", "anthropic:")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--tier-fast", proc.stderr)
+        self.assertFalse((self.root / "dev-team" / "model-tiers.json").exists())
+
     def test_refuses_a_decisions_only_model_as_a_tier(self):
         # liquid/d1.1 and pplx-decider only answer /api/alpha/decisions; an
         # agent worker on a card routed to one of them cannot run at all.

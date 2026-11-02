@@ -120,6 +120,9 @@ fi
 if [[ -n $TIER_FAST_PM ]]; then
     TIER_FAST_PROVIDER="${TIER_FAST_PM%%:*}"
     TIER_FAST_MODEL="${TIER_FAST_PM#*:}"
+    # M8: "anthropic:" (empty model, but still has a colon) must be
+    # refused, not silently written as {"provider": "anthropic", "model": ""}.
+    [[ -n $TIER_FAST_PROVIDER && -n $TIER_FAST_MODEL ]] || { echo "--tier-fast must be PROVIDER:MODEL with both non-empty (got '$TIER_FAST_PM')" >&2; exit 2; }
 else
     TIER_FAST_PROVIDER="${FAST_MODEL%%/*}"
     TIER_FAST_MODEL="${FAST_MODEL#*/}"
@@ -128,6 +131,7 @@ fi
 if [[ -n $TIER_STANDARD_PM ]]; then
     TIER_STANDARD_PROVIDER="${TIER_STANDARD_PM%%:*}"
     TIER_STANDARD_MODEL="${TIER_STANDARD_PM#*:}"
+    [[ -n $TIER_STANDARD_PROVIDER && -n $TIER_STANDARD_MODEL ]] || { echo "--tier-standard must be PROVIDER:MODEL with both non-empty (got '$TIER_STANDARD_PM')" >&2; exit 2; }
 else
     TIER_STANDARD_PROVIDER="${MID_MODEL%%/*}"
     TIER_STANDARD_MODEL="${MID_MODEL#*/}"
@@ -136,6 +140,7 @@ fi
 if [[ -n $TIER_DEEP_PM ]]; then
     TIER_DEEP_PROVIDER="${TIER_DEEP_PM%%:*}"
     TIER_DEEP_MODEL="${TIER_DEEP_PM#*:}"
+    [[ -n $TIER_DEEP_PROVIDER && -n $TIER_DEEP_MODEL ]] || { echo "--tier-deep must be PROVIDER:MODEL with both non-empty (got '$TIER_DEEP_PM')" >&2; exit 2; }
 else
     TIER_DEEP_PROVIDER="${FRONTIER_MODEL%%/*}"
     TIER_DEEP_MODEL="${FRONTIER_MODEL#*/}"

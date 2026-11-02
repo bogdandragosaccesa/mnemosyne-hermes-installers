@@ -621,5 +621,54 @@ class I4RequestShapeTests(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
 
 
+class M2ErrorLabellingTests(unittest.TestCase):
+    """M2: argparse errors (SystemExit) and a bare ValueError from
+    http.client must come out labelled 'deciders: ...' on stdout, never an
+    unlabelled message -- and the key must still be stripped."""
+
+    def test_argparse_error_is_labelled_bad_input_not_a_crash(self):
+        out = io.StringIO()
+        code = main(["decide", "--state"], home=Path("/nonexistent"), env={},
+                     transport=FakeTransport([]), out=out)
+        self.assertEqual(code, EXIT_UNANSWERED)
+        data = json.loads(out.getvalue())
+        self.assertTrue(data["error"].startswith("deciders: bad-input"))
+
+    def test_unknown_subcommand_is_labelled_bad_input_not_a_crash(self):
+        out = io.StringIO()
+        code = main(["not-a-command"], home=Path("/nonexistent"), env={},
+                     transport=FakeTransport([]), out=out)
+        self.assertEqual(code, EXIT_UNANSWERED)
+        data = json.loads(out.getvalue())
+        self.assertTrue(data["error"].startswith("deciders: bad-input"))
+
+    def test_help_exits_cleanly_and_is_not_wrapped_as_bad_input(self):
+        # Regression: SystemExit(0) from argparse's own --help handling
+        # must propagate untouched -- not be caught by the generic
+        # SystemExit-to-bad-input conversion added for M2. `deciders
+        # --help` is how installers' smoke checks verify the CLI works.
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            main(["--help"], home=Path("/nonexistent"), env={},
+                 transport=FakeTransport([]), out=out)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_value_error_from_transport_is_labelled_and_key_stripped(self):
+        key = _fake_key()
+        # http.client raises a bare ValueError for a malformed header value
+        # (e.g. a key with an embedded newline, a common `secret` artifact).
+        transport = FakeTransport([ValueError(f"Invalid header value b'Bearer {key}")])
+        code, stdout = _run(
+            ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+             "--questions", str(FIXTURES / "decide_questions.json")],
+            transport, _env(key),
+        )
+        self.assertEqual(code, EXIT_UNANSWERED)
+        data = json.loads(stdout)
+        self.assertTrue(data["error"].startswith("deciders: bad-input"))
+        self.assertNotIn(key, stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

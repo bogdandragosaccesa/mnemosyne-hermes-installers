@@ -338,6 +338,62 @@ class TierOverrideTableTests(unittest.TestCase):
         self.assertEqual(data["override"], entry)
         self.assertIsNone(data["override_reason"])
 
+    def test_M8_rejects_a_table_entry_with_an_empty_model(self):
+        # Reproduction: the Unix installer used to accept `--tier-fast
+        # anthropic:` (empty model), which produced exactly this entry.
+        fixture = _load_fixture("tier_split.json")
+        env = _env(_fake_key())
+        entry = {"provider": "anthropic", "model": ""}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "dev-team").mkdir()
+            (home / "dev-team" / "model-tiers.json").write_text(json.dumps({"deep": entry}))
+            spec_path = _write_spec(home)
+            code, stdout = _run(
+                ["tier", "--title", "Harden auth", "--spec", str(spec_path)],
+                FakeTransport([fixture]), env, home=home,
+            )
+        data = json.loads(stdout)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIsNone(data["override"])
+        self.assertIn("invalid entry", data["override_reason"])
+
+    def test_M8_rejects_a_table_entry_that_is_not_a_dict(self):
+        fixture = _load_fixture("tier_split.json")
+        env = _env(_fake_key())
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "dev-team").mkdir()
+            (home / "dev-team" / "model-tiers.json").write_text(
+                json.dumps({"deep": "anthropic/claude-opus-5"}))
+            spec_path = _write_spec(home)
+            code, stdout = _run(
+                ["tier", "--title", "Harden auth", "--spec", str(spec_path)],
+                FakeTransport([fixture]), env, home=home,
+            )
+        data = json.loads(stdout)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIsNone(data["override"])
+        self.assertIn("invalid entry", data["override_reason"])
+
+    def test_M8_rejects_a_table_entry_with_an_empty_provider(self):
+        fixture = _load_fixture("tier_split.json")
+        env = _env(_fake_key())
+        entry = {"provider": "", "model": "claude-opus-5"}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "dev-team").mkdir()
+            (home / "dev-team" / "model-tiers.json").write_text(json.dumps({"deep": entry}))
+            spec_path = _write_spec(home)
+            code, stdout = _run(
+                ["tier", "--title", "Harden auth", "--spec", str(spec_path)],
+                FakeTransport([fixture]), env, home=home,
+            )
+        data = json.loads(stdout)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIsNone(data["override"])
+        self.assertIn("invalid entry", data["override_reason"])
+
 
 # --- ledger -------------------------------------------------------------
 
@@ -376,6 +432,57 @@ class LedgerWrittenOnSuccessTests(unittest.TestCase):
             self.assertEqual(code2, EXIT_UNANSWERED)
             lines_after = ledger.read_text().splitlines()
             self.assertEqual(len(lines_after), 1)
+
+
+class M1LedgerWrittenOnFailedValidationTests(unittest.TestCase):
+    """M1: the transport returned (and was billed), but validation after
+    that still fails -- a ledger line must be written anyway, with
+    whatever model/cost could be read, cost 0.0 if it doesn't parse."""
+
+    def test_tier_unknown_option_still_writes_a_ledger_line(self):
+        # Reproduction from the review: `tier` with probabilities
+        # {fast, standard, huge} used to exit 2 and write NO ledger file.
+        fixture = _load_fixture("tier_unknown_option.json")
+        env = _env(_fake_key())
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            spec_path = _write_spec(home)
+            code, stdout = _run(
+                ["tier", "--title", "Rename a variable", "--spec", str(spec_path)],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_UNANSWERED)
+            self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-response"))
+            ledger = deciders_core.ledger_path(home)
+            lines = ledger.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            record = json.loads(lines[0])
+            self.assertEqual(record["subcommand"], "tier")
+            self.assertEqual(record["model"], fixture["model"])
+            self.assertEqual(record["cost"], fixture["cost"])
+
+    def test_bad_response_with_unparseable_cost_writes_cost_zero(self):
+        # The response came back (billed) but its cost field itself does
+        # not parse, and the shape also fails answers validation -- the
+        # ledger line must still exist, with cost 0.0 (never guessed, never
+        # dropped).
+        fixture = {"answers": "not-a-dict", "model": "liquid/d1.1-20261027",
+                   "cost": "not-a-number"}
+        env = _env(_fake_key())
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_UNANSWERED)
+            ledger = deciders_core.ledger_path(home)
+            lines = ledger.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            record = json.loads(lines[0])
+            self.assertEqual(record["cost"], 0.0)
+            self.assertEqual(record["model"], "liquid/d1.1-20261027")
 
 
 def _ledger_worker(home_str: str, count: int) -> None:
