@@ -290,7 +290,11 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
 
         new_home = self.root / "dev-team"
         self.assertEqual((new_home / "deciders-ledger.jsonl").read_text(), "ledger-data")
-        self.assertFalse(old_home.exists())  # moved, not left behind
+        # D3 (review): the old path is never left dangling or duplicated --
+        # it becomes a symlink to the new home, so anything still resolving
+        # it (including a link outside the scanned set) keeps working.
+        self.assertTrue(old_home.is_symlink(), "old_home must become a symlink, not vanish")
+        self.assertEqual(old_home.resolve(), new_home.resolve())
         backups = list(builder.glob("dev-team.pre-root-migration-*"))
         self.assertEqual(len(backups), 1, backups)
         self.assertEqual((backups[0] / "deciders-ledger.jsonl").read_text(), "ledger-data")
@@ -347,7 +351,11 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
         new_home = self.root / "dev-team"
-        self.assertFalse(old_home.exists())
+        # D3 (review): the old path becomes a symlink to the new home
+        # rather than disappearing (see test_migrates_an_old_profile_rooted
+        # _team_home for the direct D3 coverage).
+        self.assertTrue(old_home.is_symlink())
+        self.assertEqual(old_home.resolve(), new_home.resolve())
 
         pm_link = pm_dir / "dev-team"
         self.assertTrue(pm_link.is_symlink())
@@ -442,6 +450,133 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
         self.assertIn("entries moved:", proc.stdout)
         self.assertIn("deciders-ledger.jsonl", proc.stdout)
         self.assertIn("model-tiers.json", proc.stdout)
+
+    def test_D1_refuses_repro_F_dev_pm_linked_to_its_own_profile_dir(self):
+        # Repro F: a dev-team link resolves to the profile directory that
+        # contains it -- migrating it would copy the whole profile (config,
+        # memories) into the team home and rename the profile away.
+        builder = self.builder_profile()
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(pm_dir, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Refusing to migrate", proc.stderr)
+        self.assertFalse((self.root / "dev-team").exists())
+        # Tree unchanged: the profile is still exactly what it was.
+        self.assertTrue((pm_dir / "config.yaml").exists())
+        self.assertTrue((pm_dir / "dev-team").is_symlink())
+
+    def test_D1_refuses_repro_H_dev_pm_linked_to_the_hermes_root(self):
+        # Repro H: a dev-team link resolves to the Hermes root itself.
+        builder = self.builder_profile()
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(self.root, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Refusing to migrate", proc.stderr)
+        self.assertFalse((self.root / "dev-team").exists())
+        # Tree unchanged: nothing from the root was copied or renamed away.
+        self.assertTrue((self.root / "config.yaml").exists())
+        self.assertTrue((self.root / "plugins" / "mnemosyne").exists())
+
+    def test_D3_unscanned_external_link_still_resolves_after_migration(self):
+        # An out-of-band consumer outside the installer's $PREFIX$role scan
+        # entirely (never a profile at all) linked straight at the old
+        # location must not be left dangling once that location is renamed.
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("ledger-data")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        external_dir = self.tmp / "external"
+        external_dir.mkdir()
+        external_link = external_dir / "dev-team"
+        external_link.symlink_to(old_home, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        new_home = self.root / "dev-team"
+        self.assertTrue(old_home.is_symlink())
+        self.assertEqual(old_home.resolve(), new_home.resolve())
+        self.assertTrue(external_link.exists(), "external_link is dangling")
+        self.assertEqual(external_link.resolve(), new_home.resolve())
+        self.assertEqual((external_link / "deciders-ledger.jsonl").read_text(), "ledger-data")
+
+    def test_D4_repro_E_root_link_into_a_profile_is_migrated(self):
+        # Repro E: the root dev-team is itself a link into a profile that
+        # physically holds the data. The data must move to a real directory
+        # at the root, not be reported as "already migrated" in place.
+        builder = self.builder_profile()  # devops
+        devops_data = builder / "dev-team"
+        devops_data.mkdir(parents=True)
+        (devops_data / "deciders-ledger.jsonl").write_text("devops-ledger")
+
+        (self.root / "dev-team").symlink_to(devops_data, target_is_directory=True)
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(devops_data, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        new_home = self.root / "dev-team"
+        self.assertTrue(new_home.is_dir() and not new_home.is_symlink(),
+                         "the root dev-team must become a real directory")
+        self.assertEqual((new_home / "deciders-ledger.jsonl").read_text(), "devops-ledger")
+        self.assertTrue(devops_data.is_symlink())
+        self.assertEqual(devops_data.resolve(), new_home.resolve())
+        pm_link = pm_dir / "dev-team"
+        self.assertTrue(pm_link.is_symlink())
+        self.assertEqual(pm_link.resolve(), new_home.resolve())
+
+    def test_D5_conflict_refusal_prints_concrete_commands_no_placeholder(self):
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("old-ledger")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        # The new root has NO data (the commonest conflict shape, D5):
+        # an old location plus some *other* unrelated conflicting candidate.
+        old_home_2 = self.tmp / "elsewhere" / "dev-team"
+        old_home_2.mkdir(parents=True)
+        (old_home_2 / "model-tiers.json").write_text("other-tiers")
+        uiux_dir = self.profile("uiux")
+        uiux_dir.mkdir(parents=True)
+        (uiux_dir / "config.yaml").touch()
+        (uiux_dir / "dev-team").symlink_to(old_home_2, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn("<", proc.stderr)  # no "<placeholder>" text anywhere
+        self.assertIn(f'[ -e "{self.root}/dev-team" ] &&', proc.stderr)
+        self.assertIn(f'mv "{old_home}" "{self.root}/dev-team"', proc.stderr)
+        self.assertIn(f'mv "{old_home_2}" "{self.root}/dev-team"', proc.stderr)
+        # Relinking the profile that was NOT chosen is named concretely.
+        self.assertIn(f'ln -sfn "{old_home}" "{uiux_dir}/dev-team"', proc.stderr)
+        self.assertIn(f'ln -sfn "{old_home_2}" "{pm_dir}/dev-team"', proc.stderr)
+        # Nothing touched.
+        self.assertEqual((old_home / "deciders-ledger.jsonl").read_text(), "old-ledger")
+        self.assertEqual((old_home_2 / "model-tiers.json").read_text(), "other-tiers")
+        self.assertFalse((self.root / "dev-team").exists())
 
 
 if __name__ == "__main__":
