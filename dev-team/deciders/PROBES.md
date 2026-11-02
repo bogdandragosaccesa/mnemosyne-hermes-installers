@@ -156,9 +156,32 @@ only the flat record.
 
 ## Step 3: scratch-board plan run
 
-**Round 2 status: blocked. The re-run on a separate `deciders-check` board was not done.**
+**Round 2 status: passed. Run by the operator, because a dispatched worker is pinned to its
+board DB (a Hermes fence, correctly not bypassed).** Evidence file:
+`~/.hermes/dev-team/reviews/t6-step3-operator-evidence.md`. The operator ran it at
+14:10–14:12 on 2026-11-02 from a non-dispatched session, at branch `dev-team-deciders` `5582af2`:
+- **Install:** `bash dev-team/install-dev-team-unix.sh --prefix t9- --only pm`, exit 0. The
+  t9-pm tier table: fast = `anthropic/claude-haiku-4-5`, standard = `anthropic/claude-sonnet-5`,
+  deep = `anthropic/claude-opus-5`.
+- **Board:** `deciders-check` (budget $3). Plan card `t_da3b9383` (assignee `t9-pm`, a dir
+  workspace on a scratch git repo) was dispatched and finished in about 1 min.
+- **Implement card:** `t_d5d1bda0`, on `deciders-check`. No `t9-*` cards landed on
+  `dev-team-deciders`. It is assigned to `t9-backend-db`, with `model_override` =
+  `claude-haiku-4-5` and `provider_override` = `anthropic`.
+  - The body says: tier `fast` (final); probabilities `{"fast": 0.9347, "standard": 0.0624,
+    "deep": 0.0029}`; `override_reason` none; `deciders tier` exit 0; model
+    `liquid/d1.1-20261027`; cost $4.36e-06.
+  - These are real probabilities, not `unavailable`, so the round 1 finding is closed.
+- **Ledger:** one line, board `deciders-check`, subcommand `tier`, `task_id` null. That is a
+  known gap (open item 4), not a blocker.
+- **Cleanup:** `t_da3b9383` and `t_d5d1bda0` archived, board `deciders-check` archived, profile
+  `t9-pm` deleted, scratch target removed. The stray `t_557bb79f` (below) is archived too.
+- **No tier table (A6):** not re-run. The round 1 evidence (`t_231a22c3` → `t_8f11a5b4`: no
+  override, and the body says why) is accepted by the operator.
 
-Second attempt (round 2, run 38, after the operator created board `deciders-check`):
+The worker attempts below are kept as the record of why the operator had to run it.
+
+Second worker attempt (round 2, run 38, after the operator created board `deciders-check`):
 - `hermes kanban --board deciders-check list`, even with `HERMES_KANBAN_DB` and
   `HERMES_KANBAN_BOARD` pointed at `deciders-check` for that one command, returns
   `kanban: delegate_task child contexts cannot mutate Kanban tasks or boards`. The guard now
@@ -168,8 +191,8 @@ Second attempt (round 2, run 38, after the operator created board `deciders-chec
   `deciders-check`'s. The explicit `board=` argument does not override the pinned
   `HERMES_KANBAN_DB`.
 - The card was created **before** `t9-pm` existed, so it could not dispatch. `t9-pm` was then
-  deliberately not installed, and no other card was created. `t_557bb79f` is inert on the live
-  board and needs an operator archive.
+  deliberately not installed, and no other card was created. `t_557bb79f` never ran
+  (`skipped_nonspawnable`) and has since been archived.
 - Conclusion: a kanban-dispatched worker cannot place a card on another board through either
   path. The plan card for Step 3 has to be created by a non-dispatched session.
 
@@ -209,7 +232,9 @@ behaviour):
 Round 1: both `t9-pm` runs finished in 60–72 s, from dispatch to the `completed` event.
 - Each `secret exec ... deciders tier` call returned promptly with a JSON error. The run never
   sat in `running` waiting on an `OPENROUTER_DECIDERS_KEY` prompt.
-- Round 2 has to re-check this together with Step 3.
+- **Round 2: passed. Run by the operator, together with Step 3** (same reason: a dispatched
+  worker is pinned to its board DB, a Hermes fence, correctly not bypassed). The plan worker
+  finished in about 1 min with `tier` exit 0. There was no key prompt and no stall.
 
 ## Step 5: key check
 
@@ -227,8 +252,9 @@ $ grep -rl "<the OpenRouter key prefix>" ~/.hermes/dev-team/ # 1 match: pending-
 
 ## Open items
 
-1. **Step 3/4 re-run.** Board `deciders-check` now exists, but a dispatched worker cannot put a
-   card on it (see Step 3). The plan card has to be created from a non-dispatched session.
+1. **Step 3/4 re-run: closed.** The operator ran it from a non-dispatched session, because a
+   dispatched worker is pinned to its board DB (a Hermes fence, correctly not bypassed). It
+   passed, and it is cleaned up (see Step 3).
 2. **Tier-table source of truth (decided by the operator).** It is the installer-written
    per-profile file `$HERMES_HOME/dev-team/model-tiers.json`, which is what the skill and
    `deciders tier` read.
@@ -243,7 +269,8 @@ $ grep -rl "<the OpenRouter key prefix>" ~/.hermes/dev-team/ # 1 match: pending-
    decisions-only models, but a hand-edited `model-tiers.json` can still name one. Not in scope
    for this round.
 4. **The ledger's `task_id` is null** on round-2 rows, because `HERMES_KANBAN_TASK` is not set
-   in this worker's terminal environment. `board` is set.
+   in this worker's terminal environment. `board` is set. The operator's Step 3 ledger line has
+   the same gap: the worker env passes no task id to `deciders`. Known gap, not a blocker.
 5. **Fixed in round 2 (operator request):** the `dev-team-gate` failure
    `test_prefixed_assignees.test_no_line_about_assignees_names_a_bare_role`, failing since
    `aeb21ca`. `dev-team-deciders/SKILL.md` said "**Plan stage (pm):**". It now says
