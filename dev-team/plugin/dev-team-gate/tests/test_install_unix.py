@@ -324,6 +324,125 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
         self.assertEqual((new_home / "model-tiers.json").read_text(), "new-existing")
         self.assertFalse((self.root / "profiles" / "dev-architect").exists())
 
+    def test_migration_relinks_every_profile_left_out_by_only(self):
+        # Review finding #1: dev-pm and dev-qa both link at the old,
+        # profile-rooted home. Running with --only pm must not leave
+        # dev-qa's dev-team link dangling once the old home is renamed away.
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("ledger-data")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        qa_dir = self.profile("qa")
+        qa_dir.mkdir(parents=True)
+        (qa_dir / "config.yaml").touch()
+        (qa_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        proc = self.install("--only", "pm", HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        new_home = self.root / "dev-team"
+        self.assertFalse(old_home.exists())
+
+        pm_link = pm_dir / "dev-team"
+        self.assertTrue(pm_link.is_symlink())
+        self.assertEqual(pm_link.resolve(), new_home.resolve())
+
+        # dev-qa was not in --only but must still be relinked, not dangling.
+        qa_link = qa_dir / "dev-team"
+        self.assertTrue(qa_link.is_symlink())
+        self.assertTrue(qa_link.exists(), "dev-qa/dev-team is a dangling link")
+        self.assertEqual(qa_link.resolve(), new_home.resolve())
+        self.assertIn("relinked:", proc.stdout)
+        self.assertIn(str(qa_dir), proc.stdout)
+
+    def test_refuses_when_two_distinct_old_homes_both_hold_data(self):
+        # Review finding #2: the scan must not stop at the first non-empty
+        # old target. dev-pm and dev-uiux link at two different, both
+        # populated, old locations; the new root is empty. Must refuse and
+        # list every one of them rather than silently relinking to one and
+        # orphaning the other.
+        builder = self.builder_profile()
+        old_home_pm = builder / "dev-team"
+        old_home_pm.mkdir(parents=True)
+        (old_home_pm / "deciders-ledger.jsonl").write_text("pm-ledger")
+
+        old_home_uiux = self.tmp / "elsewhere" / "dev-team"
+        old_home_uiux.mkdir(parents=True)
+        (old_home_uiux / "model-tiers.json").write_text("uiux-tiers")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home_pm, target_is_directory=True)
+
+        uiux_dir = self.profile("uiux")
+        uiux_dir.mkdir(parents=True)
+        (uiux_dir / "config.yaml").touch()
+        (uiux_dir / "dev-team").symlink_to(old_home_uiux, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Team home conflict", proc.stderr)
+        self.assertIn(str(old_home_pm), proc.stderr)
+        self.assertIn(str(old_home_uiux), proc.stderr)
+        # Neither old location was touched, and no new root was created.
+        self.assertEqual((old_home_pm / "deciders-ledger.jsonl").read_text(), "pm-ledger")
+        self.assertEqual((old_home_uiux / "model-tiers.json").read_text(), "uiux-tiers")
+        self.assertFalse((self.root / "dev-team").exists())
+
+    def test_dry_run_migration_lists_entries_that_would_move(self):
+        # Review finding #4: 'what moved' must list the top-level entries,
+        # not only the source/destination paths, and must do so under
+        # --dry-run too.
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("ledger-data")
+        (old_home / "model-tiers.json").write_text("old-tiers")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        proc = self.install("--dry-run", HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Would migrate team state:", proc.stdout)
+        self.assertIn("entries that would move:", proc.stdout)
+        self.assertIn("deciders-ledger.jsonl", proc.stdout)
+        self.assertIn("model-tiers.json", proc.stdout)
+        self.assertIn(f"Team state:    {self.root}/dev-team", proc.stdout)
+        # Nothing actually changed.
+        self.assertTrue(old_home.exists())
+        self.assertEqual((old_home / "deciders-ledger.jsonl").read_text(), "ledger-data")
+        self.assertFalse((self.root / "dev-team").exists())
+
+    def test_migration_lists_entries_moved(self):
+        # Review finding #4, the non-dry-run side: the real run prints the
+        # same per-entry listing once the move has happened.
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("ledger-data")
+        (old_home / "model-tiers.json").write_text("old-tiers")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("entries moved:", proc.stdout)
+        self.assertIn("deciders-ledger.jsonl", proc.stdout)
+        self.assertIn("model-tiers.json", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

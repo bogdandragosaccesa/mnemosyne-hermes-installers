@@ -351,6 +351,94 @@ function Test-DirHasData {
     return [bool](Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
+function Get-NormalizedPath {
+    <#
+      Normalizes a filesystem path for comparison: resolves it to a full
+      path (so relative segments and case-insensitive drive letters don't
+      cause a false mismatch), strips a trailing backslash, and strips the
+      '\??\' NT-namespace prefix some junction targets carry (the Win32
+      path APIs put it there; the string a junction's .Target reports can
+      come back with or without it depending on how it was created).
+      Gives parity with the Unix installer's `readlink -f` comparison
+      (review finding #3): without this, a junction that already points at
+      the correct root could be read as a different, old location, making
+      every re-run exit 2.
+    #>
+    param([string] $Path)
+    if (-not $Path) { return $Path }
+    $ntPrefix = [string]::Concat([char]92, '?', '?', [char]92)
+    $p = $Path
+    if ($p.StartsWith($ntPrefix)) { $p = $p.Substring($ntPrefix.Length) }
+    try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+    return $p.TrimEnd([char]92)
+}
+
+function Resolve-TeamHomeMigrationPlan {
+    <#
+      Pure decision function for T4 migration, deliberately separated from
+      Invoke-Hermes/junction I/O so it can be unit tested in isolation
+      (this script has no fake-hermes harness for a full run). Takes
+      $DevTeamHome and a map of profile name -> that profile's raw
+      dev-team junction target (or $null/absent when it has none), and
+      decides what should happen:
+        Outcome 'conflict' - more than one location holds data: either two
+                 or more distinct old targets, or one old target plus the
+                 new root. Message is the full stderr text to print before
+                 exit 2 (review findings #1 and #2 depend on scanning every
+                 profile, not just -Only's selection, and on collecting
+                 every distinct old target instead of stopping at the
+                 first).
+        Outcome 'move'   - exactly one old location holds data and the new
+                 root does not. OldTeamHome is that location; Affected
+                 Profiles lists every profile name whose junction pointed
+                 there (not only the ones -Only selected).
+        Outcome 'none'   - nothing to migrate.
+    #>
+    param([string] $DevTeamHome, [hashtable] $CandidateTargets)
+
+    $devTeamHomeNorm = Get-NormalizedPath $DevTeamHome
+    $oldTargets = [ordered]@{}   # normalized target -> {Raw; Profiles}
+    foreach ($name in $CandidateTargets.Keys) {
+        $target = $CandidateTargets[$name]
+        if (-not $target) { continue }
+        $targetNorm = Get-NormalizedPath $target
+        if ($targetNorm -eq $devTeamHomeNorm) { continue }
+        if (-not (Test-DirHasData $target)) { continue }
+        if (-not $oldTargets.Contains($targetNorm)) {
+            $oldTargets[$targetNorm] = [ordered]@{ Raw = $target; Profiles = @() }
+        }
+        $oldTargets[$targetNorm].Profiles += $name
+    }
+
+    $newHasData = Test-DirHasData $DevTeamHome
+    $populatedCount = $oldTargets.Count + [int]$newHasData
+
+    if ($populatedCount -gt 1) {
+        $lines = @('Team home conflict: existing team state in more than one location:')
+        if ($newHasData) { $lines += "  $DevTeamHome  (the correct Hermes-root location)" }
+        foreach ($key in $oldTargets.Keys) {
+            $entry = $oldTargets[$key]
+            $lines += "  $($entry.Raw)  (linked from: $($entry.Profiles -join ' '))"
+        }
+        $lines += 'Refusing to guess which is current. Reconcile by hand, then re-run, e.g.:'
+        $stamp = Get-Date -Format 'yyyyMMddTHHmmss'
+        if ($newHasData -and $oldTargets.Count -eq 1) {
+            # Exactly two locations in conflict: the reconciliation command
+            # can name both exactly.
+            $onlyOld = ($oldTargets.Values | Select-Object -First 1).Raw
+            $lines += "  Rename-Item '$DevTeamHome' '$DevTeamHome.bak-$stamp'; Move-Item '$onlyOld' '$DevTeamHome'"
+        } else {
+            $lines += "  Rename-Item '$DevTeamHome' '$DevTeamHome.bak-$stamp'; Move-Item '<the location you choose>' '$DevTeamHome'"
+        }
+        return [ordered]@{ Outcome = 'conflict'; Message = ($lines -join "`n") }
+    } elseif ($oldTargets.Count -eq 1) {
+        $only = $oldTargets.Values | Select-Object -First 1
+        return [ordered]@{ Outcome = 'move'; OldTeamHome = $only.Raw; AffectedProfiles = $only.Profiles }
+    } else {
+        return [ordered]@{ Outcome = 'none' }
+    }
+}
+
 function Invoke-TeamHomeMigration {
     <#
       T4: a team installed before $HermesRoot climbed out of a profile may
@@ -381,16 +469,28 @@ function Invoke-TeamHomeMigration {
         [Console]::Error.WriteLine("  Rename-Item '$DevTeamHome' '$DevTeamHome.bak-$stamp'; Move-Item '$OldTeamHome' '$DevTeamHome'")
         exit 2
     }
+    # Review finding #4: 'what moved' must name the top-level entries, not
+    # only the source/destination paths, in both the dry run and the real
+    # run.
+    $entryNames = @()
+    if (Test-Path -LiteralPath $OldTeamHome -PathType Container) {
+        $entryNames = @(Get-ChildItem -LiteralPath $OldTeamHome -Force -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name | Sort-Object)
+    }
     $backup = "$OldTeamHome.pre-root-migration-$(Get-Date -Format 'yyyyMMddTHHmmss')"
     if ($DryRun) {
         Write-Host "Would migrate team state: $OldTeamHome -> $DevTeamHome"
         Write-Host "  (backup would be kept at $backup)"
+        Write-Host '  entries that would move:'
+        foreach ($entryName in $entryNames) { Write-Host "    $entryName" }
     } else {
         New-Item -ItemType Directory -Path $DevTeamHome -Force | Out-Null
         Copy-Item -Path (Join-Path $OldTeamHome '*') -Destination $DevTeamHome -Recurse -Force
         Rename-Item -LiteralPath $OldTeamHome -NewName (Split-Path -Leaf $backup)
         Write-Host "Migrated team state: $OldTeamHome -> $DevTeamHome"
         Write-Host "  (backup kept at $backup)"
+        Write-Host '  entries moved:'
+        foreach ($entryName in $entryNames) { Write-Host "    $entryName" }
     }
     return [ordered]@{
         Choice = 'move'
@@ -500,12 +600,18 @@ if (Test-Path -LiteralPath $decidersCmdPath) {
         exit 1
     }
 }
-# T4 migration: find whether any selected dev-* profile already links
-# dev-team at the old, profile-rooted location and that location still
-# holds data -- before anything below creates or writes to $DevTeamHome.
-$OldTeamHome = $null
+# T4 migration: scan every dev-* profile, not just the ones -Only selected.
+# -Only only limits which profiles this run *provisions*; a profile left
+# out by -Only can still have a live dev-team junction, and renaming the
+# old location out from under it would leave that junction dangling
+# (review finding #1). Resolve-TeamHomeMigrationPlan collects every
+# *distinct* populated old location instead of stopping at the first, so a
+# second, unrelated populated home is reported rather than silently
+# orphaned (review finding #2), and compares targets normalized (review
+# finding #3), so a junction that already points at the correct root is
+# never mistaken for an old one.
+$CandidateTargets = @{}
 foreach ($role in $Profiles.Keys) {
-    if (-not (Test-Selected $role)) { continue }
     $candidateName = "$Prefix$role"
     Invoke-Hermes 'profile' 'show' $candidateName | Out-Null
     if ($LASTEXITCODE -ne 0) { continue }
@@ -515,10 +621,39 @@ foreach ($role in $Profiles.Keys) {
     if (-not $linkItem -or -not $linkItem.LinkType) { continue }
     $candidateTarget = $linkItem.Target | Select-Object -First 1
     if (-not $candidateTarget) { continue }
-    if ($candidateTarget -eq $DevTeamHome) { continue }
-    if (Test-DirHasData $candidateTarget) { $OldTeamHome = $candidateTarget; break }
+    $CandidateTargets[$candidateName] = $candidateTarget
 }
-$MigrationResult = Invoke-TeamHomeMigration -DevTeamHome $DevTeamHome -OldTeamHome $OldTeamHome -DryRun:$DryRun
+
+$Plan = Resolve-TeamHomeMigrationPlan -DevTeamHome $DevTeamHome -CandidateTargets $CandidateTargets
+if ($Plan.Outcome -eq 'conflict') {
+    [Console]::Error.WriteLine($Plan.Message)
+    exit 2
+}
+
+$AffectedProfileNames = @()
+if ($Plan.Outcome -eq 'move') {
+    $AffectedProfileNames = $Plan.AffectedProfiles
+    $MigrationResult = Invoke-TeamHomeMigration -DevTeamHome $DevTeamHome -OldTeamHome $Plan.OldTeamHome -DryRun:$DryRun
+} else {
+    $MigrationResult = Invoke-TeamHomeMigration -DevTeamHome $DevTeamHome -OldTeamHome $null -DryRun:$DryRun
+}
+
+if ($MigrationResult.Choice -eq 'move' -and $AffectedProfileNames.Count -gt 0) {
+    # Every profile that pointed at the old home, not only the ones -Only
+    # selected (review finding #1): the old location was just renamed out
+    # from under them, so leaving their junction alone would make it
+    # dangling.
+    foreach ($affectedName in $AffectedProfileNames) {
+        if ($DryRun) {
+            Write-Host "  would relink: $affectedName/dev-team -> $DevTeamHome"
+            continue
+        }
+        $affectedDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $affectedName 'config' 'path'))
+        $affectedLink = Join-Path $affectedDir 'dev-team'
+        New-DirLink -LinkPath $affectedLink -Target $DevTeamHome -Label 'the shared dev-team home' | Out-Null
+        Write-Host "  relinked: $affectedName/dev-team -> $DevTeamHome"
+    }
+}
 
 Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrcMnemo"

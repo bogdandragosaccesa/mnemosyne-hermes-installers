@@ -371,6 +371,170 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertIn("CHOICE=none", proc.stdout)
             self.assertFalse(new.exists())
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_migration_lists_entries_that_would_move_in_dry_run(self):
+        # Review finding #4: 'what moved' must list the top-level entries,
+        # not only the source/destination paths, under -DryRun too.
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-team-home"
+            old.mkdir()
+            (old / "deciders-ledger.jsonl").write_text("ledger-data")
+            (old / "model-tiers.json").write_text("old-tiers")
+            new = Path(tmp) / "new-team-home"
+            harness = self._migration_harness(tmp)
+            with harness.open("a") as f:
+                f.write(f"Invoke-TeamHomeMigration -DevTeamHome '{new}' -OldTeamHome '{old}' -DryRun | Out-Null\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("Would migrate team state:", proc.stdout)
+            self.assertIn("entries that would move:", proc.stdout)
+            self.assertIn("deciders-ledger.jsonl", proc.stdout)
+            self.assertIn("model-tiers.json", proc.stdout)
+            # Nothing changed.
+            self.assertTrue(old.exists())
+            self.assertFalse(new.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_migration_lists_entries_moved(self):
+        # Review finding #4, non-dry-run side.
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-team-home"
+            old.mkdir()
+            (old / "deciders-ledger.jsonl").write_text("ledger-data")
+            (old / "model-tiers.json").write_text("old-tiers")
+            new = Path(tmp) / "new-team-home"
+            harness = self._migration_harness(tmp)
+            with harness.open("a") as f:
+                f.write(f"Invoke-TeamHomeMigration -DevTeamHome '{new}' -OldTeamHome '{old}' | Out-Null\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("entries moved:", proc.stdout)
+            self.assertIn("deciders-ledger.jsonl", proc.stdout)
+            self.assertIn("model-tiers.json", proc.stdout)
+
+    def _normalized_path_harness(self, tmp):
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        harness = Path(tmp) / "harness.ps1"
+        harness.write_text(norm_fn + "\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_normalized_path_strips_nt_namespace_prefix(self):
+        # Review finding #3: a junction's .Target can come back with the
+        # '\??\' NT-namespace prefix; without stripping it, a junction that
+        # already points at the correct root would be read as a different,
+        # old location on every re-run.
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = self._normalized_path_harness(tmp)
+            target = str(Path(tmp) / "hermes" / "dev-team")
+            with harness.open("a") as f:
+                f.write(f"$a = Get-NormalizedPath '{target}'\n")
+                f.write(f"$b = Get-NormalizedPath '\\??\\{target}'\n")
+                f.write("Write-Output \"EQUAL=$($a -eq $b)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("EQUAL=True", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_normalized_path_strips_trailing_backslash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = self._normalized_path_harness(tmp)
+            target = str(Path(tmp) / "hermes" / "dev-team")
+            with harness.open("a") as f:
+                f.write(f"$a = Get-NormalizedPath '{target}'\n")
+                f.write(f"$b = Get-NormalizedPath '{target}\\'\n")
+                f.write("Write-Output \"EQUAL=$($a -eq $b)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("EQUAL=True", proc.stdout)
+
+    def _plan_harness(self, tmp):
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        data_fn = _function(self.text, "Test-DirHasData")
+        plan_fn = _function(self.text, "Resolve-TeamHomeMigrationPlan")
+        harness = Path(tmp) / "harness.ps1"
+        harness.write_text(norm_fn + "\n" + data_fn + "\n" + plan_fn + "\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_plan_relinks_every_profile_not_only_the_selected_one(self):
+        # Review finding #1: dev-pm and dev-qa both link at the same old,
+        # populated location. The plan must list both as AffectedProfiles
+        # even though only one of them need be in -Only's selection.
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-team-home"
+            old.mkdir()
+            (old / "deciders-ledger.jsonl").write_text("ledger-data")
+            new = Path(tmp) / "new-team-home"
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ 'dev-pm' = '" + str(old) + "'; 'dev-qa' = '" + str(old) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' -CandidateTargets $candidates\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output \"OLD=$($r.OldTeamHome)\"\n"
+                    "Write-Output \"AFFECTED=$(($r.AffectedProfiles | Sort-Object) -join ',')\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=move", proc.stdout)
+            self.assertIn(f"OLD={old}", proc.stdout)
+            self.assertIn("AFFECTED=dev-pm,dev-qa", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_plan_refuses_when_two_distinct_old_homes_both_hold_data(self):
+        # Review finding #2: the plan must not stop at the first populated
+        # old target; a second, distinct populated location must also be
+        # reported, not silently orphaned.
+        with tempfile.TemporaryDirectory() as tmp:
+            old_pm = Path(tmp) / "old-pm-home"
+            old_pm.mkdir()
+            (old_pm / "deciders-ledger.jsonl").write_text("pm-ledger")
+            old_uiux = Path(tmp) / "old-uiux-home"
+            old_uiux.mkdir()
+            (old_uiux / "model-tiers.json").write_text("uiux-tiers")
+            new = Path(tmp) / "new-team-home"
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ 'dev-pm' = '" + str(old_pm) + "'; 'dev-uiux' = '" + str(old_uiux) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' -CandidateTargets $candidates\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output $r.Message\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=conflict", proc.stdout)
+            self.assertIn(str(old_pm), proc.stdout)
+            self.assertIn(str(old_uiux), proc.stdout)
+            # Neither old location was touched.
+            self.assertEqual((old_pm / "deciders-ledger.jsonl").read_text(), "pm-ledger")
+            self.assertEqual((old_uiux / "model-tiers.json").read_text(), "uiux-tiers")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_plan_treats_a_junction_already_at_the_root_as_not_old(self):
+        # Review finding #3: a candidate whose target, once normalized,
+        # already equals the new root (even with a '\??\' prefix or a
+        # trailing backslash) must not be treated as an old location.
+        with tempfile.TemporaryDirectory() as tmp:
+            new = Path(tmp) / "new-team-home"
+            new.mkdir()
+            (new / "model-tiers.json").write_text("current")
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ 'dev-pm' = '\\??\\" + str(new) + "\\' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' -CandidateTargets $candidates\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=none", proc.stdout)
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):

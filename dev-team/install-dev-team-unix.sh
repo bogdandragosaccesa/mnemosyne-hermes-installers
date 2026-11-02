@@ -378,6 +378,15 @@ done
 # anything below creates or writes to $DEV_TEAM_HOME, or the distinction
 # between "freshly created, empty" and "pre-existing data at the old wrong
 # path" is lost for good.
+#
+# The scan below walks every role in NAMES, not just the ones --only
+# selected: --only only limits which profiles this run *provisions*, and a
+# profile left out by --only still has a live dev-team link that the move
+# below would turn dangling if we only looked at the selected subset
+# (review finding #1). It also keeps every *distinct* populated old
+# location instead of stopping at the first, so a second, unrelated
+# populated home is reported rather than silently orphaned (review finding
+# #2).
 resolve_existing_link() {  # path -> prints its realpath, or nothing
     [[ -L $1 ]] || return 1
     readlink -f "$1" 2>/dev/null
@@ -385,49 +394,106 @@ resolve_existing_link() {  # path -> prints its realpath, or nothing
 dir_has_data() {  # path -> true if it exists and is non-empty
     [[ -d $1 ]] && find "$1" -mindepth 1 -print -quit 2>/dev/null | grep -q .
 }
+list_top_level_entries() {  # dir -> prints one basename per line, dotfiles included
+    local d="$1" entry
+    for entry in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+        [[ -e $entry ]] || continue
+        basename "$entry"
+    done
+}
 
 NEW_TEAM_HOME_CANON="$(readlink -f "$DEV_TEAM_HOME" 2>/dev/null || printf '%s' "$DEV_TEAM_HOME")"
-OLD_TEAM_HOME=""
+
+# Parallel arrays (bash 3.2 has no associative arrays): OLD_TARGETS[i] is a
+# distinct populated location other than the new root; OLD_TARGET_ROLES[i]
+# is a space-separated list of "$PREFIX$role" profile names whose dev-team
+# link points there.
+OLD_TARGETS=()
+OLD_TARGET_ROLES=()
+add_old_target_role() {  # target role_name
+    local tgt="$1" nm="$2" i
+    for i in "${!OLD_TARGETS[@]}"; do
+        if [[ "${OLD_TARGETS[$i]}" == "$tgt" ]]; then
+            OLD_TARGET_ROLES[$i]="${OLD_TARGET_ROLES[$i]} $nm"
+            return
+        fi
+    done
+    OLD_TARGETS+=("$tgt")
+    OLD_TARGET_ROLES+=("$nm")
+}
+
 for role in "${NAMES[@]}"; do
-    selected "$role" || continue
     name="$PREFIX$role"
     hermes profile show "$name" >/dev/null 2>&1 || continue
     pdir="$(dirname "$(hermes -p "$name" config path)")"
     target="$(resolve_existing_link "$pdir/dev-team" || true)"
     [[ -n $target ]] || continue
     [[ $target == "$NEW_TEAM_HOME_CANON" ]] && continue
-    if dir_has_data "$target"; then
-        OLD_TEAM_HOME="$target"
-        break
-    fi
+    dir_has_data "$target" || continue
+    add_old_target_role "$target" "$name"
 done
+
+NEW_HAS_DATA=0
+dir_has_data "$DEV_TEAM_HOME" && NEW_HAS_DATA=1
+POPULATED_COUNT=${#OLD_TARGETS[@]}
+(( NEW_HAS_DATA )) && POPULATED_COUNT=$((POPULATED_COUNT + 1))
 
 MIGRATION_CHOICE="none"
 MIGRATION_WHY="no pre-existing profile-rooted team home with data was found"
-if [[ -n $OLD_TEAM_HOME ]]; then
-    if dir_has_data "$DEV_TEAM_HOME"; then
-        MIGRATION_CHOICE="refuse"
-        MIGRATION_WHY="both $OLD_TEAM_HOME and $DEV_TEAM_HOME hold data; moving either would silently discard the other, so refuse and let the operator reconcile by hand"
-        echo "Team home conflict: existing team state at both:" >&2
-        echo "  $OLD_TEAM_HOME  (where dev-* profiles currently link)" >&2
+if (( POPULATED_COUNT > 1 )); then
+    MIGRATION_CHOICE="refuse"
+    MIGRATION_WHY="more than one populated team home was found (${#OLD_TARGETS[@]} old location(s)$( ((NEW_HAS_DATA)) && echo ' plus the new root' || true )); moving any of them would silently discard the others, so refuse and let the operator reconcile by hand"
+    echo "Team home conflict: existing team state in more than one location:" >&2
+    if (( NEW_HAS_DATA )); then
         echo "  $DEV_TEAM_HOME  (the correct Hermes-root location)" >&2
-        echo "Refusing to guess which is current. Reconcile by hand, then re-run, e.g.:" >&2
-        echo "  mv \"$DEV_TEAM_HOME\" \"$DEV_TEAM_HOME.bak-$(date +%Y%m%dT%H%M%S)\" && mv \"$OLD_TEAM_HOME\" \"$DEV_TEAM_HOME\"" >&2
-        exit 2
+    fi
+    for i in "${!OLD_TARGETS[@]}"; do
+        echo "  ${OLD_TARGETS[$i]}  (linked from:${OLD_TARGET_ROLES[$i]})" >&2
+    done
+    echo "Refusing to guess which is current. Reconcile by hand, then re-run, e.g.:" >&2
+    if (( NEW_HAS_DATA && ${#OLD_TARGETS[@]} == 1 )); then
+        # Exactly two locations in conflict (the new root and the one old
+        # location): the reconciliation command can name both exactly.
+        echo "  mv \"$DEV_TEAM_HOME\" \"$DEV_TEAM_HOME.bak-$(date +%Y%m%dT%H%M%S)\" && mv \"${OLD_TARGETS[0]}\" \"$DEV_TEAM_HOME\"" >&2
     else
-        MIGRATION_CHOICE="move"
-        MIGRATION_WHY="dev-* profiles' dev-team links point at $OLD_TEAM_HOME, which holds the live team's data; $DEV_TEAM_HOME is empty or absent, so it is safe to move the data there without discarding anything"
-        backup="${OLD_TEAM_HOME}.pre-root-migration-$(date +%Y%m%dT%H%M%S)"
-        if (( DRY_RUN )); then
-            say "Would migrate team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
-            say "  (backup would be kept at $backup)"
-        else
-            mkdir -p "$DEV_TEAM_HOME"
-            cp -a "$OLD_TEAM_HOME"/. "$DEV_TEAM_HOME"/
-            mv "$OLD_TEAM_HOME" "$backup"
-            say "Migrated team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
-            say "  (backup kept at $backup)"
-        fi
+        # Three or more candidate locations: no single command can name
+        # "the" right one, so point at picking and moving one by hand.
+        echo "  mv \"$DEV_TEAM_HOME\" \"$DEV_TEAM_HOME.bak-$(date +%Y%m%dT%H%M%S)\" && mv \"<the location you choose>\" \"$DEV_TEAM_HOME\"" >&2
+    fi
+    exit 2
+elif (( ${#OLD_TARGETS[@]} == 1 )); then
+    OLD_TEAM_HOME="${OLD_TARGETS[0]}"
+    AFFECTED_PROFILES="${OLD_TARGET_ROLES[0]}"
+    MIGRATION_CHOICE="move"
+    MIGRATION_WHY="dev-* profiles' dev-team links ($AFFECTED_PROFILES) point at $OLD_TEAM_HOME, which holds the live team's data; $DEV_TEAM_HOME is empty or absent, so it is safe to move the data there without discarding anything"
+    backup="${OLD_TEAM_HOME}.pre-root-migration-$(date +%Y%m%dT%H%M%S)"
+    if (( DRY_RUN )); then
+        say "Would migrate team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
+        say "  (backup would be kept at $backup)"
+        say "  entries that would move:"
+        while IFS= read -r entry; do say "    $entry"; done < <(list_top_level_entries "$OLD_TEAM_HOME" | sort -u)
+        for p in $AFFECTED_PROFILES; do
+            say "  would relink: $p/dev-team -> $DEV_TEAM_HOME"
+        done
+    else
+        entries_moved=()
+        while IFS= read -r entry; do entries_moved+=("$entry"); done < <(list_top_level_entries "$OLD_TEAM_HOME" | sort -u)
+        mkdir -p "$DEV_TEAM_HOME"
+        cp -a "$OLD_TEAM_HOME"/. "$DEV_TEAM_HOME"/
+        mv "$OLD_TEAM_HOME" "$backup"
+        say "Migrated team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
+        say "  (backup kept at $backup)"
+        say "  entries moved:"
+        for e in "${entries_moved[@]}"; do say "    $e"; done
+        # Every profile that pointed at the old home, not only the ones
+        # --only selected (review finding #1): the old location was just
+        # renamed out from under them, so leaving their link alone would
+        # make it dangling.
+        for p in $AFFECTED_PROFILES; do
+            ppdir="$(dirname "$(hermes -p "$p" config path)")"
+            ln -sfn "$DEV_TEAM_HOME" "$ppdir/dev-team"
+            say "  relinked: $ppdir/dev-team -> $DEV_TEAM_HOME"
+        done
     fi
 fi
 
