@@ -28,7 +28,12 @@ FAKE_HERMES = textwrap.dedent(r"""
     root="$FAKE_HERMES_ROOT"
     profile=""
     if [[ "${1:-}" == "-p" ]]; then profile="$2"; shift 2; fi
-    dir="$root"; [[ -n $profile ]] && dir="$root/profiles/$profile"
+    # Mirrors the real CLI: with no -p, "config path" reflects whichever
+    # profile HERMES_HOME currently points the process at (set by the
+    # gateway when a profile is active) -- an explicit -p always wins.
+    dir="$root"
+    if [[ -n "${HERMES_HOME:-}" ]]; then dir="$HERMES_HOME"; fi
+    [[ -n $profile ]] && dir="$root/profiles/$profile"
     echo "$profile $*" >> "$root/calls.log"
     case "$1 ${2:-}" in
       "config path") echo "$dir/config.yaml" ;;
@@ -58,7 +63,7 @@ FAKE_HERMES = textwrap.dedent(r"""
 
 
 @unittest.skipUnless(shutil.which("bash") and os.name == "posix", "needs bash")
-class UnixInstallerTests(unittest.TestCase):
+class InstallerSetupMixin:
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -88,6 +93,8 @@ class UnixInstallerTests(unittest.TestCase):
     def profile(self, role, prefix="dev-"):
         return self.root / "profiles" / f"{prefix}{role}"
 
+
+class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
     def test_fresh_profiles_link_the_shared_mnemosyne_bank(self):  # item 10
         proc = self.install()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -234,6 +241,88 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(sorted(p.name for p in (self.root / "profiles").iterdir()),
                          ["dev-devops", "dev-qa"])
+
+
+class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
+    """T4: the team home must live at the Hermes root, not inside whatever
+    profile happens to be running the installer. Reproduces the live bug:
+    the installer was run with HERMES_HOME pointing at a profile directory
+    (as the gateway does for any named profile), so `hermes config path`
+    with no -p resolves to that profile's own config.yaml.
+    """
+
+    def builder_profile(self, name="devops"):
+        p = self.root / "profiles" / name
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "config.yaml").touch()
+        return p
+
+    def test_root_climbs_out_of_the_active_profile(self):
+        builder = self.builder_profile()
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"Team state:    {self.root}/dev-team", proc.stdout)
+        self.assertTrue((self.root / "dev-team" / "model-tiers.json").exists())
+        self.assertFalse((builder / "dev-team").exists())
+        for role in ROLES:
+            link = self.profile(role) / "dev-team"
+            with self.subTest(role=role):
+                self.assertTrue(link.is_symlink(), f"{link} is not a symlink")
+                self.assertEqual(link.resolve(), (self.root / "dev-team").resolve())
+
+    def test_migrates_an_old_profile_rooted_team_home(self):
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "model-tiers.json").write_text("old-tiers")
+        (old_home / "deciders-ledger.jsonl").write_text("ledger-data")
+
+        # dev-pm already exists from an earlier, profile-rooted install run
+        # and still links at the old, wrong location.
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Migrated team state:", proc.stdout)
+
+        new_home = self.root / "dev-team"
+        self.assertEqual((new_home / "deciders-ledger.jsonl").read_text(), "ledger-data")
+        self.assertFalse(old_home.exists())  # moved, not left behind
+        backups = list(builder.glob("dev-team.pre-root-migration-*"))
+        self.assertEqual(len(backups), 1, backups)
+        self.assertEqual((backups[0] / "deciders-ledger.jsonl").read_text(), "ledger-data")
+
+        link = pm_dir / "dev-team"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), new_home.resolve())
+
+    def test_refuses_when_old_and_new_homes_both_hold_data(self):
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("old-ledger")
+
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+
+        new_home = self.root / "dev-team"
+        new_home.mkdir(parents=True)
+        (new_home / "model-tiers.json").write_text("new-existing")
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Team home conflict", proc.stderr)
+        self.assertIn(f'mv "{new_home}"', proc.stderr)
+        self.assertIn(f'mv "{old_home}"', proc.stderr)
+        # Neither side was touched.
+        self.assertEqual((old_home / "deciders-ledger.jsonl").read_text(), "old-ledger")
+        self.assertEqual((new_home / "model-tiers.json").read_text(), "new-existing")
+        self.assertFalse((self.root / "profiles" / "dev-architect").exists())
 
 
 if __name__ == "__main__":

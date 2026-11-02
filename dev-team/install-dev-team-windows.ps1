@@ -340,6 +340,64 @@ function New-DirLink {
     }
 }
 
+function Test-DirHasData {
+    <#
+      True when $Path exists and contains at least one entry. Used to tell
+      a freshly created, empty team-home directory apart from one that
+      still holds live data (T4 migration).
+    #>
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    return [bool](Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+function Invoke-TeamHomeMigration {
+    <#
+      T4: a team installed before $HermesRoot climbed out of a profile may
+      have every dev-* profile's dev-team junction pointing at that old,
+      profile-rooted location -- which still holds the live data (project
+      records, the deciders ledger, model-tiers.json). Moves it into
+      $DevTeamHome when that is safe (empty or absent there), otherwise
+      refuses with exit 2 and the exact command to reconcile by hand -
+      never silently picks one side when both hold data.
+
+      Returns an ordered hashtable {Choice; Why} describing what happened,
+      for the dry-run report and the completion record.
+    #>
+    param([string] $DevTeamHome, [string] $OldTeamHome, [switch] $DryRun)
+
+    if (-not $OldTeamHome) {
+        return [ordered]@{
+            Choice = 'none'
+            Why    = 'no pre-existing profile-rooted team home with data was found'
+        }
+    }
+    if (Test-DirHasData $DevTeamHome) {
+        $stamp = Get-Date -Format 'yyyyMMddTHHmmss'
+        [Console]::Error.WriteLine('Team home conflict: existing team state at both:')
+        [Console]::Error.WriteLine("  $OldTeamHome  (where dev-* profiles currently link)")
+        [Console]::Error.WriteLine("  $DevTeamHome  (the correct Hermes-root location)")
+        [Console]::Error.WriteLine('Refusing to guess which is current. Reconcile by hand, then re-run, e.g.:')
+        [Console]::Error.WriteLine("  Rename-Item '$DevTeamHome' '$DevTeamHome.bak-$stamp'; Move-Item '$OldTeamHome' '$DevTeamHome'")
+        exit 2
+    }
+    $backup = "$OldTeamHome.pre-root-migration-$(Get-Date -Format 'yyyyMMddTHHmmss')"
+    if ($DryRun) {
+        Write-Host "Would migrate team state: $OldTeamHome -> $DevTeamHome"
+        Write-Host "  (backup would be kept at $backup)"
+    } else {
+        New-Item -ItemType Directory -Path $DevTeamHome -Force | Out-Null
+        Copy-Item -Path (Join-Path $OldTeamHome '*') -Destination $DevTeamHome -Recurse -Force
+        Rename-Item -LiteralPath $OldTeamHome -NewName (Split-Path -Leaf $backup)
+        Write-Host "Migrated team state: $OldTeamHome -> $DevTeamHome"
+        Write-Host "  (backup kept at $backup)"
+    }
+    return [ordered]@{
+        Choice = 'move'
+        Why    = "dev-* profiles' dev-team links point at $OldTeamHome, which holds the live team's data; $DevTeamHome is empty or absent, so it is safe to move the data there without discarding anything"
+    }
+}
+
 if (-not (Get-Command hermes -ErrorAction SilentlyContinue)) {
     Write-Error @'
 hermes not found on PATH.
@@ -354,6 +412,15 @@ If it is installed, add its directory to PATH.
 $RootConfig = Get-HermesLastLine (Invoke-Hermes 'config' 'path')
 if ($LASTEXITCODE -ne 0) { Write-Error "hermes config path failed: $RootConfig"; exit 1 }
 $HermesRoot     = Split-Path -Parent $RootConfig
+# T4: 'hermes config path' returns the ACTIVE PROFILE's config.yaml
+# (...\profiles\<name>\config.yaml) when this installer itself is run under
+# a named profile -- so $HermesRoot above would be that profile's own
+# directory, not the true Hermes root. Climb out of profiles\<name> exactly
+# the way kanban-budget.py's hermes_root() already does, so the team home
+# below lands at the Hermes root regardless of which profile ran this.
+if ((Split-Path -Leaf (Split-Path -Parent $HermesRoot)) -eq 'profiles') {
+    $HermesRoot = Split-Path -Parent (Split-Path -Parent $HermesRoot)
+}
 $PluginSrcMnemo = Join-Path $HermesRoot 'plugins\mnemosyne'
 # The one real Mnemosyne data root, which every profile is pointed at unless
 # -SeparateMemory was passed. Honour MNEMOSYNE_HOME if the store was relocated.
@@ -433,6 +500,26 @@ if (Test-Path -LiteralPath $decidersCmdPath) {
         exit 1
     }
 }
+# T4 migration: find whether any selected dev-* profile already links
+# dev-team at the old, profile-rooted location and that location still
+# holds data -- before anything below creates or writes to $DevTeamHome.
+$OldTeamHome = $null
+foreach ($role in $Profiles.Keys) {
+    if (-not (Test-Selected $role)) { continue }
+    $candidateName = "$Prefix$role"
+    Invoke-Hermes 'profile' 'show' $candidateName | Out-Null
+    if ($LASTEXITCODE -ne 0) { continue }
+    $candidateDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $candidateName 'config' 'path'))
+    $candidateLink = Join-Path $candidateDir 'dev-team'
+    $linkItem = Get-Item -LiteralPath $candidateLink -Force -ErrorAction SilentlyContinue
+    if (-not $linkItem -or -not $linkItem.LinkType) { continue }
+    $candidateTarget = $linkItem.Target | Select-Object -First 1
+    if (-not $candidateTarget) { continue }
+    if ($candidateTarget -eq $DevTeamHome) { continue }
+    if (Test-DirHasData $candidateTarget) { $OldTeamHome = $candidateTarget; break }
+}
+$MigrationResult = Invoke-TeamHomeMigration -DevTeamHome $DevTeamHome -OldTeamHome $OldTeamHome -DryRun:$DryRun
+
 Write-Host "Hermes home:   $HermesRoot"
 Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"

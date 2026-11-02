@@ -254,6 +254,124 @@ class WindowsInstallerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
+class WindowsT4TeamHomeRootTests(unittest.TestCase):
+    """T4: the team home must live at the Hermes root, not inside whatever
+    profile happens to be running the installer. install-dev-team-windows.ps1
+    has no fake-hermes harness (a full run needs real junctions, which this
+    sandbox cannot create), so these exercise the two pure pieces of the fix
+    in isolation the same way test_invoke_checked_command_... does above:
+    the root-climb Split-Path logic, and the migration decision function.
+    """
+
+    def setUp(self):
+        self.text = PS1.read_text(encoding="utf-8")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_root_climb_logic_climbs_out_of_a_profile_directory(self):
+        start = self.text.index("$RootConfig = Get-HermesLastLine")
+        end = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        snippet = self.text[start:end]
+        self.assertIn("-eq 'profiles'", snippet, "no profiles-climb check")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            profile_dir = root / "profiles" / "devops"
+            profile_dir.mkdir(parents=True)
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                "function Invoke-Hermes { param([Parameter(ValueFromRemainingArguments=$true)]$a) "
+                f"$global:LASTEXITCODE = 0; '{profile_dir / 'config.yaml'}' }}\n"
+                "function Get-HermesLastLine { param($r) $r }\n"
+                + snippet +
+                "\nWrite-Output \"ROOT=$HermesRoot\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"ROOT={root}", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_root_climb_logic_leaves_the_true_root_alone(self):
+        start = self.text.index("$RootConfig = Get-HermesLastLine")
+        end = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        snippet = self.text[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir(parents=True)
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                "function Invoke-Hermes { param([Parameter(ValueFromRemainingArguments=$true)]$a) "
+                f"$global:LASTEXITCODE = 0; '{root / 'config.yaml'}' }}\n"
+                "function Get-HermesLastLine { param($r) $r }\n"
+                + snippet +
+                "\nWrite-Output \"ROOT=$HermesRoot\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"ROOT={root}", proc.stdout)
+
+    def _migration_harness(self, tmp):
+        test_fn = _function(self.text, "Test-DirHasData")
+        migrate_fn = _function(self.text, "Invoke-TeamHomeMigration")
+        harness = Path(tmp) / "harness.ps1"
+        harness.write_text(test_fn + "\n" + migrate_fn + "\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_migration_moves_data_when_the_new_home_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-team-home"
+            old.mkdir()
+            (old / "deciders-ledger.jsonl").write_text("ledger-data")
+            new = Path(tmp) / "new-team-home"
+            harness = self._migration_harness(tmp)
+            with harness.open("a") as f:
+                f.write(f"$r = Invoke-TeamHomeMigration -DevTeamHome '{new}' -OldTeamHome '{old}'\n")
+                f.write("Write-Output \"CHOICE=$($r.Choice)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("CHOICE=move", proc.stdout)
+            self.assertEqual((new / "deciders-ledger.jsonl").read_text(), "ledger-data")
+            self.assertFalse(old.exists())
+            backups = list(Path(tmp).glob("old-team-home.pre-root-migration-*"))
+            self.assertEqual(len(backups), 1, backups)
+            self.assertEqual((backups[0] / "deciders-ledger.jsonl").read_text(), "ledger-data")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_migration_refuses_when_both_homes_hold_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-team-home"
+            old.mkdir()
+            (old / "deciders-ledger.jsonl").write_text("old-ledger")
+            new = Path(tmp) / "new-team-home"
+            new.mkdir()
+            (new / "model-tiers.json").write_text("new-existing")
+            harness = self._migration_harness(tmp)
+            with harness.open("a") as f:
+                f.write(f"Invoke-TeamHomeMigration -DevTeamHome '{new}' -OldTeamHome '{old}' | Out-Null\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("Team home conflict", proc.stderr)
+            self.assertIn(str(old), proc.stderr)
+            self.assertIn(str(new), proc.stderr)
+            self.assertEqual((old / "deciders-ledger.jsonl").read_text(), "old-ledger")
+            self.assertEqual((new / "model-tiers.json").read_text(), "new-existing")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_migration_is_a_noop_when_no_old_home_was_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new = Path(tmp) / "new-team-home"
+            harness = self._migration_harness(tmp)
+            with harness.open("a") as f:
+                f.write(f"$r = Invoke-TeamHomeMigration -DevTeamHome '{new}' -OldTeamHome $null\n")
+                f.write("Write-Output \"CHOICE=$($r.Choice)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("CHOICE=none", proc.stdout)
+            self.assertFalse(new.exists())
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding="utf-8")

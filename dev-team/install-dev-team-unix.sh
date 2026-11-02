@@ -317,6 +317,15 @@ fi
 # custom HERMES_HOME keeps working.
 ROOT_CONFIG="$(hermes config path)"
 HERMES_ROOT="$(dirname "$ROOT_CONFIG")"
+# T4: `hermes config path` returns the ACTIVE PROFILE's config.yaml
+# (…/profiles/<name>/config.yaml) when this installer itself is run under a
+# named profile -- so HERMES_ROOT above would be that profile's directory,
+# not the true Hermes root. Climb out of profiles/<name> exactly the way
+# kanban-budget.py's hermes_root() already does, so the team home below
+# lands at the Hermes root regardless of which profile ran the installer.
+if [[ "$(basename "$(dirname "$HERMES_ROOT")")" == profiles ]]; then
+    HERMES_ROOT="$(dirname "$(dirname "$HERMES_ROOT")")"
+fi
 PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 # The one real Mnemosyne data root, which every profile will be pointed at
 # unless --separate-memory was passed. Honour MNEMOSYNE_HOME if the user has
@@ -361,6 +370,66 @@ for key in memory.memory_enabled memory.user_profile_enabled; do
         say "         main installer with --disable-builtin-memory to turn it off."
     fi
 done
+
+# T4 migration: a team installed before HERMES_ROOT climbed out of a
+# profile may have every dev-* profile's dev-team symlink pointing at that
+# old, profile-rooted location -- which still holds the live data (project
+# records, the deciders ledger, model-tiers.json). Detect that *before*
+# anything below creates or writes to $DEV_TEAM_HOME, or the distinction
+# between "freshly created, empty" and "pre-existing data at the old wrong
+# path" is lost for good.
+resolve_existing_link() {  # path -> prints its realpath, or nothing
+    [[ -L $1 ]] || return 1
+    readlink -f "$1" 2>/dev/null
+}
+dir_has_data() {  # path -> true if it exists and is non-empty
+    [[ -d $1 ]] && find "$1" -mindepth 1 -print -quit 2>/dev/null | grep -q .
+}
+
+NEW_TEAM_HOME_CANON="$(readlink -f "$DEV_TEAM_HOME" 2>/dev/null || printf '%s' "$DEV_TEAM_HOME")"
+OLD_TEAM_HOME=""
+for role in "${NAMES[@]}"; do
+    selected "$role" || continue
+    name="$PREFIX$role"
+    hermes profile show "$name" >/dev/null 2>&1 || continue
+    pdir="$(dirname "$(hermes -p "$name" config path)")"
+    target="$(resolve_existing_link "$pdir/dev-team" || true)"
+    [[ -n $target ]] || continue
+    [[ $target == "$NEW_TEAM_HOME_CANON" ]] && continue
+    if dir_has_data "$target"; then
+        OLD_TEAM_HOME="$target"
+        break
+    fi
+done
+
+MIGRATION_CHOICE="none"
+MIGRATION_WHY="no pre-existing profile-rooted team home with data was found"
+if [[ -n $OLD_TEAM_HOME ]]; then
+    if dir_has_data "$DEV_TEAM_HOME"; then
+        MIGRATION_CHOICE="refuse"
+        MIGRATION_WHY="both $OLD_TEAM_HOME and $DEV_TEAM_HOME hold data; moving either would silently discard the other, so refuse and let the operator reconcile by hand"
+        echo "Team home conflict: existing team state at both:" >&2
+        echo "  $OLD_TEAM_HOME  (where dev-* profiles currently link)" >&2
+        echo "  $DEV_TEAM_HOME  (the correct Hermes-root location)" >&2
+        echo "Refusing to guess which is current. Reconcile by hand, then re-run, e.g.:" >&2
+        echo "  mv \"$DEV_TEAM_HOME\" \"$DEV_TEAM_HOME.bak-$(date +%Y%m%dT%H%M%S)\" && mv \"$OLD_TEAM_HOME\" \"$DEV_TEAM_HOME\"" >&2
+        exit 2
+    else
+        MIGRATION_CHOICE="move"
+        MIGRATION_WHY="dev-* profiles' dev-team links point at $OLD_TEAM_HOME, which holds the live team's data; $DEV_TEAM_HOME is empty or absent, so it is safe to move the data there without discarding anything"
+        backup="${OLD_TEAM_HOME}.pre-root-migration-$(date +%Y%m%dT%H%M%S)"
+        if (( DRY_RUN )); then
+            say "Would migrate team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
+            say "  (backup would be kept at $backup)"
+        else
+            mkdir -p "$DEV_TEAM_HOME"
+            cp -a "$OLD_TEAM_HOME"/. "$DEV_TEAM_HOME"/
+            mv "$OLD_TEAM_HOME" "$backup"
+            say "Migrated team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
+            say "  (backup kept at $backup)"
+        fi
+    fi
+fi
 
 say "Hermes home:   $HERMES_ROOT"
 say "Mnemosyne:     $PLUGIN_SRC_MNEMO"
