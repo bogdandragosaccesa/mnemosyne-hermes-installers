@@ -33,22 +33,31 @@ def _fake_key() -> str:
 class FakeTransport:
     """Records every call; replays a queued response or raises a queued error.
 
-    I4: also asserts the live request shapes recorded in PROBES.md (see
-    test_deciders_core.py's FakeTransport for the same check)."""
+    I4: also records live request-shape violations recorded in PROBES.md
+    (see test_deciders_core.py's FakeTransport for the same check).
+
+    D4 (review): recorded into self.violations, not raised, so a test
+    driving main() can't pass just because main()'s catch-all turned the
+    violation into an ordinary-looking exit 2 -- see _assert_no_shape_violations
+    below, used by every call through _run()."""
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.violations = []
 
     def __call__(self, url, headers, body, timeout):
         self.calls.append((url, headers, body, timeout))
         if url == "https://openrouter.ai/api/alpha/decisions" and "questions" in body:
             questions = body["questions"]
-            assert isinstance(questions, dict), (
-                f"questions must be a record (dict), not {type(questions).__name__}")
-            for qid, spec in questions.items():
-                assert isinstance(spec, dict) and spec.get("type"), (
-                    f"questions[{qid!r}] must be an object with a 'type'")
+            if not isinstance(questions, dict):
+                self.violations.append(
+                    f"questions must be a record (dict), not {type(questions).__name__}")
+            else:
+                for qid, spec in questions.items():
+                    if not (isinstance(spec, dict) and spec.get("type")):
+                        self.violations.append(
+                            f"questions[{qid!r}] must be an object with a 'type'")
         if not self._responses:
             raise AssertionError("FakeTransport called more times than expected")
         resp = self._responses.pop(0)
@@ -64,6 +73,18 @@ def _env(key=None):
     return env
 
 
+def _assert_no_shape_violations(transport) -> None:
+    """D4 (review): see test_deciders_core.py's identical helper -- every
+    test driving main() through a FakeTransport must fail on a recorded
+    shape violation, not just on whatever exit code main() produced."""
+    violations = getattr(transport, "violations", None)
+    if violations:
+        raise AssertionError(
+            "FakeTransport recorded request-shape violation(s), but the "
+            "test did not fail on them: " + "; ".join(violations)
+        )
+
+
 def _run(argv, transport, env, home=None):
     import io
     out = io.StringIO()
@@ -74,8 +95,10 @@ def _run(argv, transport, env, home=None):
         # isn't writable.
         with tempfile.TemporaryDirectory() as tmp:
             code = main(argv, home=Path(tmp), env=env, transport=transport, out=out)
+            _assert_no_shape_violations(transport)
             return code, out.getvalue()
     code = main(argv, home=home, env=env, transport=transport, out=out)
+    _assert_no_shape_violations(transport)
     return code, out.getvalue()
 
 
