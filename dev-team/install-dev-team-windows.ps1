@@ -693,7 +693,12 @@ Write-Host ''
 Write-Host "forge installed: $forgeCmdPath"
 
 # deciders.cmd on the same PATH, same wrapper shape as forge.cmd above.
-$decidersCmdContent = "@echo off`r`n$DecidersMarker`r`npython `"$DecidersPy`" %*`r`n"
+# `exit /b %ERRORLEVEL%` is explicit on purpose: without it, a caller that
+# launches the .cmd as other than the last command in its own cmd.exe
+# session (or under a shell that does not treat a bare batch-file
+# ERRORLEVEL as its own exit code) sees exit 0 regardless of python's real
+# exit code. python's own exit code is the whole point of this check.
+$decidersCmdContent = "@echo off`r`n$DecidersMarker`r`npython `"$DecidersPy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
 Set-Content -LiteralPath $decidersCmdPath -Value $decidersCmdContent -NoNewline -Encoding ascii
 Write-Host "deciders installed: $decidersCmdPath"
 
@@ -716,6 +721,48 @@ function Test-Eventually([scriptblock] $Check) {
     return $false
 }
 
+function Invoke-CheckedCommand {
+    <#
+      Runs $FilePath with $Arguments and returns @{ Code = <exit code>;
+      Output = <combined stdout+stderr as one string> }, never throwing on
+      a non-zero exit.
+
+      Windows PowerShell 5.1 writes a native command's stderr as
+      ErrorRecords as soon as any stream is redirected (here, folding
+      stderr into stdout with 2>&1), and $ErrorActionPreference = 'Stop'
+      turns those into terminating errors even though the command itself
+      ran and exited normally. Drop to 'Continue' for the call so a
+      failing child process is reported through its exit code and output,
+      the way a verification check needs, rather than as a PowerShell
+      exception that a bare try/catch collapses into an unexplained
+      "FAILED". See also Invoke-Hermes above, which has the same guard for
+      the same reason.
+    #>
+    param([string] $FilePath, [string[]] $Arguments)
+    $previousEA = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = (& $FilePath @Arguments 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+    } catch {
+        # e.g. the file cannot be launched at all (missing, not executable)
+        $output = $_.Exception.Message
+        $code = 1
+    } finally {
+        $ErrorActionPreference = $previousEA
+    }
+    return @{ Code = $code; Output = $output }
+}
+
+function Write-CheckFailure([string] $Label, [string] $Output) {
+    <# Prints the captured output of a failed check, indented, so a future
+       failure explains itself instead of only saying "FAILED". #>
+    Write-Host "  $Label`: FAILED"
+    if ($Output) {
+        ($Output -split "`r?`n") | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "    $_" }
+    }
+}
+
 Write-Host ''
 Write-Host 'Verifying'
 Write-Host ('-' * 40)
@@ -723,25 +770,11 @@ $failed = 0
 
 # deciders + model-tiers.json: one check, not per-profile - both are shared
 # installs, not something each profile wires separately.
-# Same stderr hazard as Invoke-Hermes: a failing deciders (python missing,
-# an import error) writes to stderr, which the redirect turns into
-# ErrorRecords and 'Stop' into a terminating error. Drop to 'Continue' so a
-# failure counts as a failed check instead of aborting the script.
-$previousEA = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-try {
-    & $decidersCmdPath '--help' *> $null
-    $decidersCode = $LASTEXITCODE
-} catch {
-    # e.g. the wrapper cannot be launched at all
-    $decidersCode = 1
-} finally {
-    $ErrorActionPreference = $previousEA
-}
-if ($decidersCode -eq 0) {
+$decidersResult = Invoke-CheckedCommand -FilePath $decidersCmdPath -Arguments @('--help')
+if ($decidersResult.Code -eq 0) {
     Write-Host '  deciders --help: ok'
 } else {
-    Write-Host '  deciders --help: FAILED'
+    Write-CheckFailure 'deciders --help' $decidersResult.Output
     $failed++
 }
 try {

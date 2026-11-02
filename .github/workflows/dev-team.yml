@@ -43,6 +43,8 @@ jobs:
 
       - name: Install Mnemosyne memory
         run: ./install-mnemosyne-hermes-unix.sh --disable-builtin-memory
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Create qa collision canary (old-team profile name)
         run: hermes profile create qa --clone
@@ -132,6 +134,8 @@ jobs:
       - name: Install Mnemosyne memory
         shell: pwsh
         run: .\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Create qa collision canary (old-team profile name)
         shell: pwsh
@@ -199,6 +203,8 @@ jobs:
       - name: Install Mnemosyne memory
         shell: powershell
         run: .\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Runs under Windows PowerShell 5.1
         shell: powershell

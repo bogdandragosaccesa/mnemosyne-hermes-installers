@@ -83,6 +83,64 @@ class WindowsInstallerTests(unittest.TestCase):
                 self.assertIn("decisions-only", proc.stderr)
                 self.assertIn(param, proc.stderr)
 
+    def test_deciders_cmd_propagates_exit_code_explicitly(self):
+        # install-windows-ps51 (run 41451251672): `deciders --help` FAILED
+        # with no explanation, because (a) the .cmd wrapper let cmd.exe's
+        # own exit code stand in for python's instead of propagating it
+        # explicitly, and (b) the check threw everything away with `*>
+        # $null`. A .cmd whose last line is a bare command relies on
+        # cmd.exe's ERRORLEVEL propagation, which is not reliable across
+        # shells launching it; an explicit `exit /b %ERRORLEVEL%` is.
+        self.assertTrue(
+            re.search(r"decidersCmdContent = .*exit /b %ERRORLEVEL%", self.text),
+            "deciders.cmd does not explicitly propagate python's exit code")
+
+    def test_deciders_help_check_prints_output_instead_of_discarding_it(self):
+        # The old check piped everything to `*> $null`, so a failure said
+        # only "FAILED" with no way to tell python-not-found from a bad
+        # argument from an import error.
+        self.assertNotIn("*> $null", self.text, "a check still discards all output")
+        body = _function(self.text, "Invoke-CheckedCommand")
+        self.has("2>&1", body, "Invoke-CheckedCommand does not capture stderr")
+        verify_section = self.text[self.text.index("Write-Host 'Verifying'"):]
+        deciders_check = verify_section[:verify_section.index("$ModelTiersPath -Raw")]
+        self.has("Invoke-CheckedCommand", deciders_check,
+                  "deciders --help check does not use Invoke-CheckedCommand")
+        # On failure it must call the helper that prints the captured
+        # output, not just say "FAILED" with nothing to explain it.
+        self.has("Write-CheckFailure", deciders_check,
+                  "deciders --help check never prints the output on failure")
+        failure_printer = _function(self.text, "Write-CheckFailure")
+        self.has("FAILED", failure_printer, "no FAILED label")
+        self.has("Write-Host", failure_printer, "failure printer never writes the output")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_invoke_checked_command_reports_exit_code_and_combined_output(self):
+        # Exercises the actual helper function (not a stand-in): a fake
+        # "python" that writes to both stdout and stderr then exits
+        # non-zero must come back with that exit code and both lines in
+        # Output, proving the check can explain a future failure instead
+        # of only saying "FAILED".
+        func_body = _function(self.text, "Invoke-CheckedCommand")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake_tool.sh"
+            fake.write_text(
+                "#!/bin/sh\necho 'to stdout'\necho 'boom: python not found' >&2\nexit 7\n")
+            fake.chmod(0o755)
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                func_body + "\n"
+                f"$r = Invoke-CheckedCommand -FilePath '{fake}' -Arguments @('--help')\n"
+                "Write-Output \"CODE=$($r.Code)\"\n"
+                "Write-Output \"OUT=$($r.Output)\"\n")
+            proc = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("CODE=7", proc.stdout)
+        self.assertIn("boom: python not found", proc.stdout)
+        self.assertIn("to stdout", proc.stdout)
+
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_parses_under_powershell(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,6 +185,16 @@ class WorkflowTests(unittest.TestCase):
         job = self.job("install-linux")
         self.has("--dry-run", job, "no --dry-run run")
         self.has("--only", job, "no --only run")
+
+    def test_mnemosyne_install_steps_pass_github_token(self):
+        # run 41451251672: install-windows and install-windows-ps51 hit
+        # "GitHub API rate limit" installing Mnemosyne, unauthenticated.
+        for job_name in ("install-linux", "install-windows", "install-windows-ps51"):
+            job = self.job(job_name)
+            step = job[job.index("Install Mnemosyne memory"):]
+            step = step[:step.index("\n      - name:") if "\n      - name:" in step else len(step)]
+            self.has("GITHUB_TOKEN: ${{ github.token }}", step,
+                      f"{job_name}: Install Mnemosyne memory step has no GITHUB_TOKEN env")
 
 
 if __name__ == "__main__":
