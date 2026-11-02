@@ -47,20 +47,29 @@ its own stdout, but you must not route the value through anything that would re-
   or graded question you would otherwise spend a long read or several turns answering, and that
   repeats (triaging many similar items, matching a failure to one of several known causes). Not
   for one-off reasoning you are already doing in this turn — that call costs you nothing extra
-  and deciders would only add a round trip. Code applies the real thresholds; between
-  probability `0.35` and `0.65` on the leading answer, the signal is too weak to trust and you
-  decide yourself instead of taking the model's top pick.
+  and deciders would only add a round trip. `--questions` is a JSON array, one object per
+  question, e.g. `[{"id": "q1", "type": "choice", "instructions": "Is this a flake?",
+  "criteria": {"yes": "...", "no": "..."}}]`. `decide` returns the model's raw `choice` and
+  `probabilities` for each question **unmodified — no threshold is applied in code**; only
+  `deciders tier` applies one (via `choose_tier`). You apply the band yourself: for a yes/no
+  question, read the `yes` probability — `>= 0.65` means yes, `<= 0.35` means no, anything in
+  between you decide yourself without trusting the model's `choice`. For a one-of-N question,
+  trust the leading option's `choice` only when its own probability is `>= 0.65`; below that,
+  decide yourself — a leading option sitting at, say, 0.30 is a *weaker* signal than the band
+  itself, not a usable pick.
 - **`deciders extract --entities <file|-> [--input <file|->]`** — to find *where* to look inside
   large text (a CI log, a test run, a long diff): it returns spans with offsets and confidence,
-  not conclusions. An extracted span is a pointer, never a finding — you must open the reported
-  span yourself and judge it before you act on it or cite it anywhere.
+  not conclusions. `--entities` is a JSON object naming what to find, e.g.
+  `{"types": ["synthetic-secret"]}` — passed through as
+  `provider.options.scaledown.entities`. An extracted span is a pointer, never a finding — you
+  must open the reported span yourself and judge it before you act on it or cite it anywhere.
 - **`deciders summarize [--input <file|->]`** — only to compress context you will not cite:
   background material, old discussion, anything you are reading for orientation rather than
   evidence. The output always carries `"evidence": false`, and that is a statement of fact, not
   a formality: never evidence for a verdict, a finding, or "tests pass". Never run it on test
   output, review output, or CI output, and never let its summary stand in for reading output
-  that a gate or a finding rests on. The spike that justified this rule caught it twice writing
-  a confident, false summary of a run that had actually failed.
+  that a gate or a finding rests on. The spike that justified this rule caught it writing a
+  confident, false summary of a review whose tool output showed a credential leak.
 
 ## On failure: exit 2
 

@@ -38,21 +38,36 @@ a different, unguarded profile of that name. If the file is missing or empty,
 ## The child card
 
 Before each `kanban_create` for an implement card, run `deciders tier` (see `dev-team-deciders`)
-over the card's title and spec: `deciders tier --title "..." --spec <file|->`. Apply its
-printed `tier` and, when `override` is non-null, pass that override's `provider` and `model`
-straight through to `kanban_create(model=..., provider=...)` — `override` already comes from
-the operator-written `model-tiers.json` table, mapping each tier to an exact pair, so you are
-never choosing a model `model-tiers.json` doesn't list. When `override` is null (no tier table,
-or no entry for this tier), create the card without a model/provider override and say why in
-the card body. Put `tier`, `probabilities` and `override_reason` in the card body either way, so
-the reviewer can see the reasoning. **Your own soul's routing overrides still win over the
-decider's tier**: a retry drops a tier, two failures escalate once, and architecture or security
-work is always Frontier (deep) regardless of what `deciders tier` answered. On exit `2` (no key,
-bad key, cap, malformed response), pick the tier yourself, as before deciders existed, and note
-that in the card body instead of a probability — never block the plan card over an unavailable
-decider call.
+over the card's title and spec: `deciders tier --title "..." --spec <file|->`. It prints a
+`tier`, `probabilities`, and — for that one computed tier only — an `override` looked up from
+the operator-written `model-tiers.json` table. Do **not** apply that `override` yet: it is only
+correct for the tier `deciders tier` itself computed.
 
-Then create the `implement` card as this card's direct child:
+**Decide the final tier yourself next.** Start from the printed `tier`, then apply your own
+soul's routing overrides, which still win over the decider's answer: a retry drops a tier, two
+failures escalate once, and architecture or security work is always Frontier (`deep`) regardless
+of what `deciders tier` answered. Call the result of that the **final tier**, and record in the
+card body which soul rule (if any) changed it, e.g. `override_reason: soul rule "security always
+deep" raised computed tier "standard" to "deep"`.
+
+- If the final tier is the same as the printed `tier`, the decider's own `override` is already
+  the `model-tiers.json` entry for that tier — use it directly.
+- If a soul rule changed the tier, the decider's `override` is for the *wrong* tier and must not
+  be used. Instead read `$HERMES_HOME/dev-team/model-tiers.json` yourself and look up the entry
+  for the **final tier**: `{provider, model}`. If the file is missing, isn't valid JSON, or has
+  no entry for the final tier, create the card with no model/provider override and say why in
+  the body (`override_reason: ... (no tier table)` or `... (no entry for <tier>)`) — never guess
+  a model or fall back to the decider's tier's pair.
+
+Put `tier` (the final tier), `probabilities` and `override_reason` in the card body either way,
+so the reviewer can see the reasoning, and note which soul rule (if any) changed the tier right
+next to them. On exit `2` (no key, bad key, cap, malformed response), pick the tier yourself, as
+before deciders existed, and note that in the card body instead of a probability — never block
+the plan card over an unavailable decider call.
+
+Then create the `implement` card as this card's direct child, using the **final tier's** pair
+(`final_override`, from `model-tiers.json` keyed on the final tier, not the decider's `override`
+for its own computed tier):
 
 ```
 kanban_create(
@@ -60,8 +75,8 @@ kanban_create(
     assignee="<prefix>backend-db",   # or "<prefix>frontend", whichever role this unit needs
     parents=[<this plan card's id>],
     skills=["dev-team-stage-implement"],
-    model=<override["model"] if override else omitted>,
-    provider=<override["provider"] if override else omitted>,
+    model=<final_override["model"] if final_override else omitted>,
+    provider=<final_override["provider"] if final_override else omitted>,
 )
 ```
 
