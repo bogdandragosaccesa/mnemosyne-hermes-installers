@@ -1,0 +1,7 @@
+{
+  "state": "failure",
+  "statuses": [
+    {"status": "success"},
+    {"status": "failure"}
+  ]
+}

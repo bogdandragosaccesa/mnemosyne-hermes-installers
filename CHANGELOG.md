@@ -7,7 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Moved `sdlc-team/` and `outsourcing-team/` to `old/sdlc-team/` and `old/outsourcing-team/`
+  (`git mv`). Both are superseded by `dev-team/` (added below) and are kept frozen, not
+  maintained. Internal relative paths (`../install-...`, `../uninstall-...`, `../docs/...`)
+  were updated to `../../...` to account for the extra directory level, and each old README
+  gained one line at the top pointing at `../../dev-team/README.md`.
+
 ### Added
+
+- [`dev-team/`](dev-team/README.md) — an autonomous software delivery team, governed the
+  Archon way: Hermes kanban stays exactly as it is, and a small plugin
+  (`dev-team-gate`) enforces stage completion mechanically instead of trusting an agent's
+  say-so. One sentence, a budget and a repository in; a pull request with green CI, marked
+  ready for human merge, out — merge and deploy stay human-only by construction (`forge` has
+  no merge or deploy subcommand, and the guard additionally blocks known merge/deploy commands
+  and the kanban side-door verbs on every guarded card).
+  - Eight profiles (`pm`, `architect`, `uiux`, `backend-db`, `frontend`, `qa`, `reviewer` —
+    new — `devops`), prefixed `dev-` by default (`--prefix`/`-Prefix`, as the outsourcing
+    installer's), installed by `install-dev-team-unix.sh` /
+    `install-dev-team-windows.ps1` with `--model`/`-Model`, `--only`/`-Only`,
+    `--skip-model`/`-SkipModel`, `--keep-soul`/`-KeepSoul`,
+    `--separate-memory`/`-SeparateMemory`, `--dry-run`/`-DryRun`. Idempotent; links the gate
+    plugin and Mnemosyne into every profile and verifies both before exiting.
+  - Six pipeline stages (`intake` → `plan` → `implement` → `validate` → `review` → `pr-ci`),
+    each a child card of the last, each required to hand the next a small typed `metadata`
+    result the guard validates by type on `kanban_complete`; `pr-ci`'s claimed `ci: "green"`
+    is re-verified against the forge itself, not taken on the worker's word. Rework (QA fail,
+    review changes, CI red caused by the change) loops back to a new `implement` card up to a
+    round limit of 3, enforced from the card's ancestry.
+  - `forge`, a vendor-neutral stdlib CLI (`detect`, `pr-open`, `pr-status`, `ci-status`,
+    `mark-ready`) with adapters for GitHub, GitLab, Gitea and Jenkins, so no vendor name leaks
+    into any soul, stage skill or the guard's logic except the one stage skill
+    (`dev-team-stage-pr-ci`) allowed to name it.
+  - `dev-team/scripts/kanban-budget.py`, dev-team's own copy of the outsourcing team's budget
+    script, run by `pm` at 25/50/75% checkpoints; its exit code (0 fine, 1 closeout reserve, 2
+    exhausted) is pm's judgment call, never the guard's.
+  - Unit tests for `forge`'s adapters and the `dev-team-gate` guard, plus
+    `.github/workflows/dev-team.yml` running them alongside an install/reinstall idempotency
+    check on Linux and Windows.
 
 - `--recommended-config` / `-RecommendedConfig`: opt-in settings for cross-session recall
   over global-scope memories and the strict write classifier (in Mnemosyne's `config.yaml`,
@@ -18,7 +57,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory text to Hermes' model provider, which costs tokens. The uninstallers remove the two
   `.env` lines while they still read `true`. See
   [Configuration](docs/configuration.md#recommended-configuration).
-- [`outsourcing-team/`](outsourcing-team/README.md) — a second optional profile set, for the
+- [`outsourcing-team/`](old/outsourcing-team/README.md) — a second optional profile set, for the
   vendor side of a contract rather than a product team: eleven role profiles
   (engagement-lead, delivery-manager, business-analyst, domain-consultant,
   solution-architect, app-engineer, integration-engineer, qa-lead, platform-sre,
@@ -46,7 +85,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name so two engagements of the same team can run side by side. `--only`/`-Only` still takes
   bare role names, unaffected by the prefix, and now fails fast on an unrecognised name
   instead of completing successfully having created nothing.
-- [`sdlc-team/`](sdlc-team/README.md) — an optional companion to the memory installers:
+- [`sdlc-team/`](old/sdlc-team/README.md) — an optional companion to the memory installers:
   nine role profiles (architect, backend-db, devops, frontend, pm, qa, researcher, uiux,
   writer), each with its own SOUL, each pointed at Mnemosyne, with
   `install-sdlc-team-unix.sh` and `install-sdlc-team-windows.ps1`. Flags:

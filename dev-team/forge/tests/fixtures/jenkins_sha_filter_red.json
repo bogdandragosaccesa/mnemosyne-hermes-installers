@@ -1,0 +1,20 @@
+{
+  "builds": [
+    {
+      "number": 7,
+      "result": "SUCCESS",
+      "building": false,
+      "actions": [
+        {"lastBuiltRevision": {"SHA1": "other999"}}
+      ]
+    },
+    {
+      "number": 6,
+      "result": "FAILURE",
+      "building": false,
+      "actions": [
+        {"lastBuiltRevision": {"SHA1": "abc123"}}
+      ]
+    }
+  ]
+}

@@ -136,7 +136,7 @@ function Invoke-Hermes {
 if (-not (Get-Command hermes -ErrorAction SilentlyContinue)) {
     Write-Error @'
 hermes not found on PATH.
-Install Hermes and Mnemosyne first: ..\install-mnemosyne-hermes-windows.ps1
+Install Hermes and Mnemosyne first: ..\..\install-mnemosyne-hermes-windows.ps1
 '@
     exit 1
 }
@@ -154,7 +154,7 @@ $MnemoHome  = if ($env:MNEMOSYNE_HOME) { $env:MNEMOSYNE_HOME } else { Join-Path 
 if (-not (Test-Path -LiteralPath $PluginSrc)) {
     Write-Error @"
 Mnemosyne plugin not found at $PluginSrc.
-Run ..\install-mnemosyne-hermes-windows.ps1 first.
+Run ..\..\install-mnemosyne-hermes-windows.ps1 first.
 "@
     exit 1
 }
@@ -167,7 +167,7 @@ $Provider = Invoke-Hermes 'config' 'get' 'memory.provider'
 if ($Provider -ne 'mnemosyne') {
     Write-Error @"
 memory.provider on the root profile is '$Provider', not 'mnemosyne'.
-Run ..\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory first,
+Run ..\..\install-mnemosyne-hermes-windows.ps1 -DisableBuiltinMemory first,
 so the profiles clone a config that already points at Mnemosyne.
 "@
     exit 1

@@ -89,4 +89,4 @@ the procedural skills that tell those roles where their boundary is.
 Porting it is mechanical: the same role→tier table, the same role→skill table, and
 `Copy-Item -Recurse` from `role-skills/` into `<profile>/skills/delivery/`. Until that
 lands, a Windows user should run the bash installer under WSL, or set the models by hand
-from the table in `outsourcing-team/README.md`.
+from the table in `old/outsourcing-team/README.md`.

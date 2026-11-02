@@ -1,3 +1,5 @@
+> Superseded by [dev-team](../../dev-team/README.md). Kept frozen; not maintained.
+
 # IT outsourcing delivery team profiles
 
 Eleven Hermes profiles covering how a software services company actually delivers into
@@ -54,7 +56,7 @@ rather than by profile name alone.
 Hermes must already be installed with Mnemosyne as the active memory provider:
 
 ```bash
-../install-mnemosyne-hermes-unix.sh --disable-builtin-memory
+../../install-mnemosyne-hermes-unix.sh --disable-builtin-memory
 ```
 
 `--disable-builtin-memory` matters here beyond the usual context argument. `hermes profile
