@@ -380,6 +380,65 @@ class KeyRedactionTests(unittest.TestCase):
         self.assertNotIn(key, stdout)
 
 
+class TaskIdValidationTests(unittest.TestCase):
+    """D2 (review): `--task-id` is validated before the handler runs, so a
+    bad value never spends money and never reaches the ledger. Every
+    rejection is the same labelled `deciders: bad-input: task-id` --
+    never the rejected value itself."""
+
+    def _decide_argv(self, task_id):
+        return [
+            "decide", "--state", str(FIXTURES / "decide_ok.json"),
+            "--questions", str(FIXTURES / "decide_questions.json"),
+            "--task-id", task_id,
+        ]
+
+    def _assert_rejected(self, task_id):
+        key = _fake_key()
+        transport = FakeTransport([])  # never reached if rejection is pre-handler
+        env = _env(key)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(self._decide_argv(task_id), transport, env, home=home)
+            self.assertEqual(code, EXIT_UNANSWERED)
+            self.assertEqual(len(transport.calls), 0, "handler must not run on bad task-id")
+            data = json.loads(stdout)
+            self.assertTrue(data["error"].startswith("deciders: bad-input"))
+            self.assertIn("task-id", data["error"])
+            self.assertNotIn(key, stdout)
+            if task_id != key:
+                self.assertNotIn(task_id, stdout)
+            ledger = deciders_core.ledger_path(home)
+            self.assertFalse(ledger.exists(), "a rejected task-id must never reach the ledger")
+
+    def test_key_as_task_id_is_rejected(self):
+        self._assert_rejected(_fake_key())
+
+    def test_bearer_key_as_task_id_is_rejected(self):
+        self._assert_rejected(f"Bearer {_fake_key()}")
+
+    def test_5000_char_task_id_is_rejected(self):
+        self._assert_rejected("a" * 5000)
+
+    def test_task_id_with_newline_is_rejected(self):
+        self._assert_rejected("t_abc\ndef")
+
+    def test_valid_task_id_is_accepted(self):
+        fixture = _load_fixture("decide_ok.json")
+        key = _fake_key()
+        transport = FakeTransport([fixture])
+        env = _env(key)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                self._decide_argv("t_1a2b3c4d"), transport, env, home=home
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["task_id"], "t_1a2b3c4d")
+
+
 # --- Real classification: urllib_transport with urlopen patched -------------
 
 _ERROR_BODY = "UPSTREAM-ERROR-BODY-MARKER"

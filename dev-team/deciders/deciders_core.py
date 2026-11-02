@@ -14,6 +14,7 @@ import datetime
 import json
 import math
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -51,6 +52,27 @@ DEFAULT_MODELS = {
 DECISION_MODELS = ("liquid/d1.1", "typesafe/jev-1.13", "upstage/solar-decide-flash", "perplexity/pplx-decider-*")
 
 TIMEOUT_S = 60.0
+
+# D2 (review): the only shape a task id is ever allowed to take. Anything
+# else -- the key itself, a "Bearer <key>" header value, an over-long
+# string, a newline -- is rejected as bad-input before any network call,
+# so a typo in a skill or a card never spends money and never lands in
+# the ledger.
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _task_id_is_valid(value: str, key: "str | None") -> bool:
+    """True iff `value` matches TASK_ID_RE and does not embed `key`.
+
+    The key-containment check is independent of the shape check: a key
+    that happens to be 64-or-fewer alphanumeric/`-`/`_` characters would
+    otherwise pass the regex outright.
+    """
+    if not isinstance(value, str) or not TASK_ID_RE.fullmatch(value):
+        return False
+    if key and key in value:
+        return False
+    return True
 
 # Plan-stage tier rule (design, "Plan-stage tier proposal"). Consequence of
 # missing the threshold either way: too low sends an uncertain card to a
@@ -134,6 +156,7 @@ def append_ledger(
     cost: float,
     *,
     task_id: "str | None" = None,
+    key: "str | None" = None,
 ) -> None:
     """Append one spend record as a single atomic write() of one JSON line.
 
@@ -142,16 +165,31 @@ def append_ledger(
     a whole, valid line -- never an interleaved partial write.
 
     ``task_id``, when given, is the explicit ``--task-id`` CLI value and
-    always wins. ``$HERMES_KANBAN_TASK`` is read only as a fallback: a
-    dispatched worker's own harness process knows its task id, but that
-    variable is not reliably present in the environment a *subprocess*
-    (such as this CLI, invoked via `secret exec` or a plain shell command)
-    inherits -- proved by probing a real dispatched-worker shell, where
-    sibling vars like HERMES_KANBAN_BOARD and HERMES_KANBAN_WORKSPACE were
-    set but HERMES_KANBAN_TASK was not. Callers that know their task id
-    (the skill instructs passing it explicitly) should always pass it.
+    always wins; by the time it reaches here it has already been
+    validated by ``main()`` (an invalid explicit value raises before any
+    handler runs, so this function never sees one). ``$HERMES_KANBAN_TASK``
+    is read only as a fallback: a dispatched worker's own harness process
+    knows its task id, but that variable is not reliably present in the
+    environment a *subprocess* (such as this CLI, invoked via `secret exec`
+    or a plain shell command) inherits -- proved by probing a real
+    dispatched-worker shell, where sibling vars like HERMES_KANBAN_BOARD
+    and HERMES_KANBAN_WORKSPACE were set but HERMES_KANBAN_TASK was not.
+    Callers that know their task id (the skill instructs passing it
+    explicitly) should always pass it.
+
+    D2 (review): the env fallback is validated with the same
+    ``_task_id_is_valid`` shape+key check as the explicit flag. Unlike the
+    flag, an invalid env value never raises -- it silently becomes
+    ``None`` -- because this runs after a call has already been billed
+    and must still write a ledger line.
     """
-    resolved_task_id = task_id if task_id else (env.get("HERMES_KANBAN_TASK") or None)
+    resolved_task_id = task_id
+    if not resolved_task_id:
+        env_task_id = env.get("HERMES_KANBAN_TASK") or None
+        if env_task_id and _task_id_is_valid(env_task_id, key):
+            resolved_task_id = env_task_id
+        else:
+            resolved_task_id = None
     record = {
         "ts": datetime.datetime.now(datetime.timezone.utc)
         .isoformat(timespec="milliseconds")
@@ -607,7 +645,17 @@ def main(
         # The explicit --task-id flag always wins over $HERMES_KANBAN_TASK:
         # see append_ledger's docstring for why the env var alone is not
         # trustworthy in a dispatched worker's subprocess environment.
-        task_id = (getattr(args, "task_id", None) or "").strip() or None
+        # D2 (review): validated here, before the handler runs, so an
+        # invalid value -- the key itself, "Bearer <key>", an over-long
+        # string, a newline -- never spends money and never reaches the
+        # ledger. The error never echoes the rejected value.
+        raw_task_id = (getattr(args, "task_id", None) or "").strip()
+        if raw_task_id:
+            if not _task_id_is_valid(raw_task_id, key):
+                raise DecidersError("deciders: bad-input", "task-id")
+            task_id = raw_task_id
+        else:
+            task_id = None
         handler = _DISPATCH[args.command]
         result = handler(args, key, transport, ledger_info)
         if args.command == "tier":
@@ -615,7 +663,8 @@ def main(
             result = dict(result, override=override, override_reason=override_reason)
         ledger_info["success_write_attempted"] = True
         append_ledger(
-            home, env, args.command, result["model"], result["cost"], task_id=task_id
+            home, env, args.command, result["model"], result["cost"],
+            task_id=task_id, key=key,
         )
     except Exception as exc:  # catch-all: never let an exception escape unredacted
         # M1: the transport may have returned (and been billed) even though
@@ -630,7 +679,7 @@ def main(
                     home, env, ledger_info.get("command", "?"),
                     ledger_info.get("model") or "unknown",
                     ledger_info.get("cost", 0.0),
-                    task_id=task_id,
+                    task_id=task_id, key=key,
                 )
             except OSError as le:
                 ledger_error = le

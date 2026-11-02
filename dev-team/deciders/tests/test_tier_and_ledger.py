@@ -528,6 +528,44 @@ class DispatchedWorkerTaskIdTests(unittest.TestCase):
             record = json.loads(ledger.read_text().splitlines()[0])
             self.assertEqual(record["task_id"], "t_from_env")
 
+    def test_env_task_id_containing_key_is_recorded_as_null_not_failed(self):
+        # D2 (review): the same validation applies to the env fallback,
+        # but an invalid env value silently becomes null -- it never
+        # fails the call, because this runs after a billed transport
+        # call already succeeded.
+        fixture = _load_fixture("decide_ok.json")
+        key = _fake_key()
+        env = _env(key)
+        env["HERMES_KANBAN_TASK"] = key
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            self.assertNotIn(key, stdout)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertIsNone(record["task_id"])
+
+    def test_env_task_id_too_long_is_recorded_as_null_not_failed(self):
+        fixture = _load_fixture("decide_ok.json")
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_TASK"] = "a" * 5000
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, _ = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertIsNone(record["task_id"])
+
 
 class M1LedgerWrittenOnFailedValidationTests(unittest.TestCase):
     """M1: the transport returned (and was billed), but validation after
