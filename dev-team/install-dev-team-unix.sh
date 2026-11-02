@@ -496,12 +496,24 @@ for i in "${!NAMES[@]}"; do
     fi
 done
 
+# The OpenRouter key for deciders: this installer never reads, prompts for
+# or writes it. Only print where to put it.
+deciders_key_note() {
+    if command -v secret >/dev/null 2>&1; then
+        say "OpenRouter key for deciders: store it with \`secret set openrouter/deciders\`"
+    else
+        say "OpenRouter key for deciders: add \`OPENROUTER_DECIDERS_KEY\` to each profile's .env"
+    fi
+}
+
 if (( DRY_RUN )); then
     say ""
     say "  would install: running-the-pipeline skill + bin/kanban-budget.py"
     say "                 into the '$PREFIX$ENTRY_PROFILE' profile"
     say "  would install: ~/.local/bin/forge"
     say "  would install: ~/.local/bin/deciders"
+    say ""
+    deciders_key_note
     say "Dry run: nothing was changed."
     exit 0
 fi
@@ -550,14 +562,10 @@ EOF
 chmod +x "$DECIDERS_BIN"
 say "deciders installed: $DECIDERS_BIN"
 
-# The OpenRouter key for deciders: this installer never reads, prompts for
-# or writes it. Only print where to put it.
+# The OpenRouter key for deciders: printed by deciders_key_note (defined
+# above, also shown in --dry-run).
 say ""
-if command -v secret >/dev/null 2>&1; then
-    say "OpenRouter key for deciders: store it with \`secret set openrouter/deciders\`"
-else
-    say "OpenRouter key for deciders: add \`OPENROUTER_DECIDERS_KEY\` to each profile's .env"
-fi
+deciders_key_note
 
 # A check that can race the gateway's plugin reload right after `plugins
 # enable` (Task 12: the first run exited 1 although the plugin was enabled).

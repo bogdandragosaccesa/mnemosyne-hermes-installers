@@ -616,6 +616,8 @@ if ($DryRun) {
     Write-Host "                 into the '$Prefix$EntryProfile' profile"
     Write-Host '  would install: forge.cmd next to hermes.exe on PATH'
     Write-Host '  would install: deciders.cmd next to hermes.exe on PATH'
+    Write-Host ''
+    Write-Host "OpenRouter key for deciders: add ``OPENROUTER_DECIDERS_KEY`` to each profile's .env"
     Write-Host 'Dry run: nothing was changed.'
     exit 0
 }
@@ -685,8 +687,22 @@ $failed = 0
 
 # deciders + model-tiers.json: one check, not per-profile - both are shared
 # installs, not something each profile wires separately.
-& $decidersCmdPath '--help' *> $null
-if ($LASTEXITCODE -eq 0) {
+# Same stderr hazard as Invoke-Hermes: a failing deciders (python missing,
+# an import error) writes to stderr, which the redirect turns into
+# ErrorRecords and 'Stop' into a terminating error. Drop to 'Continue' so a
+# failure counts as a failed check instead of aborting the script.
+$previousEA = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $decidersCmdPath '--help' *> $null
+    $decidersCode = $LASTEXITCODE
+} catch {
+    # e.g. the wrapper cannot be launched at all
+    $decidersCode = 1
+} finally {
+    $ErrorActionPreference = $previousEA
+}
+if ($decidersCode -eq 0) {
     Write-Host '  deciders --help: ok'
 } else {
     Write-Host '  deciders --help: FAILED'
