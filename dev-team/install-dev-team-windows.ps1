@@ -112,8 +112,10 @@ if (-not $Prefix -or $Prefix -notmatch '^[a-zA-Z0-9_-]+$') {
 function Split-TierPM {
     <#
       Splits "$Value" on its FIRST ':' into a two-element array
-      (provider, model). Exits 2, naming $FlagName, when there is no ':' -
-      same contract as the Unix installer's --tier-* flags.
+      (provider, model). Exits 2, naming $FlagName, when there is no ':'
+      or when either half is empty - same contract as the Unix
+      installer's --tier-* flags ("must be PROVIDER:MODEL with both
+      non-empty").
     #>
     param([string] $Value, [string] $FlagName)
     if ($Value -notmatch ':') {
@@ -121,7 +123,13 @@ function Split-TierPM {
         exit 2
     }
     $idx = $Value.IndexOf(':')
-    return @($Value.Substring(0, $idx), $Value.Substring($idx + 1))
+    $provider = $Value.Substring(0, $idx)
+    $model = $Value.Substring($idx + 1)
+    if (-not $provider -or -not $model) {
+        [Console]::Error.WriteLine("$FlagName must be PROVIDER:MODEL with both non-empty (got '$Value')")
+        exit 2
+    }
+    return @($provider, $model)
 }
 
 function Split-ProviderModel {

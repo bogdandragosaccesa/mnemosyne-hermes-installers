@@ -147,6 +147,28 @@ class WindowsInstallerTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("-TierFast", proc.stderr)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_T2_refuses_an_empty_provider_or_model_half(self):
+        # -TierFast 'anthropic:' (empty model) and -TierFast ':model' (empty
+        # provider) both split cleanly on ':' and so slipped past
+        # Split-TierPM's "no colon" check -- unlike the Unix installer,
+        # which requires both halves non-empty. Same contract here: exit 2
+        # with "must be PROVIDER:MODEL with both non-empty".
+        for param, value in (("-TierFast", "anthropic:"),
+                              ("-TierFast", ":model"),
+                              ("-TierStandard", "anthropic:"),
+                              ("-TierDeep", ":model")):
+            with self.subTest(param=param, value=value), tempfile.TemporaryDirectory() as tmp:
+                proc = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1),
+                     "-DryRun", param, value],
+                    capture_output=True, text=True, timeout=120,
+                    env={"HOME": tmp, "PATH": "/usr/bin:/bin:/snap/bin",
+                         "USERPROFILE": tmp})
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("must be PROVIDER:MODEL with both non-empty", proc.stderr)
+                self.assertIn(param, proc.stderr)
+
     def test_wrappers_name_a_resolved_python_not_a_bare_python(self):
         # A bare `python` hits the Microsoft Store alias stub on machines with
         # no system Python ("Python was not found", exit 9009), which failed
