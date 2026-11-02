@@ -87,6 +87,12 @@ def urllib_transport(url: str, headers: dict, body: dict, timeout: float) -> dic
         if isinstance(exc.reason, socket.timeout):
             raise DecidersError("deciders: timeout") from exc
         raise DecidersError("deciders: upstream", str(exc.reason)) from exc
+    except OSError as exc:
+        # Connection reset/refused mid-request or mid-read: classified by
+        # exception type only, never by message text.
+        raise DecidersError("deciders: upstream", type(exc).__name__) from exc
+    except UnicodeDecodeError as exc:
+        raise DecidersError("deciders: bad-response", "body is not UTF-8") from exc
 
     try:
         return json.loads(raw)
@@ -140,30 +146,61 @@ def _chat_content(data: dict) -> str:
         raise DecidersError("deciders: bad-response", str(exc)) from exc
 
 
+def _require_dict(data) -> dict:
+    """The top level of every response must be a JSON object."""
+    if not isinstance(data, dict):
+        raise DecidersError("deciders: bad-response",
+                            f"top level is {type(data).__name__}, not object")
+    return data
+
+
+def _cost(data: dict) -> float:
+    """Cost as reported by the response: top-level ``cost``, else ``usage.cost``.
+
+    Missing or non-numeric cost is a bad response, never a guessed 0.0 —
+    the ledger would silently undercount.
+    """
+    cost = data.get("cost")
+    if cost is None:
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            cost = usage.get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        raise DecidersError("deciders: bad-response", "cost missing or not a number")
+    return float(cost)
+
+
+def _require_input(text: str) -> str:
+    """Refuse to send an empty prompt to a paid model."""
+    if not text.strip():
+        raise DecidersError("deciders: bad-input", "input is empty (pass --input <file|->)")
+    return text
+
+
 def _cmd_decide(args, key: str, transport: Transport) -> dict:
     state = _read_json(args.state)
     questions = _read_json(args.questions)
     model = args.model or DEFAULT_MODELS["decide"]
     body = {"model": model, "state": state, "questions": questions}
-    data = _call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S)
+    data = _require_dict(_call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S))
 
     answers = data.get("answers")
     resp_model = data.get("model")
     if not isinstance(answers, dict) or not isinstance(resp_model, str):
         raise DecidersError("deciders: bad-response")
-    return {"answers": answers, "model": resp_model, "cost": float(data.get("cost", 0.0))}
+    return {"answers": answers, "model": resp_model, "cost": _cost(data)}
 
 
 def _cmd_extract(args, key: str, transport: Transport) -> dict:
     entities_spec = _read_json(args.entities)
-    input_text = _read_text(args.input) if args.input else ""
+    input_text = _require_input(_read_text(args.input) if args.input else "")
     model = args.model or DEFAULT_MODELS["extract"]
     body = {
         "model": model,
         "messages": [{"role": "user", "content": input_text}],
         "provider": {"options": {"scaledown": {"entities": entities_spec}}},
     }
-    data = _call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S)
+    data = _require_dict(_call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S))
 
     content = _chat_content(data)
     try:
@@ -176,14 +213,14 @@ def _cmd_extract(args, key: str, transport: Transport) -> dict:
     resp_model = data.get("model")
     if not isinstance(resp_model, str):
         raise DecidersError("deciders: bad-response")
-    return {"entities": entities, "model": resp_model, "cost": float(data.get("cost", 0.0))}
+    return {"entities": entities, "model": resp_model, "cost": _cost(data)}
 
 
 def _cmd_summarize(args, key: str, transport: Transport) -> dict:
-    input_text = _read_text(args.input) if args.input else ""
+    input_text = _require_input(_read_text(args.input) if args.input else "")
     model = args.model or DEFAULT_MODELS["summarize"]
     body = {"model": model, "messages": [{"role": "user", "content": input_text}]}
-    data = _call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S)
+    data = _require_dict(_call(transport, CHAT_URL, _headers(key), body, TIMEOUT_S))
 
     content = _chat_content(data)
     resp_model = data.get("model")
@@ -193,7 +230,7 @@ def _cmd_summarize(args, key: str, transport: Transport) -> dict:
         "summary": content,
         "evidence": False,
         "model": resp_model,
-        "cost": float(data.get("cost", 0.0)),
+        "cost": _cost(data),
     }
 
 
