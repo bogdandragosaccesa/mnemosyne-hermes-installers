@@ -518,9 +518,6 @@ class LedgerConcurrencyTests(unittest.TestCase):
                 self.assertEqual(record["subcommand"], "decide")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class LedgerWriteFailureTests(unittest.TestCase):
     """Review r2 D1: an unwritable ledger must still give the labelled
@@ -557,3 +554,7 @@ class KeyWhitespaceTests(unittest.TestCase):
             )
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(transport.calls[0][1]["Authorization"], "Bearer " + _fake_key())
+
+
+if __name__ == "__main__":
+    unittest.main()

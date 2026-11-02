@@ -30,6 +30,9 @@ jobs:
       - name: dev-team-gate unit tests
         run: python3 -m unittest discover -s dev-team/plugin/dev-team-gate/tests
 
+      - name: deciders unit tests
+        run: python3 -m unittest discover -s dev-team/deciders/tests
+
   install-linux:
     runs-on: ubuntu-latest
     steps:
