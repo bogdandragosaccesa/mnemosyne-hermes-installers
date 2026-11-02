@@ -38,7 +38,12 @@ def _fake_key() -> str:
 
 
 class FakeTransport:
-    """Records every call; replays a queued response or raises a queued error."""
+    """Records every call; replays a queued response or raises a queued error.
+
+    I4: also asserts the live request shapes recorded in PROBES.md, so a
+    test that (re)introduces an array `questions` or a nested/list
+    `entities` fails here even if production code's own validation were
+    ever weakened or bypassed."""
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -46,6 +51,22 @@ class FakeTransport:
 
     def __call__(self, url, headers, body, timeout):
         self.calls.append((url, headers, body, timeout))
+        if url == "https://openrouter.ai/api/alpha/decisions" and "questions" in body:
+            questions = body["questions"]
+            assert isinstance(questions, dict), (
+                f"questions must be a record (dict), not {type(questions).__name__}")
+            for qid, spec in questions.items():
+                assert isinstance(spec, dict) and spec.get("type"), (
+                    f"questions[{qid!r}] must be an object with a 'type'")
+        if url == "https://openrouter.ai/api/v1/chat/completions":
+            entities = (body.get("provider") or {}).get("options", {}).get(
+                "scaledown", {}).get("entities")
+            if entities is not None:
+                assert isinstance(entities, dict), (
+                    f"entities must be a flat dict, not {type(entities).__name__}")
+                for name, desc in entities.items():
+                    assert isinstance(name, str) and isinstance(desc, str), (
+                        "entities must be a flat str -> str record")
         if not self._responses:
             raise AssertionError("FakeTransport called more times than expected")
         resp = self._responses.pop(0)
@@ -83,7 +104,7 @@ class DecideRequestTests(unittest.TestCase):
 
         code, stdout = _run(
             ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-             "--questions", str(FIXTURES / "decide_ok.json")],
+             "--questions", str(FIXTURES / "decide_questions.json")],
             transport, env,
         )
 
@@ -108,7 +129,7 @@ class ExtractRequestTests(unittest.TestCase):
         transport = FakeTransport([fixture])
         env = _env(_fake_key())
 
-        entities_spec = {"types": ["synthetic-secret"]}
+        entities_spec = {"synthetic-secret": "a fake example credential pattern, for tests only"}
         with tempfile.TemporaryDirectory() as tmp:
             entities_path = Path(tmp) / "entities_spec.json"
             entities_path.write_text(json.dumps(entities_spec))
@@ -163,7 +184,7 @@ class ModelFlagTests(unittest.TestCase):
 
         code, stdout = _run(
             ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-             "--questions", str(FIXTURES / "decide_ok.json"),
+             "--questions", str(FIXTURES / "decide_questions.json"),
              "--model", "typesafe/jev-1.13"],
             transport, env,
         )
@@ -180,7 +201,7 @@ class NoKeyTests(unittest.TestCase):
 
         code, stdout = _run(
             ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-             "--questions", str(FIXTURES / "decide_ok.json")],
+             "--questions", str(FIXTURES / "decide_questions.json")],
             transport, env,
         )
 
@@ -193,7 +214,7 @@ class NoKeyTests(unittest.TestCase):
 class StatusLabelTests(unittest.TestCase):
     def _decide_argv(self):
         return ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-                "--questions", str(FIXTURES / "decide_ok.json")]
+                "--questions", str(FIXTURES / "decide_questions.json")]
 
     def test_status_401_is_auth(self):
         self._assert_label([DecidersError("deciders: auth")], "deciders: auth")
@@ -240,7 +261,7 @@ class RetryTests(unittest.TestCase):
 
         code, stdout = _run(
             ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-             "--questions", str(FIXTURES / "decide_ok.json")],
+             "--questions", str(FIXTURES / "decide_questions.json")],
             transport, env,
         )
 
@@ -258,7 +279,7 @@ class BadShapeTests(unittest.TestCase):
 
         code, stdout = _run(
             ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-             "--questions", str(FIXTURES / "decide_ok.json")],
+             "--questions", str(FIXTURES / "decide_questions.json")],
             transport, env,
         )
 
@@ -270,7 +291,7 @@ class BadShapeTests(unittest.TestCase):
 class KeyRedactionTests(unittest.TestCase):
     def _decide_argv(self):
         return ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-                "--questions", str(FIXTURES / "decide_ok.json")]
+                "--questions", str(FIXTURES / "decide_questions.json")]
 
     def _assert_key_absent(self, responses):
         key = _fake_key()
@@ -400,7 +421,7 @@ class UrllibTransportClassificationTests(unittest.TestCase):
 class MainOverRealTransportTests(unittest.TestCase):
     def _decide_argv(self):
         return ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-                "--questions", str(FIXTURES / "decide_ok.json")]
+                "--questions", str(FIXTURES / "decide_questions.json")]
 
     def test_main_retries_real_429_then_succeeds(self):
         fixture = _load_fixture("decide_ok.json")
@@ -431,7 +452,7 @@ class ResponseShapeTests(unittest.TestCase):
     def _decide(self, response):
         return _run(
             ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-             "--questions", str(FIXTURES / "decide_ok.json")],
+             "--questions", str(FIXTURES / "decide_questions.json")],
             FakeTransport([response]), _env(_fake_key()),
         )
 
@@ -487,7 +508,7 @@ class EmptyInputTests(unittest.TestCase):
     def test_extract_and_summarize_without_input_are_bad_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             entities_path = Path(tmp) / "entities.json"
-            entities_path.write_text(json.dumps({"types": ["x"]}))
+            entities_path.write_text(json.dumps({"x": "a fake example pattern, for tests only"}))
             empty_path = Path(tmp) / "empty.txt"
             empty_path.write_text("  \n")
             argvs = [
@@ -509,6 +530,95 @@ class EmptyInputTests(unittest.TestCase):
 class RedactConformanceTests(unittest.TestCase):
     def test_redact_is_forges(self):
         self.assertIs(deciders_core.redact, forge_core.redact)
+
+
+class I4RequestShapeTests(unittest.TestCase):
+    """I4: decide/extract validate the live request shapes before any
+    network call -- an array `questions` or a nested/list `entities` is
+    `bad-input`, never sent."""
+
+    def _decide_with_questions(self, tmp: Path, questions) -> tuple[int, str]:
+        questions_path = tmp / "questions.json"
+        questions_path.write_text(json.dumps(questions))
+        transport = FakeTransport([])
+        code, stdout = _run(
+            ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+             "--questions", str(questions_path)],
+            transport, _env(_fake_key()),
+        )
+        self.assertEqual(len(transport.calls), 0, "network call made on bad input")
+        return code, stdout
+
+    def test_decide_rejects_an_array_of_questions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout = self._decide_with_questions(
+                Path(tmp), [{"type": "choice"}])
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-input"))
+
+    def test_decide_rejects_a_question_without_a_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout = self._decide_with_questions(
+                Path(tmp), {"q1": {"instructions": "no type here"}})
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-input"))
+
+    def test_decide_rejects_empty_questions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout = self._decide_with_questions(Path(tmp), {})
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-input"))
+
+    def _extract_with_entities(self, tmp: Path, entities) -> tuple[int, str]:
+        entities_path = tmp / "entities.json"
+        entities_path.write_text(json.dumps(entities))
+        input_path = tmp / "in.txt"
+        input_path.write_text("some text")
+        transport = FakeTransport([])
+        code, stdout = _run(
+            ["extract", "--entities", str(entities_path), "--input", str(input_path)],
+            transport, _env(_fake_key()),
+        )
+        self.assertEqual(len(transport.calls), 0, "network call made on bad input")
+        return code, stdout
+
+    def test_extract_rejects_the_nested_entities_shape(self):
+        # PROBES.md step 2c: {"entities": [{"type": ..., "pattern": ...}]}
+        # silently returned zero entities live.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout = self._extract_with_entities(
+                Path(tmp), {"entities": [{"type": "x", "pattern": "y"}]})
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-input"))
+
+    def test_extract_rejects_an_array_of_type_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout = self._extract_with_entities(Path(tmp), ["credential"])
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-input"))
+
+    def test_extract_rejects_the_old_types_list_shape(self):
+        # The old documented shape, {"types": [...]}, was a silent false
+        # negative live (exit 0, zero entities).
+        with tempfile.TemporaryDirectory() as tmp:
+            code, stdout = self._extract_with_entities(
+                Path(tmp), {"types": ["synthetic-secret"]})
+        self.assertEqual(code, EXIT_UNANSWERED)
+        self.assertTrue(json.loads(stdout)["error"].startswith("deciders: bad-input"))
+
+    def test_extract_accepts_the_flat_record_shape(self):
+        fixture = _load_fixture("extract_ok.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            entities_path = Path(tmp) / "entities.json"
+            entities_path.write_text(
+                json.dumps({"synthetic-secret": "a fake example pattern"}))
+            input_path = Path(tmp) / "in.txt"
+            input_path.write_text("some text")
+            code, stdout = _run(
+                ["extract", "--entities", str(entities_path), "--input", str(input_path)],
+                FakeTransport([fixture]), _env(_fake_key()),
+            )
+        self.assertEqual(code, EXIT_OK)
 
 
 if __name__ == "__main__":

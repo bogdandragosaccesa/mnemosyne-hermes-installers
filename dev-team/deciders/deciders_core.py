@@ -314,9 +314,51 @@ def _require_input(text: str) -> str:
     return text
 
 
+def _require_questions_record(questions) -> dict:
+    """I4: the live Decisions API rejects an array ("expected record,
+    received array", http-400) -- `questions` must be a record keyed by
+    question id, each value a dict carrying at least a `type`. Checked
+    before any network call, as `bad-input`, not left for the API to
+    reject (and bill) after the fact."""
+    if not isinstance(questions, dict) or not questions:
+        raise DecidersError(
+            "deciders: bad-input",
+            "--questions must be a non-empty object keyed by question id, "
+            "e.g. {\"q1\": {\"type\": \"choice\", ...}}, not an array",
+        )
+    for qid, spec in questions.items():
+        if not isinstance(spec, dict) or not isinstance(spec.get("type"), str) or not spec.get("type"):
+            raise DecidersError(
+                "deciders: bad-input",
+                f"--questions[{qid!r}] must be an object with a non-empty string 'type'",
+            )
+    return questions
+
+
+def _require_entities_record(entities) -> dict:
+    """I4: `entities` must be a flat record of type-name -> description
+    strings (`{"<type-name>": "<description>"}`), never a nested or
+    list shape -- PROBES.md step 2c shows every other shape either times
+    out or silently returns zero entities live. Checked before any
+    network call, as `bad-input`."""
+    if not isinstance(entities, dict) or not entities:
+        raise DecidersError(
+            "deciders: bad-input",
+            "--entities must be a non-empty flat object of "
+            "{\"<type-name>\": \"<description>\"}, not a list or nested shape",
+        )
+    for name, description in entities.items():
+        if not isinstance(name, str) or not isinstance(description, str) or not description:
+            raise DecidersError(
+                "deciders: bad-input",
+                f"--entities[{name!r}] must map to a non-empty description string",
+            )
+    return entities
+
+
 def _cmd_decide(args, key: str, transport: Transport) -> dict:
     state = _read_json(args.state)
-    questions = _read_json(args.questions)
+    questions = _require_questions_record(_read_json(args.questions))
     model = args.model or DEFAULT_MODELS["decide"]
     body = {"model": model, "state": state, "questions": questions}
     data = _require_dict(_call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S))
@@ -329,7 +371,7 @@ def _cmd_decide(args, key: str, transport: Transport) -> dict:
 
 
 def _cmd_extract(args, key: str, transport: Transport) -> dict:
-    entities_spec = _read_json(args.entities)
+    entities_spec = _require_entities_record(_read_json(args.entities))
     input_text = _require_input(_read_text(args.input) if args.input else "")
     model = args.model or DEFAULT_MODELS["extract"]
     body = {

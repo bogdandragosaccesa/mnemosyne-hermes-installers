@@ -31,7 +31,10 @@ def _fake_key() -> str:
 
 
 class FakeTransport:
-    """Records every call; replays a queued response or raises a queued error."""
+    """Records every call; replays a queued response or raises a queued error.
+
+    I4: also asserts the live request shapes recorded in PROBES.md (see
+    test_deciders_core.py's FakeTransport for the same check)."""
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -39,6 +42,13 @@ class FakeTransport:
 
     def __call__(self, url, headers, body, timeout):
         self.calls.append((url, headers, body, timeout))
+        if url == "https://openrouter.ai/api/alpha/decisions" and "questions" in body:
+            questions = body["questions"]
+            assert isinstance(questions, dict), (
+                f"questions must be a record (dict), not {type(questions).__name__}")
+            for qid, spec in questions.items():
+                assert isinstance(spec, dict) and spec.get("type"), (
+                    f"questions[{qid!r}] must be an object with a 'type'")
         if not self._responses:
             raise AssertionError("FakeTransport called more times than expected")
         resp = self._responses.pop(0)
@@ -341,7 +351,7 @@ class LedgerWrittenOnSuccessTests(unittest.TestCase):
             home = Path(tmp)
             code, stdout = _run(
                 ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-                 "--questions", str(FIXTURES / "decide_ok.json")],
+                 "--questions", str(FIXTURES / "decide_questions.json")],
                 FakeTransport([fixture]), env, home=home,
             )
             self.assertEqual(code, EXIT_OK)
@@ -360,7 +370,7 @@ class LedgerWrittenOnSuccessTests(unittest.TestCase):
             no_key_env = {"HERMES_KANBAN_BOARD": "myboard", "HERMES_KANBAN_TASK": "t_123"}
             code2, _ = _run(
                 ["decide", "--state", str(FIXTURES / "decide_ok.json"),
-                 "--questions", str(FIXTURES / "decide_ok.json")],
+                 "--questions", str(FIXTURES / "decide_questions.json")],
                 FakeTransport([]), no_key_env, home=home,
             )
             self.assertEqual(code2, EXIT_UNANSWERED)

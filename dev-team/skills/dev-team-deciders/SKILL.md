@@ -63,8 +63,9 @@ its own stdout, but you must not route the value through anything that would re-
   not conclusions. `--entities` is a flat JSON object mapping each entity type name to a
   description of what to find, `{"<type-name>": "<description>"}`, e.g.
   `{"synthetic-secret": "an API key, token or password written into the text"}` — passed
-  through as `provider.options.scaledown.entities`. Any other shape is a silent false negative
-  (`{"types": [...]}` exits 0 with zero entities) or `http-400` (an array). An extracted span is a pointer, never a finding — you
+  through as `provider.options.scaledown.entities`. Any other shape (a nested `{"entities":
+  [...]}`, the old `{"types": [...]}`, or an array) is now refused as `deciders: bad-input`
+  before any call is made. An extracted span is a pointer, never a finding — you
   must open the reported span yourself and judge it before you act on it or cite it anywhere.
 - **`deciders summarize [--input <file|->]`** — only to compress context you will not cite:
   background material, old discussion, anything you are reading for orientation rather than
