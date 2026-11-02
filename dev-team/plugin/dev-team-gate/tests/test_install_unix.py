@@ -165,6 +165,33 @@ class UnixInstallerTests(unittest.TestCase):
                 self.assertFalse((self.root / "profiles").exists())
                 self.assertFalse((self.root / "dev-team" / "model-tiers.json").exists())
 
+    def test_I3_refuses_additional_decision_models_and_the_pplx_family(self):
+        for flag, value in (
+            ("--tier-fast", "typesafe:jev-1.13"),
+            ("--tier-standard", "upstage:solar-decide-flash"),
+            ("--tier-deep", "perplexity:pplx-decider-v2"),  # family, not just v1.2
+        ):
+            with self.subTest(flag=flag, value=value):
+                proc = self.install(flag, value)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("decisions-only", proc.stderr)
+
+    def test_I3_refuses_a_variant_suffix_on_a_decision_model(self):
+        proc = self.install("--tier-fast", "openrouter:liquid/d1.1:nitro")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("decisions-only", proc.stderr)
+
+    def test_I3_refuses_a_decisions_only_model_via_the_model_flag(self):
+        # self.install() always prepends --skip-model (which contradicts
+        # --model), so invoke the installer directly here.
+        proc = subprocess.run(
+            ["bash", str(INSTALLER), "--model", "liquid/d1.1"],
+            env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("decisions-only", proc.stderr)
+        self.assertIn("--model", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
     def test_default_fast_tier_is_a_chat_model(self):
         proc = self.install("--only", "pm")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

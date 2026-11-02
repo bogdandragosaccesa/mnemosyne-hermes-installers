@@ -196,6 +196,34 @@ class DecisionModelListTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0].rstrip().endswith(")"))
 
+    def test_I3_additional_decision_models_are_refused(self):
+        # typesafe/jev-1.13 and upstage/solar-decide-flash were used as
+        # decision models by the design's spike but were missing from the
+        # denylist entirely.
+        for entry in (
+            {"provider": "typesafe", "model": "jev-1.13"},
+            {"provider": "typesafe", "model": "jev-1.13-20261027"},  # dated variant
+            {"provider": "upstage", "model": "solar-decide-flash"},
+        ):
+            with self.subTest(entry=entry):
+                self.assertTrue(deciders_core._is_decision_model(entry))
+
+    def test_I3_pplx_decider_family_is_refused_not_just_v1_2(self):
+        for model in ("pplx-decider-v1.2", "pplx-decider-v2", "pplx-decider-v1.2-20261016"):
+            with self.subTest(model=model):
+                entry = {"provider": "perplexity", "model": f"perplexity/{model}"}
+                self.assertTrue(deciders_core._is_decision_model(entry))
+
+    def test_I3_variant_suffix_is_stripped_before_comparing(self):
+        # "liquid/d1.1:nitro" must still be refused -- stripping only the
+        # dated "-20261027" suffix style is not enough.
+        entry = {"provider": "openrouter", "model": "liquid/d1.1:nitro"}
+        self.assertTrue(deciders_core._is_decision_model(entry))
+
+    def test_I3_unrelated_model_is_not_a_decision_model(self):
+        entry = {"provider": "anthropic", "model": "claude-haiku-4-5"}
+        self.assertFalse(deciders_core._is_decision_model(entry))
+
 
 class TierOverrideTableTests(unittest.TestCase):
     def test_tier_reads_table(self):

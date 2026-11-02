@@ -43,9 +43,12 @@ DEFAULT_MODELS = {
 
 # Models that only answer DECISIONS_URL, never chat completions: an agent
 # worker routed to one cannot run. The installers read this one line and
-# refuse any of these (or a dated variant, e.g. "<id>-20261027") as a
-# model-tiers.json entry, so keep it a single-line tuple of string literals.
-DECISION_MODELS = ("liquid/d1.1", "perplexity/pplx-decider-v1.2")
+# refuse any of these (or a dated variant, e.g. "<id>-20261027", or an
+# OpenRouter ":variant" suffix) as a model-tiers.json entry, so keep it a
+# single-line tuple of string literals. An entry ending in "*" is a family
+# prefix match (e.g. every "perplexity/pplx-decider-*" version), not a
+# single model.
+DECISION_MODELS = ("liquid/d1.1", "typesafe/jev-1.13", "upstage/solar-decide-flash", "perplexity/pplx-decider-*")
 
 TIMEOUT_S = 60.0
 
@@ -206,11 +209,26 @@ def _tier_override(home: Path, tier: str):
     return entry, None
 
 
+def _strip_variant_suffix(name: str) -> str:
+    """Drop an OpenRouter `:variant` suffix, e.g. `liquid/d1.1:nitro` -> `liquid/d1.1`."""
+    return name.split(":", 1)[0]
+
+
+def _matches_decision_model(name: str, pattern: str) -> bool:
+    """`pattern` ending in "*" is a family prefix match; otherwise exact or
+    a dated `<id>-...` variant."""
+    if pattern.endswith("*"):
+        return name.startswith(pattern[:-1])
+    return name == pattern or name.startswith(pattern + "-")
+
+
 def _is_decision_model(entry: dict) -> bool:
-    """Same rule as the installers: bare or provider/model, exact or `<id>-*`."""
-    model = str(entry.get("model", ""))
-    names = (model, f"{entry.get('provider', '')}/{model}")
-    return any(n == m or n.startswith(m + "-") for n in names for m in DECISION_MODELS)
+    """Same rule as the installers: bare or provider/model, each with any
+    `:variant` suffix stripped first, exact or `<id>-*`, or a family prefix."""
+    model = _strip_variant_suffix(str(entry.get("model", "")))
+    provider = str(entry.get("provider", ""))
+    names = (model, f"{provider}/{model}")
+    return any(_matches_decision_model(n, m) for n in names for m in DECISION_MODELS)
 
 
 def scrub(text: str, key: str | None) -> str:

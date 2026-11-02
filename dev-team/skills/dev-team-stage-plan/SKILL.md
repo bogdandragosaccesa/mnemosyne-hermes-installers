@@ -55,8 +55,9 @@ deep" raised computed tier "standard" to "deep"`.
 - If a soul rule changed the tier, the decider's `override` is for the *wrong* tier and must not
   be used. Instead read `$HERMES_HOME/dev-team/model-tiers.json` yourself and look up the entry
   for the **final tier**: `{provider, model}`. If the file is missing, isn't valid JSON, has
-  no entry for the final tier, or the entry names a decisions-only model (deciders'
-  `DECISION_MODELS`, e.g. `liquid/d1.1`, or a dated `<id>-…` variant), create the card with no
+  no entry for the final tier, or the entry names a decisions-only model (checked the same way
+  `deciders_core.py`'s `_is_decision_model` does, against its single-owned `DECISION_MODELS`
+  list), create the card with no
   model/provider override and say why in the body (`override_reason: ... (no tier table)`,
   `... (no entry for <tier>)` or `... (decisions-only model for <tier>: <provider>/<model>)`) —
   never guess a model or fall back to the decider's tier's pair.

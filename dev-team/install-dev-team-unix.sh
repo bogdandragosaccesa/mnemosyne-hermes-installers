@@ -191,10 +191,22 @@ if [[ -z $DECISION_MODELS_LIST ]]; then
     exit 2
 fi
 refuse_decision_model() {  # flag provider model
-    local flag="$1" full="$2/$3" bare="$3" m
+    local flag="$1" full="$2/$3" bare="$3" m prefix
+    # Strip an OpenRouter ":variant" suffix (e.g. "liquid/d1.1:nitro")
+    # before comparing, same as deciders_core.py's _is_decision_model.
+    bare="${bare%%:*}"
+    full="${full%%:*}"
     while IFS= read -r m; do
         [[ -n $m ]] || continue
-        case "$bare" in "$m"|"$m"-*) ;; *) case "$full" in "$m"|"$m"-*) ;; *) continue ;; esac ;; esac
+        if [[ $m == *'*' ]]; then
+            # A family prefix entry, e.g. "perplexity/pplx-decider-*":
+            # quoting "$m" in a case pattern disables globbing, so match
+            # the prefix explicitly instead.
+            prefix="${m%\*}"
+            case "$bare" in "$prefix"*) ;; *) case "$full" in "$prefix"*) ;; *) continue ;; esac ;; esac
+        else
+            case "$bare" in "$m"|"$m"-*) ;; *) case "$full" in "$m"|"$m"-*) ;; *) continue ;; esac ;; esac
+        fi
         echo "$flag $2:$3 is a decisions-only model (it only answers /api/alpha/decisions);" >&2
         echo "an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5." >&2
         exit 2
@@ -203,6 +215,10 @@ refuse_decision_model() {  # flag provider model
 refuse_decision_model --tier-fast "$TIER_FAST_PROVIDER" "$TIER_FAST_MODEL"
 refuse_decision_model --tier-standard "$TIER_STANDARD_PROVIDER" "$TIER_STANDARD_MODEL"
 refuse_decision_model --tier-deep "$TIER_DEEP_PROVIDER" "$TIER_DEEP_MODEL"
+# I3: --model sets every profile's own model; it must be refused the same
+# way a decisions-only tier-table entry is, or an agent worker ends up
+# unable to run at all.
+refuse_decision_model --model "${MODEL%%/*}" "${MODEL#*/}"
 
 # Profile name, then the description the kanban decomposer routes tasks on.
 # Parallel arrays rather than an associative array: bash 3.2 (stock macOS)

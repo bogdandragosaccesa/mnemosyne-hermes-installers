@@ -83,6 +83,48 @@ class WindowsInstallerTests(unittest.TestCase):
                 self.assertIn("decisions-only", proc.stderr)
                 self.assertIn(param, proc.stderr)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_I3_refuses_additional_decision_models_and_the_pplx_family(self):
+        for param, value in (
+            ("-TierFast", "typesafe:jev-1.13"),
+            ("-TierStandard", "upstage:solar-decide-flash"),
+            ("-TierDeep", "perplexity:pplx-decider-v2"),  # family, not just v1.2
+        ):
+            with self.subTest(param=param, value=value), tempfile.TemporaryDirectory() as tmp:
+                proc = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1),
+                     "-DryRun", param, value],
+                    capture_output=True, text=True, timeout=120,
+                    env={"HOME": tmp, "PATH": "/usr/bin:/bin:/snap/bin",
+                         "USERPROFILE": tmp})
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("decisions-only", proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_I3_refuses_a_variant_suffix_on_a_decision_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1),
+                 "-DryRun", "-TierFast", "openrouter:liquid/d1.1:nitro"],
+                capture_output=True, text=True, timeout=120,
+                env={"HOME": tmp, "PATH": "/usr/bin:/bin:/snap/bin",
+                     "USERPROFILE": tmp})
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("decisions-only", proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_I3_refuses_a_decisions_only_model_via_the_model_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1),
+                 "-DryRun", "-Model", "liquid/d1.1"],
+                capture_output=True, text=True, timeout=120,
+                env={"HOME": tmp, "PATH": "/usr/bin:/bin:/snap/bin",
+                     "USERPROFILE": tmp})
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("decisions-only", proc.stderr)
+            self.assertIn("-Model", proc.stderr)
+
     def test_deciders_cmd_propagates_exit_code_explicitly(self):
         # install-windows-ps51 (run 41451251672): `deciders --help` FAILED
         # with no explanation, because (a) the .cmd wrapper let cmd.exe's

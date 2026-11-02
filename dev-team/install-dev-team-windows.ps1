@@ -184,9 +184,21 @@ if ($DecisionModels.Count -eq 0) {
 }
 function Assert-NotDecisionModel {
     param([string] $FlagName, [string] $Provider, [string] $ModelId)
+    # Strip an OpenRouter ":variant" suffix, e.g. "<provider>/<model>:nitro"
+    # (OpenRouter's variant syntax), before comparing, same as
+    # deciders_core.py's _is_decision_model.
+    $bareModel = $ModelId.Split(':')[0]
     foreach ($m in $DecisionModels) {
-        foreach ($candidate in @($ModelId, "$Provider/$ModelId")) {
-            if ($candidate -eq $m -or $candidate.StartsWith("$m-")) {
+        foreach ($candidate in @($bareModel, "$Provider/$bareModel")) {
+            $isMatch = $false
+            if ($m.EndsWith('*')) {
+                # A family prefix entry, e.g. "perplexity/pplx-decider-*".
+                $prefix = $m.Substring(0, $m.Length - 1)
+                $isMatch = $candidate.StartsWith($prefix)
+            } else {
+                $isMatch = ($candidate -eq $m -or $candidate.StartsWith("$m-"))
+            }
+            if ($isMatch) {
                 [Console]::Error.WriteLine("$FlagName $Provider`:$ModelId is a decisions-only model (it only answers /api/alpha/decisions); an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5.")
                 exit 2
             }
@@ -196,6 +208,11 @@ function Assert-NotDecisionModel {
 Assert-NotDecisionModel '-TierFast' $TierFastProvider $TierFastModel
 Assert-NotDecisionModel '-TierStandard' $TierStandardProvider $TierStandardModel
 Assert-NotDecisionModel '-TierDeep' $TierDeepProvider $TierDeepModel
+# I3: -Model sets every profile's own model; it must be refused the same
+# way a decisions-only tier-table entry is, or an agent worker ends up
+# unable to run at all.
+$ModelParts = Split-ProviderModel $Model
+Assert-NotDecisionModel '-Model' $ModelParts[0] $ModelParts[1]
 
 # Profile name -> the description the kanban decomposer routes tasks on.
 # Ordered so the output prints in a stable order. Kept in lockstep with the

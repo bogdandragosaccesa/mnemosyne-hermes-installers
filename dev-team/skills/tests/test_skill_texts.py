@@ -67,6 +67,15 @@ class PlanSkillTierStepTests(unittest.TestCase):
         self.assertIn("deciders tier", text)
         self.assertIn("model-tiers.json", text)
 
+    def test_plan_skill_names_the_decision_model_owner_not_an_example(self):
+        # I3: "e.g. `liquid/d1.1`" cannot let an agent enumerate the full
+        # denylist (typesafe/jev-1.13, upstage/solar-decide-flash, the
+        # perplexity/pplx-decider-* family are not named by that example).
+        text = _read(_PLAN_SKILL)
+        self.assertIn("_is_decision_model", text)
+        self.assertIn("DECISION_MODELS", text)
+        self.assertNotIn("e.g. `liquid/d1.1`", text)
+
 
 class EverySoulNamesTheSkillTests(unittest.TestCase):
     def test_every_soul_names_the_skill(self):
