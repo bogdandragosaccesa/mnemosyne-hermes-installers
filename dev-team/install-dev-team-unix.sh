@@ -544,12 +544,14 @@ for i in "${!NAMES[@]}"; do
 done
 
 # The OpenRouter key for deciders: this installer never reads, prompts for
-# or writes it. Only print where to put it.
+# or writes it. Only print where to put it -- never a per-profile plaintext
+# file (I5): a shared user environment variable is one copy, not eight.
 deciders_key_note() {
     if command -v secret >/dev/null 2>&1; then
         say "OpenRouter key for deciders: store it with \`secret set openrouter/deciders\`"
     else
-        say "OpenRouter key for deciders: add \`OPENROUTER_DECIDERS_KEY\` to each profile's .env"
+        say "OpenRouter key for deciders: set it as a user environment variable, e.g. in"
+        say "  your shell profile: export OPENROUTER_DECIDERS_KEY=<key>"
     fi
 }
 

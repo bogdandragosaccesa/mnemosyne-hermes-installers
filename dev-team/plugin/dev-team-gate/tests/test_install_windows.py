@@ -66,6 +66,13 @@ class WindowsInstallerTests(unittest.TestCase):
         self.has("'anthropic/claude-haiku-4-5'", self.text, "no haiku fast default")
         self.assertFalse("liquid" in self.text, "a decisions model is still suggested")
 
+    def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
+        # Both the dry-run and real-run key notes used to say "add
+        # OPENROUTER_DECIDERS_KEY to each profile's .env".
+        self.assertNotIn(".env", self.text, "still points at a plaintext .env file")
+        self.has("setx OPENROUTER_DECIDERS_KEY", self.text,
+                 "no setx guidance for a user environment variable")
+
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_refuses_a_decisions_only_model_as_a_tier(self):
         # The refusal runs before anything is read or written, so the script

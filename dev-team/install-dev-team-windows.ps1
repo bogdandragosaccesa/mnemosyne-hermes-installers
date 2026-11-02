@@ -670,7 +670,8 @@ if ($DryRun) {
     Write-Host '  would install: forge.cmd next to hermes.exe on PATH'
     Write-Host '  would install: deciders.cmd next to hermes.exe on PATH'
     Write-Host ''
-    Write-Host "OpenRouter key for deciders: add ``OPENROUTER_DECIDERS_KEY`` to each profile's .env"
+    Write-Host "OpenRouter key for deciders: set a user environment variable, e.g.:"
+    Write-Host "  setx OPENROUTER_DECIDERS_KEY <key>"
     Write-Host 'Dry run: nothing was changed.'
     exit 0
 }
@@ -720,10 +721,12 @@ Set-Content -LiteralPath $decidersCmdPath -Value $decidersCmdContent -NoNewline 
 Write-Host "deciders installed: $decidersCmdPath"
 
 # The OpenRouter key for deciders: this installer never reads, prompts for
-# or writes it. There is no secret store on Windows, so the only note is
-# the .env variable name.
+# or writes it. There is no secret store on Windows, so the only note is a
+# user environment variable -- never a per-profile plaintext dotfile (I5):
+# one `setx` is a single copy, not eight.
 Write-Host ''
-Write-Host "OpenRouter key for deciders: add ``OPENROUTER_DECIDERS_KEY`` to each profile's .env"
+Write-Host "OpenRouter key for deciders: set a user environment variable, e.g.:"
+Write-Host "  setx OPENROUTER_DECIDERS_KEY <key>"
 
 # The checks below can race the plugin reload right after `plugins enable`
 # (Task 12: a first run exited 1 although the plugin was enabled). Each is

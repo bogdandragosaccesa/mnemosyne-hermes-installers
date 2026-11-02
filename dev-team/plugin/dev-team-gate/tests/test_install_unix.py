@@ -151,6 +151,22 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertFalse((self.root / "profiles").exists())
         self.assertFalse((self.home / ".local" / "bin" / "forge").exists())
 
+    def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
+        # Without `secret` on PATH the installer used to say "add
+        # OPENROUTER_DECIDERS_KEY to each profile's .env" -- eight plaintext
+        # copies of the key for the default team.
+        no_secret_bin = self.tmp / "no-secret-bin"
+        no_secret_bin.mkdir()
+        for name in ("hermes",):
+            src = Path(self.env["PATH"].split(":")[0]) / name
+            dst = no_secret_bin / name
+            shutil.copy(src, dst)
+            dst.chmod(dst.stat().st_mode | stat.S_IXUSR)
+        proc = self.install(PATH=f"{no_secret_bin}:/usr/bin:/bin")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn(".env", proc.stdout)
+        self.assertIn("OPENROUTER_DECIDERS_KEY", proc.stdout)
+
     def test_refuses_a_decisions_only_model_as_a_tier(self):
         # liquid/d1.1 and pplx-decider only answer /api/alpha/decisions; an
         # agent worker on a card routed to one of them cannot run at all.
