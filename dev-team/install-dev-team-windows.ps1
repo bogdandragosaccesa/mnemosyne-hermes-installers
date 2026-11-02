@@ -713,7 +713,11 @@ function Resolve-WrapperPython {
         if ($hermesPy) { return $hermesPy }
     }
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        $launched = & py -3 -c 'import sys; print(sys.executable)' 2>$null
+        # 'Continue' locally: under 'Stop', PS 5.1 turns a native command's
+        # redirected stderr (py with no Python 3 installed) into a terminating
+        # error, which would abort the install instead of falling through.
+        $savedEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $launched = & py -3 -c 'import sys; print(sys.executable)' 2>$null } finally { $ErrorActionPreference = $savedEap }
         if ($LASTEXITCODE -eq 0 -and $launched -and (Test-Path -LiteralPath $launched.Trim())) { return $launched.Trim() }
     }
     $onPath = Get-Command python -All -ErrorAction SilentlyContinue |

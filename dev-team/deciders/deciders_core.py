@@ -579,7 +579,7 @@ def main(
             raise DecidersError(
                 "deciders: bad-input", f"argument error (exit code {exc.code})"
             ) from exc
-        key = env.get("OPENROUTER_DECIDERS_KEY")
+        key = (env.get("OPENROUTER_DECIDERS_KEY") or "").strip() or None
         if not key:
             raise DecidersError("deciders: no-key")
         handler = _DISPATCH[args.command]
@@ -587,23 +587,32 @@ def main(
         if args.command == "tier":
             override, override_reason = _tier_override(home, result["tier"])
             result = dict(result, override=override, override_reason=override_reason)
+        ledger_info["success_write_attempted"] = True
         append_ledger(home, env, args.command, result["model"], result["cost"])
     except Exception as exc:  # catch-all: never let an exception escape unredacted
         # M1: the transport may have returned (and been billed) even though
         # a later validation step raised -- write that spend too, cost 0.0
         # if it never parsed, rather than silently dropping it.
-        if ledger_info.get("received"):
-            append_ledger(
-                home, env, ledger_info.get("command", "?"),
-                ledger_info.get("model") or "unknown",
-                ledger_info.get("cost", 0.0),
-            )
+        # Skip the fallback when the success-path write is what failed: it
+        # would fail again, inside this handler, and escape (review r2 D1).
+        ledger_error = None
+        if ledger_info.get("received") and not ledger_info.get("success_write_attempted"):
+            try:
+                append_ledger(
+                    home, env, ledger_info.get("command", "?"),
+                    ledger_info.get("model") or "unknown",
+                    ledger_info.get("cost", 0.0),
+                )
+            except OSError as le:
+                ledger_error = le
         # M2: a bare ValueError (e.g. http.client's "Invalid header value"
         # for a malformed key) must not reach stdout unlabelled.
         if isinstance(exc, ValueError) and not isinstance(exc, DecidersError):
             message = f"deciders: bad-input: {exc}"
         else:
             message = str(exc)
+        if ledger_error is not None:
+            message = f"{message} (ledger write also failed: {ledger_error})"
         _emit(out, {"error": scrub(message, key)})
         return EXIT_UNANSWERED
     _emit(out, result)

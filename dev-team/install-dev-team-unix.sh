@@ -212,7 +212,7 @@ refuse_decision_model() {  # flag provider model
         else
             case "$bare" in "$m"|"$m"-*) ;; *) case "$full" in "$m"|"$m"-*) ;; *) continue ;; esac ;; esac
         fi
-        echo "$flag $2:$3 is a decisions-only model (it only answers /api/alpha/decisions);" >&2
+        echo "$flag ${4:-$2:$3} is a decisions-only model (it only answers /api/alpha/decisions);" >&2
         echo "an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5." >&2
         exit 2
     done <<< "$DECISION_MODELS_LIST"
@@ -223,7 +223,7 @@ refuse_decision_model --tier-deep "$TIER_DEEP_PROVIDER" "$TIER_DEEP_MODEL"
 # I3: --model sets every profile's own model; it must be refused the same
 # way a decisions-only tier-table entry is, or an agent worker ends up
 # unable to run at all.
-refuse_decision_model --model "${MODEL%%/*}" "${MODEL#*/}"
+refuse_decision_model --model "${MODEL%%/*}" "${MODEL#*/}" "$MODEL"
 
 # Profile name, then the description the kanban decomposer routes tasks on.
 # Parallel arrays rather than an associative array: bash 3.2 (stock macOS)

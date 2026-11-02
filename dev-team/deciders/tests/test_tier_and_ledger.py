@@ -520,3 +520,40 @@ class LedgerConcurrencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerWriteFailureTests(unittest.TestCase):
+    """Review r2 D1: an unwritable ledger must still give the labelled
+    {"error": ...} / exit 2 contract, never an escaping exception."""
+
+    def test_unwritable_ledger_is_a_labelled_error_not_a_traceback(self):
+        fixture = _load_fixture("tier_confident.json")
+        env = _env(_fake_key())
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            spec_path = _write_spec(home)
+            (home / "dev-team").write_text("a file where the team dir should be")
+            code, stdout = _run(
+                ["tier", "--title", "Rename a variable", "--spec", str(spec_path)],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_UNANSWERED)
+            self.assertIn("error", json.loads(stdout))
+
+
+class KeyWhitespaceTests(unittest.TestCase):
+    """Review r2, item 9 remainder: a key read with a trailing newline (a
+    common `secret` output artefact) is stripped before it is sent."""
+
+    def test_trailing_newline_is_stripped_from_the_authorization_header(self):
+        fixture = _load_fixture("tier_confident.json")
+        transport = FakeTransport([fixture])
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            spec_path = _write_spec(home)
+            code, _ = _run(
+                ["tier", "--title", "Rename a variable", "--spec", str(spec_path)],
+                transport, _env(_fake_key() + "\n"), home=home,
+            )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(transport.calls[0][1]["Authorization"], "Bearer " + _fake_key())
