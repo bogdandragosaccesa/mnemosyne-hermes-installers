@@ -526,16 +526,27 @@ POPULATED_COUNT=${#OLD_TARGETS[@]}
 # never a placeholder. Guard the backup-mv with `[ -e ... ] &&` so an absent
 # root (the commonest conflict shape) does not short-circuit the real mv
 # that follows it, and name every profile that needs relinking afterwards.
-_relink_cmds_for_choice() {  # chosen_path
-    local chosen="$1" i role pdir
+_display_roles() {  # space-separated roles -> user-facing text (N4, review r2)
+    local r out=""
+    for r in $1; do
+        [[ $r == "__root_link__" ]] && r="the-root-dev-team-link"
+        out+=" $r"
+    done
+    printf '%s' "$out"
+}
+_relink_cmds_for_choice() {  # chosen_path (unused: every link goes to the root)
+    # N2 (review r2): after `mv <chosen> $DEV_TEAM_HOME`, the chosen path no
+    # longer exists, so every affected profile -- including the ones that
+    # linked to the chosen location -- must point at the root.
+    local i role pdir
     for i in "${!OLD_TARGETS[@]}"; do
-        [[ "${OLD_TARGETS[$i]}" == "$chosen" ]] && continue
         for role in ${OLD_TARGET_ROLES[$i]}; do
             [[ "$role" == "__root_link__" ]] && continue
             pdir="$(dirname "$(hermes -p "$role" config path)")"
-            echo "    ln -sfn \"$chosen\" \"$pdir/dev-team\"" >&2
+            echo "    ln -sfn \"$DEV_TEAM_HOME\" \"$pdir/dev-team\"" >&2
         done
     done
+    echo "    (or simply re-run this installer: it relinks every $PREFIX* profile to $DEV_TEAM_HOME)" >&2
 }
 _print_candidate_choice() {  # label chosen_path
     local label="$1" chosen="$2"
@@ -555,12 +566,12 @@ if (( POPULATED_COUNT > 1 )); then
         echo "  $DEV_TEAM_HOME  (the correct Hermes-root location)" >&2
     fi
     for i in "${!OLD_TARGETS[@]}"; do
-        echo "  ${OLD_TARGETS[$i]}  (linked from:${OLD_TARGET_ROLES[$i]})" >&2
+        echo "  ${OLD_TARGETS[$i]}  (linked from:$(_display_roles "${OLD_TARGET_ROLES[$i]}"))" >&2
     done
     echo "Refusing to guess which is current. Reconcile by hand by choosing exactly one candidate below, then re-run:" >&2
     (( NEW_HAS_DATA )) && _print_candidate_choice "the existing root location" "$DEV_TEAM_HOME"
     for i in "${!OLD_TARGETS[@]}"; do
-        _print_candidate_choice "the location linked from:${OLD_TARGET_ROLES[$i]}" "${OLD_TARGETS[$i]}"
+        _print_candidate_choice "the location linked from:$(_display_roles "${OLD_TARGET_ROLES[$i]}")" "${OLD_TARGETS[$i]}"
     done
     exit 2
 elif (( ${#OLD_TARGETS[@]} == 1 )); then
@@ -611,6 +622,11 @@ elif (( ${#OLD_TARGETS[@]} == 1 )); then
         # drop it first so the rename lands a real directory there instead
         # of replacing the link target through it.
         [[ -L $DEV_TEAM_HOME ]] && rm "$DEV_TEAM_HOME"
+        # N1 (review r2): an existing real root directory must go first, or
+        # `mv` moves OLD *into* it (dev-team/dev-team/...). The plan only gets
+        # here when the root holds no data; rmdir refuses a non-empty
+        # directory, so under set -e this can never delete anything.
+        [[ -d $DEV_TEAM_HOME && ! -L $DEV_TEAM_HOME ]] && rmdir "$DEV_TEAM_HOME"
         mv "$OLD_TEAM_HOME" "$DEV_TEAM_HOME"
         ln -s "$DEV_TEAM_HOME" "$OLD_TEAM_HOME"
         mkdir -p "$backup"

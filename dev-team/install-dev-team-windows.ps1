@@ -482,7 +482,8 @@ function Resolve-TeamHomeMigrationPlan {
         if ($newHasData) { $lines += "  $DevTeamHome  (the correct Hermes-root location)" }
         foreach ($key in $oldTargets.Keys) {
             $entry = $oldTargets[$key]
-            $lines += "  $($entry.Raw)  (linked from: $($entry.Profiles -join ' '))"
+            $shownFrom = @($entry.Profiles | ForEach-Object { if ($_ -eq '__root_link__') { 'the root dev-team link' } else { $_ } })
+            $lines += "  $($entry.Raw)  (linked from: $($shownFrom -join ', '))"
         }
         $lines += 'Refusing to guess which is current. Reconcile by hand by choosing exactly one candidate below, then re-run:'
         $stamp = Get-Date -Format 'yyyyMMddTHHmmss'
@@ -494,7 +495,8 @@ function Resolve-TeamHomeMigrationPlan {
         if ($newHasData) { $choices += [ordered]@{ Label = 'the existing root location'; Path = $DevTeamHome } }
         foreach ($key in $oldTargets.Keys) {
             $entry = $oldTargets[$key]
-            $choices += [ordered]@{ Label = "the location linked from: $($entry.Profiles -join ' ')"; Path = $entry.Raw }
+            $shown = @($entry.Profiles | ForEach-Object { if ($_ -eq '__root_link__') { 'the root dev-team link' } else { $_ } })
+            $choices += [ordered]@{ Label = "the location linked from: $($shown -join ', ')"; Path = $entry.Raw }
         }
         foreach ($choice in $choices) {
             $lines += "  To keep $($choice.Label) ($($choice.Path)):"
@@ -502,14 +504,10 @@ function Resolve-TeamHomeMigrationPlan {
             if ((Get-NormalizedPath $choice.Path) -ne $devTeamHomeNorm) {
                 $lines += "    Move-Item -LiteralPath '$($choice.Path)' -Destination '$DevTeamHome'"
             }
-            foreach ($key in $oldTargets.Keys) {
-                $entry = $oldTargets[$key]
-                if ($key -eq (Get-NormalizedPath $choice.Path)) { continue }
-                foreach ($profileName in $entry.Profiles) {
-                    if ($profileName -eq '__root_link__') { continue }
-                    $lines += "    # relink ${profileName}: New-DirLink against $($choice.Path)"
-                }
-            }
+            # N2 (review r2): the chosen path no longer exists after the move,
+            # so every affected profile must point at the root; the installer
+            # does exactly that on a re-run.
+            $lines += "    then re-run this installer: it relinks every team profile's dev-team to '$DevTeamHome'"
         }
         return [ordered]@{ Outcome = 'conflict'; Message = ($lines -join "`n") }
     } elseif ($oldTargets.Count -eq 1) {
@@ -598,6 +596,13 @@ function Invoke-TeamHomeMigration {
         $DevTeamHomeParent = Split-Path -Parent $DevTeamHome
         if ($DevTeamHomeParent -and -not (Test-Path -LiteralPath $DevTeamHomeParent)) {
             New-Item -ItemType Directory -Path $DevTeamHomeParent -Force | Out-Null
+        }
+        # N1 (review r2): Move-Item into an existing folder moves the source
+        # INSIDE it. The plan only gets here when the root holds no data;
+        # a non-recursive Directory.Delete refuses a non-empty folder.
+        $rootItem = Get-Item -LiteralPath $DevTeamHome -Force -ErrorAction SilentlyContinue
+        if ($rootItem -and $rootItem.PSIsContainer -and -not $rootItem.LinkType) {
+            [System.IO.Directory]::Delete($DevTeamHome)
         }
         Move-Item -LiteralPath $OldTeamHome -Destination $DevTeamHome
         New-DirLink -LinkPath $OldTeamHome -Target $DevTeamHome -Label 'the old team-home path' | Out-Null

@@ -225,7 +225,10 @@ jobs:
         run: |
           hermes profile create dev-pm --clone
           $pmDir = Split-Path -Parent (hermes -p dev-pm config path | Select-Object -Last 1)
-          $oldHome = Join-Path $env:RUNNER_TEMP 'old-root\dev-team'
+          # Under a (builder) profile directory on the Hermes root's own volume:
+          # the real bug shape (profiles\<builder>\dev-team), and same-volume,
+          # so the atomic-move path is what runs (RUNNER_TEMP is on D:).
+          $oldHome = Join-Path (Split-Path -Parent $pmDir) 'ci-builder\dev-team'
           New-Item -ItemType Directory -Path $oldHome -Force | Out-Null
           Set-Content -LiteralPath (Join-Path $oldHome 'deciders-ledger.jsonl') -Value 'ledger-data' -NoNewline
           New-Item -ItemType Junction -Path (Join-Path $pmDir 'dev-team') -Target $oldHome | Out-Null

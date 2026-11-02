@@ -303,6 +303,26 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), new_home.resolve())
 
+    def test_N1_existing_empty_root_does_not_nest_the_data(self):
+        # Review r2 N1: with the root dev-team already present as an EMPTY
+        # directory, `mv OLD NEW` moved OLD *into* it (dev-team/dev-team/...).
+        builder = self.builder_profile()
+        old_home = builder / "dev-team"
+        old_home.mkdir(parents=True)
+        (old_home / "deciders-ledger.jsonl").write_text("ledger-data")
+        pm_dir = self.profile("pm")
+        pm_dir.mkdir(parents=True)
+        (pm_dir / "config.yaml").touch()
+        (pm_dir / "dev-team").symlink_to(old_home, target_is_directory=True)
+        new_home = self.root / "dev-team"
+        new_home.mkdir(parents=True)  # exists, empty
+
+        proc = self.install(HERMES_HOME=str(builder))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((new_home / "deciders-ledger.jsonl").read_text(), "ledger-data")
+        self.assertFalse((new_home / "dev-team").exists(), "data nested one level too deep")
+        self.assertEqual((pm_dir / "dev-team" / "deciders-ledger.jsonl").read_text(), "ledger-data")
+
     def test_refuses_when_old_and_new_homes_both_hold_data(self):
         builder = self.builder_profile()
         old_home = builder / "dev-team"
@@ -570,9 +590,15 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
         self.assertIn(f'[ -e "{self.root}/dev-team" ] &&', proc.stderr)
         self.assertIn(f'mv "{old_home}" "{self.root}/dev-team"', proc.stderr)
         self.assertIn(f'mv "{old_home_2}" "{self.root}/dev-team"', proc.stderr)
-        # Relinking the profile that was NOT chosen is named concretely.
-        self.assertIn(f'ln -sfn "{old_home}" "{uiux_dir}/dev-team"', proc.stderr)
-        self.assertIn(f'ln -sfn "{old_home_2}" "{pm_dir}/dev-team"', proc.stderr)
+        # Review r2 N2: after the chosen location is moved to the root, every
+        # affected profile must be relinked to the ROOT, never to the moved
+        # (now nonexistent) chosen path.
+        self.assertIn(f'ln -sfn "{self.root}/dev-team" "{uiux_dir}/dev-team"', proc.stderr)
+        self.assertIn(f'ln -sfn "{self.root}/dev-team" "{pm_dir}/dev-team"', proc.stderr)
+        self.assertNotIn(f'ln -sfn "{old_home}"', proc.stderr)
+        self.assertNotIn(f'ln -sfn "{old_home_2}"', proc.stderr)
+        # Review r2 N4: the internal sentinel never reaches the user.
+        self.assertNotIn("__root_link__", proc.stderr)
         # Nothing touched.
         self.assertEqual((old_home / "deciders-ledger.jsonl").read_text(), "old-ledger")
         self.assertEqual((old_home_2 / "model-tiers.json").read_text(), "other-tiers")

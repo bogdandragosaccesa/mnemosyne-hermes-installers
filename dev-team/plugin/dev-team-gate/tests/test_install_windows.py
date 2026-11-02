@@ -347,6 +347,32 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertEqual((backups[0] / "deciders-ledger.jsonl").read_text(), "ledger-data")
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N1_migration_into_an_existing_empty_root_does_not_nest(self):
+        # Review r2 N1: Move-Item into an existing (empty) folder moves the
+        # source INSIDE it. The empty root must be removed first.
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old-team-home"
+            old.mkdir()
+            (old / "deciders-ledger.jsonl").write_text("ledger-data")
+            new = Path(tmp) / "new-team-home"
+            new.mkdir()  # exists, empty
+            harness = self._migration_harness(tmp)
+            with harness.open("a") as f:
+                f.write(f"$r = Invoke-TeamHomeMigration -DevTeamHome '{new}' -OldTeamHome '{old}'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((new / "deciders-ledger.jsonl").read_text(), "ledger-data")
+            self.assertFalse((new / "old-team-home").exists(), "data nested one level too deep")
+
+    def test_N2_N4_conflict_text_relinks_to_the_root_and_hides_the_sentinel(self):
+        # Review r2 N2/N4 (static): the conflict block must not print a
+        # comment naming an installer-internal function as the relink step,
+        # and must not show the '__root_link__' sentinel to the user.
+        self.assertNotIn("# relink ${profileName}: New-DirLink", self.text)
+        self.assertNotIn("linked from: $($entry.Profiles -join ' ')", self.text)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_migration_refuses_when_both_homes_hold_data(self):
         with tempfile.TemporaryDirectory() as tmp:
             old = Path(tmp) / "old-team-home"
@@ -638,7 +664,10 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertNotIn("<", proc.stdout)  # no "<placeholder>" text
             self.assertIn(f"if (Test-Path -LiteralPath '{new}')", proc.stdout)
             self.assertIn(f"Move-Item -LiteralPath '{old}'", proc.stdout)
-            self.assertIn("relink dev-pm", proc.stdout)
+            # N2 (review r2): the relink step points every profile at the root
+            # (via a re-run), never at the just-moved chosen path.
+            self.assertIn("re-run this installer: it relinks every team profile", proc.stdout)
+            self.assertNotIn("New-DirLink against", proc.stdout)
 
 
 class WorkflowTests(unittest.TestCase):
