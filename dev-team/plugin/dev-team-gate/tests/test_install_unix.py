@@ -599,6 +599,8 @@ class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
         self.assertNotIn(f'ln -sfn "{old_home_2}"', proc.stderr)
         # Review r2 N4: the internal sentinel never reaches the user.
         self.assertNotIn("__root_link__", proc.stderr)
+        # Review r3: prose inside the copy-paste block must be a comment.
+        self.assertIn("    # or simply re-run this installer", proc.stderr)
         # Nothing touched.
         self.assertEqual((old_home / "deciders-ledger.jsonl").read_text(), "old-ledger")
         self.assertEqual((old_home_2 / "model-tiers.json").read_text(), "other-tiers")

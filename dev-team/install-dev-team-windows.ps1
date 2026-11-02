@@ -507,7 +507,7 @@ function Resolve-TeamHomeMigrationPlan {
             # N2 (review r2): the chosen path no longer exists after the move,
             # so every affected profile must point at the root; the installer
             # does exactly that on a re-run.
-            $lines += "    then re-run this installer: it relinks every team profile's dev-team to '$DevTeamHome'"
+            $lines += "    # then re-run this installer: it relinks every team profile's dev-team to '$DevTeamHome'"
         }
         return [ordered]@{ Outcome = 'conflict'; Message = ($lines -join "`n") }
     } elseif ($oldTargets.Count -eq 1) {

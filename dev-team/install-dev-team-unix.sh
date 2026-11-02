@@ -546,7 +546,7 @@ _relink_cmds_for_choice() {  # chosen_path (unused: every link goes to the root)
             echo "    ln -sfn \"$DEV_TEAM_HOME\" \"$pdir/dev-team\"" >&2
         done
     done
-    echo "    (or simply re-run this installer: it relinks every $PREFIX* profile to $DEV_TEAM_HOME)" >&2
+    echo "    # or simply re-run this installer: it relinks every $PREFIX* profile to $DEV_TEAM_HOME" >&2
 }
 _print_candidate_choice() {  # label chosen_path
     local label="$1" chosen="$2"

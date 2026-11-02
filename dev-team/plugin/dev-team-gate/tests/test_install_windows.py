@@ -666,7 +666,7 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertIn(f"Move-Item -LiteralPath '{old}'", proc.stdout)
             # N2 (review r2): the relink step points every profile at the root
             # (via a re-run), never at the just-moved chosen path.
-            self.assertIn("re-run this installer: it relinks every team profile", proc.stdout)
+            self.assertIn("    # then re-run this installer: it relinks every team profile", proc.stdout)
             self.assertNotIn("New-DirLink against", proc.stdout)
 
 
