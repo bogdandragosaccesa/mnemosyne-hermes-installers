@@ -98,8 +98,12 @@ call outright:
 
 ## Where else this gets used (guidance, not a separate contract)
 
-- **Plan stage (pm):** before each implement-card `kanban_create`, run `deciders tier` — see
-  `dev-team-stage-plan`'s "The child card" section for the exact rule.
+- **Plan stage (`<prefix>pm`, where `<prefix>` is read from your profile's `dev-team-prefix`
+  file):** before each implement-card `kanban_create`, run `deciders tier` — see
+  `dev-team-stage-plan`'s "The child card" section for the exact rule. The tier table's single
+  source of truth is the installer-written `$HERMES_HOME/dev-team/model-tiers.json` of the
+  process that runs `deciders` (per profile). `~/.hermes/dev-team/model-tiers.json` is the same
+  file for the default `HERMES_HOME`, used only by calls run with `HERMES_HOME=$HOME/.hermes`.
 - **pr-ci stage (devops):** on a red CI run, `deciders extract` over the log to find failing
   tests and file:line before judging cause vs. flake yourself — see `dev-team-stage-pr-ci`
   step 5.
