@@ -5,6 +5,7 @@ runs, and parse the script with PowerShell when `pwsh` is installed.
 
 Assertion messages are short on purpose: a failing assertIn would print the
 whole 27 kB script."""
+import os
 import re
 import shutil
 import subprocess
@@ -309,10 +310,12 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
         self.assertIn(f"ROOT={root}", proc.stdout)
 
     def _migration_harness(self, tmp):
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        link_fn = _function(self.text, "New-DirLink")
         test_fn = _function(self.text, "Test-DirHasData")
         migrate_fn = _function(self.text, "Invoke-TeamHomeMigration")
         harness = Path(tmp) / "harness.ps1"
-        harness.write_text(test_fn + "\n" + migrate_fn + "\n")
+        harness.write_text(norm_fn + "\n" + link_fn + "\n" + test_fn + "\n" + migrate_fn + "\n")
         return harness
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
@@ -331,7 +334,14 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("CHOICE=move", proc.stdout)
             self.assertEqual((new / "deciders-ledger.jsonl").read_text(), "ledger-data")
-            self.assertFalse(old.exists())
+            # D3 (review): the old path must keep resolving to the data via
+            # a junction. Only verifiable on real Windows -- Linux pwsh's
+            # New-Item -ItemType Junction reports success without creating
+            # anything Test-Path recognizes, a platform limitation the
+            # install-windows-ps51 CI job exists to cover on real Windows.
+            if os.name == "nt":
+                self.assertTrue(old.exists(), "old path must still resolve after migration")
+                self.assertEqual((old / "deciders-ledger.jsonl").read_text(), "ledger-data")
             backups = list(Path(tmp).glob("old-team-home.pre-root-migration-*"))
             self.assertEqual(len(backups), 1, backups)
             self.assertEqual((backups[0] / "deciders-ledger.jsonl").read_text(), "ledger-data")
@@ -454,10 +464,12 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
 
     def _plan_harness(self, tmp):
         norm_fn = _function(self.text, "Get-NormalizedPath")
+        anc_fn = _function(self.text, "Test-IsAncestorOrEqualPath")
+        reason_fn = _function(self.text, "Get-UnsafeOldHomeReason")
         data_fn = _function(self.text, "Test-DirHasData")
         plan_fn = _function(self.text, "Resolve-TeamHomeMigrationPlan")
         harness = Path(tmp) / "harness.ps1"
-        harness.write_text(norm_fn + "\n" + data_fn + "\n" + plan_fn + "\n")
+        harness.write_text(norm_fn + "\n" + anc_fn + "\n" + reason_fn + "\n" + data_fn + "\n" + plan_fn + "\n")
         return harness
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
@@ -466,8 +478,8 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
         # populated location. The plan must list both as AffectedProfiles
         # even though only one of them need be in -Only's selection.
         with tempfile.TemporaryDirectory() as tmp:
-            old = Path(tmp) / "old-team-home"
-            old.mkdir()
+            old = Path(tmp) / "old-area" / "dev-team"
+            old.mkdir(parents=True)
             (old / "deciders-ledger.jsonl").write_text("ledger-data")
             new = Path(tmp) / "new-team-home"
             harness = self._plan_harness(tmp)
@@ -491,11 +503,11 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
         # old target; a second, distinct populated location must also be
         # reported, not silently orphaned.
         with tempfile.TemporaryDirectory() as tmp:
-            old_pm = Path(tmp) / "old-pm-home"
-            old_pm.mkdir()
+            old_pm = Path(tmp) / "pm-area" / "dev-team"
+            old_pm.mkdir(parents=True)
             (old_pm / "deciders-ledger.jsonl").write_text("pm-ledger")
-            old_uiux = Path(tmp) / "old-uiux-home"
-            old_uiux.mkdir()
+            old_uiux = Path(tmp) / "uiux-area" / "dev-team"
+            old_uiux.mkdir(parents=True)
             (old_uiux / "model-tiers.json").write_text("uiux-tiers")
             new = Path(tmp) / "new-team-home"
             harness = self._plan_harness(tmp)
@@ -534,6 +546,99 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("OUTCOME=none", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D1_refuses_a_candidate_not_named_dev_team(self):
+        # Repro F/H equivalent: a candidate junction resolves to something
+        # not literally named "dev-team" -- migrating it would move an
+        # entire profile or other directory.
+        with tempfile.TemporaryDirectory() as tmp:
+            new = Path(tmp) / "new-team-home"
+            not_dev_team = Path(tmp) / "profiles" / "dev-pm"
+            not_dev_team.mkdir(parents=True)
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ 'dev-pm' = '" + str(not_dev_team) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' -CandidateTargets $candidates\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output $r.Message\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=invalid", proc.stdout)
+            self.assertIn("not 'dev-team'", proc.stdout)
+            self.assertFalse(new.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D1_refuses_a_candidate_equal_to_a_profile_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new = Path(tmp) / "hermes" / "dev-team"
+            profile_dir = Path(tmp) / "hermes" / "profiles" / "dev-team"
+            profile_dir.mkdir(parents=True)
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ 'dev-pm' = '" + str(profile_dir) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' "
+                    f"-CandidateTargets $candidates -HermesRoot '{Path(tmp) / 'hermes'}' "
+                    f"-ProfileDirs @('{profile_dir}')\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=invalid", proc.stdout)
+            self.assertFalse(new.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D4_root_link_target_is_treated_as_an_old_home_candidate(self):
+        # D4: when $DevTeamHome itself is a link, its target must be fed in
+        # as the "__root_link__" candidate and not double-counted against
+        # itself as a second populated location.
+        with tempfile.TemporaryDirectory() as tmp:
+            new = Path(tmp) / "hermes" / "dev-team"
+            root_target = Path(tmp) / "hermes" / "profiles" / "devops" / "dev-team"
+            root_target.mkdir(parents=True)
+            (root_target / "deciders-ledger.jsonl").write_text("devops-ledger")
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ '__root_link__' = '" + str(root_target) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' "
+                    f"-CandidateTargets $candidates -HermesRoot '{Path(tmp) / 'hermes'}' "
+                    "-DevTeamHomeIsLink\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output \"OLD=$($r.OldTeamHome)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=move", proc.stdout)
+            self.assertIn(f"OLD={root_target}", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D5_conflict_message_has_no_placeholder_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "pm-area" / "dev-team"
+            old.mkdir(parents=True)
+            (old / "deciders-ledger.jsonl").write_text("ledger-data")
+            new = Path(tmp) / "new-team-home"
+            new.mkdir()
+            (new / "model-tiers.json").write_text("new-existing")
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ 'dev-pm' = '" + str(old) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' -CandidateTargets $candidates\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output $r.Message\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=conflict", proc.stdout)
+            self.assertNotIn("<", proc.stdout)  # no "<placeholder>" text
+            self.assertIn(f"if (Test-Path -LiteralPath '{new}')", proc.stdout)
+            self.assertIn(f"Move-Item -LiteralPath '{old}'", proc.stdout)
+            self.assertIn("relink dev-pm", proc.stdout)
 
 
 class WorkflowTests(unittest.TestCase):
