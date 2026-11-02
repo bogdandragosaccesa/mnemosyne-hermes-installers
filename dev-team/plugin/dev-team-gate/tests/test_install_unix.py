@@ -151,6 +151,32 @@ class UnixInstallerTests(unittest.TestCase):
         self.assertFalse((self.root / "profiles").exists())
         self.assertFalse((self.home / ".local" / "bin" / "forge").exists())
 
+    def test_refuses_a_decisions_only_model_as_a_tier(self):
+        # liquid/d1.1 and pplx-decider only answer /api/alpha/decisions; an
+        # agent worker on a card routed to one of them cannot run at all.
+        for flag, value in (("--tier-fast", "openrouter:liquid/d1.1"),
+                            ("--tier-standard", "openrouter:perplexity/pplx-decider-v1.2"),
+                            ("--tier-deep", "openrouter:liquid/d1.1-20261027")):
+            with self.subTest(flag=flag):
+                proc = self.install(flag, value)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("decisions-only", proc.stderr)
+                self.assertIn(flag, proc.stderr)
+                self.assertFalse((self.root / "profiles").exists())
+                self.assertFalse((self.root / "dev-team" / "model-tiers.json").exists())
+
+    def test_default_fast_tier_is_a_chat_model(self):
+        proc = self.install("--only", "pm")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        import json
+        table = json.loads((self.root / "dev-team" / "model-tiers.json").read_text())
+        self.assertEqual(table["fast"], {"provider": "anthropic", "model": "claude-haiku-4-5"})
+
+    def test_help_does_not_suggest_a_decisions_model_for_a_tier(self):
+        proc = self.install("--help")
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("liquid", proc.stdout)
+
     def test_only_installs_the_named_roles(self):
         proc = self.install("--only", "qa,devops")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

@@ -47,8 +47,9 @@
 
 .PARAMETER TierFast
     deciders tier table entry for the fast tier, as PROVIDER:MODEL (e.g.
-    openrouter:liquid/d1.1). No default: absent from model-tiers.json unless
-    given.
+    anthropic:claude-haiku-4-5). Default: $FastModel split on its first '/'.
+    Every -Tier* model must be a chat model an agent can run on; a
+    decisions-only model is refused.
 
 .PARAMETER TierStandard
     deciders tier table entry for the standard tier. Default: $MidModel
@@ -89,6 +90,10 @@ $ErrorActionPreference = 'Stop'
 # added: their cost is out of all proportion to the work these profiles do.
 $FrontierModel = 'anthropic/claude-opus-5'
 $MidModel      = 'anthropic/claude-sonnet-5'
+# Default for the deciders tier table's fast tier only (no profile uses it).
+# Must be a chat model an agent worker can run on: never a decisions-only
+# model such as deciders' own tier/decide models (see DECISION_MODELS).
+$FastModel     = 'anthropic/claude-haiku-4-5'
 $ModelExplicit = $PSBoundParameters.ContainsKey('Model')
 # The profile a human talks to. It gets the pipeline-orchestration skill and
 # the budget script; every other profile is a worker the dispatcher spawns.
@@ -127,12 +132,13 @@ function Split-ProviderModel {
     return @($Value.Substring(0, $idx), $Value.Substring($idx + 1))
 }
 
-# deciders tier table. -TierFast has no default (absent from
-# model-tiers.json unless given); -TierStandard/-TierDeep default from
-# $MidModel/$FrontierModel, split on their first '/'.
-$TierFastProvider = $null; $TierFastModel = $null
+# deciders tier table. -TierFast/-TierStandard/-TierDeep default from
+# $FastModel/$MidModel/$FrontierModel, split on their first '/'.
 if ($TierFast) {
     $parts = Split-TierPM $TierFast '-TierFast'
+    $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
+} else {
+    $parts = Split-ProviderModel $FastModel
     $TierFastProvider = $parts[0]; $TierFastModel = $parts[1]
 }
 
@@ -160,6 +166,36 @@ $ForgePy        = Join-Path $ScriptDir 'forge\forge.py'
 $KanbanBudgetPy = Join-Path $ScriptDir 'scripts\kanban-budget.py'
 $DecidersPy       = Join-Path $ScriptDir 'deciders\deciders.py'
 $DecidersSkillDir = Join-Path $SkillsDir 'dev-team-deciders'
+
+# Refuse a decisions-only model in the tier table before anything is
+# written: an agent worker on a card routed to it could not run at all. The
+# list is deciders_core.py's one-line DECISION_MODELS tuple, so it has one
+# owner; a dated variant ("<id>-20261027") is refused too. Two Join-Paths
+# rather than one backslash path, so the check also runs under pwsh on Linux.
+$DecidersCorePy = Join-Path (Join-Path $ScriptDir 'deciders') 'deciders_core.py'
+$DecisionModels = @()
+if (Test-Path -LiteralPath $DecidersCorePy) {
+    $line = Get-Content -LiteralPath $DecidersCorePy | Where-Object { $_ -like 'DECISION_MODELS = (*' } | Select-Object -First 1
+    if ($line) { $DecisionModels = @([regex]::Matches($line, '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value }) }
+}
+if ($DecisionModels.Count -eq 0) {
+    [Console]::Error.WriteLine("cannot read DECISION_MODELS from $DecidersCorePy")
+    exit 2
+}
+function Assert-NotDecisionModel {
+    param([string] $FlagName, [string] $Provider, [string] $ModelId)
+    foreach ($m in $DecisionModels) {
+        foreach ($candidate in @($ModelId, "$Provider/$ModelId")) {
+            if ($candidate -eq $m -or $candidate.StartsWith("$m-")) {
+                [Console]::Error.WriteLine("$FlagName $Provider`:$ModelId is a decisions-only model (it only answers /api/alpha/decisions); an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5.")
+                exit 2
+            }
+        }
+    }
+}
+Assert-NotDecisionModel '-TierFast' $TierFastProvider $TierFastModel
+Assert-NotDecisionModel '-TierStandard' $TierStandardProvider $TierStandardModel
+Assert-NotDecisionModel '-TierDeep' $TierDeepProvider $TierDeepModel
 
 # Profile name -> the description the kanban decomposer routes tasks on.
 # Ordered so the output prints in a stable order. Kept in lockstep with the

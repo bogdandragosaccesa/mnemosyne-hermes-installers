@@ -62,6 +62,27 @@ class WindowsInstallerTests(unittest.TestCase):
         self.assertTrue(re.search(r"Test-Eventually \{[^}]*plugins' 'list'", self.text),
                         "plugins list check not retried")
 
+    def test_tier_table_defaults_fast_to_a_chat_model(self):
+        self.has("'anthropic/claude-haiku-4-5'", self.text, "no haiku fast default")
+        self.assertFalse("liquid" in self.text, "a decisions model is still suggested")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_refuses_a_decisions_only_model_as_a_tier(self):
+        # The refusal runs before anything is read or written, so the script
+        # can be run as-is; HOME points at an empty temp dir all the same.
+        for param, value in (("-TierFast", "openrouter:liquid/d1.1"),
+                             ("-TierDeep", "openrouter:perplexity/pplx-decider-v1.2")):
+            with self.subTest(param=param), tempfile.TemporaryDirectory() as tmp:
+                proc = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(PS1),
+                     "-DryRun", param, value],
+                    capture_output=True, text=True, timeout=120,
+                    env={"HOME": tmp, "PATH": "/usr/bin:/bin:/snap/bin",
+                         "USERPROFILE": tmp})
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("decisions-only", proc.stderr)
+                self.assertIn(param, proc.stderr)
+
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_parses_under_powershell(self):
         with tempfile.TemporaryDirectory() as tmp:

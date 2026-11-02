@@ -172,12 +172,29 @@ class TierQuestionShapeTests(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
         url, headers, body, timeout = transport.calls[0]
         self.assertEqual(url, "https://openrouter.ai/api/alpha/decisions")
+        # The live Decisions API rejects an array ("expected record, received
+        # array", http-400): questions is a record keyed by question id.
         questions = body["questions"]
-        self.assertEqual(len(questions), 1)
-        self.assertEqual(questions[0]["type"], "choice")
+        self.assertIsInstance(questions, dict)
+        self.assertEqual(list(questions.keys()), ["tier"])
+        self.assertEqual(questions["tier"]["type"], "choice")
         self.assertEqual(
-            set(questions[0]["criteria"].keys()), {"fast", "standard", "deep"}
+            set(questions["tier"]["criteria"].keys()), {"fast", "standard", "deep"}
         )
+
+
+class DecisionModelListTests(unittest.TestCase):
+    def test_decisions_endpoint_defaults_are_listed_as_decision_models(self):
+        # The installers refuse these as tier-table models: a decisions-only
+        # model cannot run an agent worker.
+        self.assertIn(deciders_core.DEFAULT_MODELS["decide"], deciders_core.DECISION_MODELS)
+        self.assertIn(deciders_core.DEFAULT_MODELS["tier"], deciders_core.DECISION_MODELS)
+
+    def test_decision_model_list_is_one_line_the_installers_can_read(self):
+        src = Path(deciders_core.__file__).read_text()
+        lines = [ln for ln in src.splitlines() if ln.startswith("DECISION_MODELS = (")]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].rstrip().endswith(")"))
 
 
 class TierOverrideTableTests(unittest.TestCase):

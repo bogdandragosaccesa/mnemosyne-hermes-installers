@@ -18,6 +18,10 @@ MODEL="anthropic/claude-sonnet-5"
 # added: their cost is out of all proportion to the work these profiles do.
 FRONTIER_MODEL="anthropic/claude-opus-5"
 MID_MODEL="anthropic/claude-sonnet-5"
+# Default for the deciders tier table's fast tier only (no profile uses it).
+# Must be a chat model an agent worker can run on: never a decisions-only
+# model such as deciders' own tier/decide models (see DECISION_MODELS).
+FAST_MODEL="anthropic/claude-haiku-4-5"
 # Set when the caller passes --model, so one explicit model beats the table.
 MODEL_EXPLICIT=""
 ONLY=""
@@ -27,8 +31,8 @@ DRY_RUN=0
 PREFIX="dev-"
 SHARED_DATA=1
 # deciders tier table: PROVIDER:MODEL per tier, raw --tier-* values before
-# the colon split below. Unset unless the caller passes the flag (fast has
-# no default; standard/deep default from MID_MODEL/FRONTIER_MODEL).
+# the colon split below. Unset unless the caller passes the flag (each tier
+# then defaults from FAST_MODEL/MID_MODEL/FRONTIER_MODEL).
 TIER_FAST_PM=""
 TIER_STANDARD_PM=""
 TIER_DEEP_PM=""
@@ -53,8 +57,10 @@ Usage: install-dev-team-unix.sh [options]
                      other's notes, so the board no longer hands work
                      between them.
   --tier-fast P:M     deciders tier table entry for the fast tier, as
-                     PROVIDER:MODEL (e.g. openrouter:liquid/d1.1). No
-                     default: absent from model-tiers.json unless given.
+                     PROVIDER:MODEL (e.g. anthropic:claude-haiku-4-5).
+                     Default: $FAST_MODEL split on its first '/'.
+                     Every --tier-* model must be a chat model an agent
+                     can run on; a decisions-only model is refused.
   --tier-standard P:M deciders tier table entry for the standard tier.
                      Default: $MID_MODEL split on its first '/'.
   --tier-deep P:M     deciders tier table entry for the deep tier.
@@ -109,13 +115,14 @@ if [[ -n $PREFIX && ! $PREFIX =~ ^[a-zA-Z0-9_-]+$ ]]; then
 fi
 
 # deciders tier table: --tier-fast/standard/deep were already validated as
-# PROVIDER:MODEL above. fast has no default (absent from model-tiers.json
-# unless given); standard and deep default from MID_MODEL/FRONTIER_MODEL,
-# split on their first '/'.
-TIER_FAST_PROVIDER=""; TIER_FAST_MODEL=""
+# PROVIDER:MODEL above. Each tier defaults from FAST_MODEL/MID_MODEL/
+# FRONTIER_MODEL, split on its first '/'.
 if [[ -n $TIER_FAST_PM ]]; then
     TIER_FAST_PROVIDER="${TIER_FAST_PM%%:*}"
     TIER_FAST_MODEL="${TIER_FAST_PM#*:}"
+else
+    TIER_FAST_PROVIDER="${FAST_MODEL%%/*}"
+    TIER_FAST_MODEL="${FAST_MODEL#*/}"
 fi
 
 if [[ -n $TIER_STANDARD_PM ]]; then
@@ -172,6 +179,30 @@ FORGE_PY="$SCRIPT_DIR/forge/forge.py"
 KANBAN_BUDGET_PY="$SCRIPT_DIR/scripts/kanban-budget.py"
 DECIDERS_PY="$SCRIPT_DIR/deciders/deciders.py"
 DECIDERS_SKILL_DIR="$SKILLS_DIR/dev-team-deciders"
+
+# Refuse a decisions-only model in the tier table before anything is
+# written: an agent worker on a card routed to it could not run at all. The
+# list is deciders_core.py's one-line DECISION_MODELS tuple, so it has one
+# owner; a dated variant ("<id>-20261027") is refused too.
+DECIDERS_CORE_PY="$SCRIPT_DIR/deciders/deciders_core.py"
+DECISION_MODELS_LIST="$(grep -m1 '^DECISION_MODELS = (' "$DECIDERS_CORE_PY" 2>/dev/null | grep -o '"[^"]*"' | tr -d '"' || true)"
+if [[ -z $DECISION_MODELS_LIST ]]; then
+    echo "cannot read DECISION_MODELS from $DECIDERS_CORE_PY" >&2
+    exit 2
+fi
+refuse_decision_model() {  # flag provider model
+    local flag="$1" full="$2/$3" bare="$3" m
+    while IFS= read -r m; do
+        [[ -n $m ]] || continue
+        case "$bare" in "$m"|"$m"-*) ;; *) case "$full" in "$m"|"$m"-*) ;; *) continue ;; esac ;; esac
+        echo "$flag $2:$3 is a decisions-only model (it only answers /api/alpha/decisions);" >&2
+        echo "an agent worker cannot run on it. Pick a chat model, e.g. anthropic:claude-haiku-4-5." >&2
+        exit 2
+    done <<< "$DECISION_MODELS_LIST"
+}
+refuse_decision_model --tier-fast "$TIER_FAST_PROVIDER" "$TIER_FAST_MODEL"
+refuse_decision_model --tier-standard "$TIER_STANDARD_PROVIDER" "$TIER_STANDARD_MODEL"
+refuse_decision_model --tier-deep "$TIER_DEEP_PROVIDER" "$TIER_DEEP_MODEL"
 
 # Profile name, then the description the kanban decomposer routes tasks on.
 # Parallel arrays rather than an associative array: bash 3.2 (stock macOS)

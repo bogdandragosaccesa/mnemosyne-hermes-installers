@@ -41,6 +41,12 @@ DEFAULT_MODELS = {
     "tier": "liquid/d1.1",
 }
 
+# Models that only answer DECISIONS_URL, never chat completions: an agent
+# worker routed to one cannot run. The installers read this one line and
+# refuse any of these (or a dated variant, e.g. "<id>-20261027") as a
+# model-tiers.json entry, so keep it a single-line tuple of string literals.
+DECISION_MODELS = ("liquid/d1.1", "perplexity/pplx-decider-v1.2")
+
 TIMEOUT_S = 60.0
 
 # Plan-stage tier rule (design, "Plan-stage tier proposal"). Consequence of
@@ -335,9 +341,10 @@ def _cmd_tier(args, key: str, transport: Transport) -> dict:
     spec_text = _read_text(args.spec)[:20000]
     model = args.model or DEFAULT_MODELS["tier"]
     state = {"title": args.title, "spec": spec_text}
-    questions = [
-        {
-            "id": "tier",
+    # The Decisions API takes a record keyed by question id; an array gets
+    # http-400 ("expected record, received array").
+    questions = {
+        "tier": {
             "type": "choice",
             "instructions": (
                 "Which model tier does this software task need to be done "
@@ -352,7 +359,7 @@ def _cmd_tier(args, key: str, transport: Transport) -> dict:
                 ),
             },
         }
-    ]
+    }
     body = {"model": model, "state": state, "questions": questions}
     data = _require_dict(_call(transport, DECISIONS_URL, _headers(key), body, TIMEOUT_S))
 

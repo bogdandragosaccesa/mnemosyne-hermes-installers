@@ -47,9 +47,10 @@ its own stdout, but you must not route the value through anything that would re-
   or graded question you would otherwise spend a long read or several turns answering, and that
   repeats (triaging many similar items, matching a failure to one of several known causes). Not
   for one-off reasoning you are already doing in this turn — that call costs you nothing extra
-  and deciders would only add a round trip. `--questions` is a JSON array, one object per
-  question, e.g. `[{"id": "q1", "type": "choice", "instructions": "Is this a flake?",
-  "criteria": {"yes": "...", "no": "..."}}]`. `decide` returns the model's raw `choice` and
+  and deciders would only add a round trip. `--questions` is a JSON object (a record) keyed by
+  question id, one entry per question, e.g. `{"q1": {"type": "choice", "instructions": "Is this
+  a flake?", "criteria": {"yes": "...", "no": "..."}}}` — answers come back under the same ids.
+  A JSON array gets `deciders: http-400` (the API says "expected record, received array"). `decide` returns the model's raw `choice` and
   `probabilities` for each question **unmodified — no threshold is applied in code**; only
   `deciders tier` applies one (via `choose_tier`). You apply the band yourself: for a yes/no
   question, read the `yes` probability — `>= 0.65` means yes, `<= 0.35` means no, anything in
@@ -59,9 +60,11 @@ its own stdout, but you must not route the value through anything that would re-
   itself, not a usable pick.
 - **`deciders extract --entities <file|-> [--input <file|->]`** — to find *where* to look inside
   large text (a CI log, a test run, a long diff): it returns spans with offsets and confidence,
-  not conclusions. `--entities` is a JSON object naming what to find, e.g.
-  `{"types": ["synthetic-secret"]}` — passed through as
-  `provider.options.scaledown.entities`. An extracted span is a pointer, never a finding — you
+  not conclusions. `--entities` is a flat JSON object mapping each entity type name to a
+  description of what to find, `{"<type-name>": "<description>"}`, e.g.
+  `{"synthetic-secret": "an API key, token or password written into the text"}` — passed
+  through as `provider.options.scaledown.entities`. Any other shape is a silent false negative
+  (`{"types": [...]}` exits 0 with zero entities) or `http-400` (an array). An extracted span is a pointer, never a finding — you
   must open the reported span yourself and judge it before you act on it or cite it anywhere.
 - **`deciders summarize [--input <file|->]`** — only to compress context you will not cite:
   background material, old discussion, anything you are reading for orientation rather than
