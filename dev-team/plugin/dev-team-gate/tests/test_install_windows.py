@@ -1390,10 +1390,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(first_run, job.index("D3: old path"), "D3 assertion must run after the first (migrating) run")
         self.assertLess(job.index("D3: old path"), second_run, "D6 assertions must run before the idempotency re-run")
 
-    def test_linux_job_asserts_first_run_exit_0_and_shared_mnemosyne_links(self):
+    def test_linux_job_asserts_first_run_exit_0_and_team_mnemosyne_links(self):
         job = self.job("install-linux")
         self.has("first run must exit 0", job, "no first-run exit check")
-        self.has("is not a symlink to the shared bank", job, "no shared-bank link check")
+        self.has("is not a symlink to the team bank", job, "no team-bank link check")
 
     def test_linux_job_runs_dry_run_and_only(self):
         job = self.job("install-linux")

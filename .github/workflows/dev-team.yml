@@ -83,18 +83,27 @@ jobs:
       - name: dev-team install --only qa (run 3, partial re-run)
         run: dev-team/install-dev-team-unix.sh --skip-model --only qa
 
-      - name: every dev-* profile links the shared Mnemosyne bank
-        # Brief item 10: profiles this installer creates share one bank.
+      - name: every dev-* profile links the team-only Mnemosyne bank
+        # Brief item 10: profiles this installer creates share one bank --
+        # the TEAM bank ($HERMES_ROOT/dev-team-mnemosyne), never the
+        # operator's own ($HERMES_ROOT/mnemosyne). dev-team-next Task 2
+        # moved the default target; this must also fail if the two banks
+        # ever resolve to the same place.
         run: |
-          shared="$(cd "$(dirname "$(hermes config path)")/mnemosyne" && pwd -P)"
+          root="$(dirname "$(hermes config path)")"
+          shared="$(cd "$root/dev-team-mnemosyne" && pwd -P)"
+          if [ -e "$root/mnemosyne" ] && [ "$shared" = "$(cd "$root/mnemosyne" && pwd -P)" ]; then
+            echo "::error::the team bank resolves to the operator's own bank ($root/mnemosyne)" >&2
+            exit 1
+          fi
           for role in pm architect uiux backend-db frontend qa reviewer devops; do
             dir="$(dirname "$(hermes -p "dev-$role" config path)")"
             if [ ! -L "$dir/mnemosyne" ] || [ "$(cd "$dir/mnemosyne" && pwd -P)" != "$shared" ]; then
-              echo "::error::dev-$role: $dir/mnemosyne is not a symlink to the shared bank $shared" >&2
+              echo "::error::dev-$role: $dir/mnemosyne is not a symlink to the team bank $shared" >&2
               exit 1
             fi
           done
-          test -f "$shared/data/mnemosyne.db" || { echo "::error::shared Mnemosyne DB missing" >&2; exit 1; }
+          test -f "$shared/data/mnemosyne.db" || { echo "::error::team Mnemosyne DB missing" >&2; exit 1; }
 
       - name: every dev-* profile records its team prefix
         run: |
@@ -281,8 +290,13 @@ jobs:
         shell: powershell
         run: |
           $root = Split-Path -Parent (hermes config path | Select-Object -Last 1)
-          $db = Join-Path $root 'mnemosyne\data\mnemosyne.db'
-          if (-not (Test-Path -LiteralPath $db)) { Write-Error "shared Mnemosyne DB is gone: $db"; exit 1 }
+          # The team-only bank (dev-team-next Task 2), never the operator's own.
+          $db = Join-Path $root 'dev-team-mnemosyne\data\mnemosyne.db'
+          if (-not (Test-Path -LiteralPath $db)) { Write-Error "team Mnemosyne DB is gone: $db"; exit 1 }
+          $operatorDb = Join-Path $root 'mnemosyne\data\mnemosyne.db'
+          if ((Test-Path -LiteralPath $operatorDb) -and ((Resolve-Path -LiteralPath $db).Path -eq (Resolve-Path -LiteralPath $operatorDb).Path)) {
+            Write-Error "the team bank resolves to the operator's own bank: $operatorDb"; exit 1
+          }
           $guard = Join-Path $env:GITHUB_WORKSPACE 'dev-team\plugin\dev-team-gate\guard.py'
           if (-not (Test-Path -LiteralPath $guard)) { Write-Error "plugin source is gone: $guard"; exit 1 }
           foreach ($role in 'pm','architect','uiux','backend-db','frontend','qa','reviewer','devops') {
@@ -290,6 +304,6 @@ jobs:
             $linked = Join-Path $dir 'plugins\dev-team-gate\guard.py'
             if (-not (Test-Path -LiteralPath $linked)) { Write-Error "dev-$role : $linked missing"; exit 1 }
             if (-not (Test-Path -LiteralPath (Join-Path $dir 'mnemosyne\data\mnemosyne.db'))) {
-              Write-Error "dev-$role : shared Mnemosyne DB not reachable through the link"; exit 1
+              Write-Error "dev-$role : team Mnemosyne DB not reachable through the link"; exit 1
             }
           }
