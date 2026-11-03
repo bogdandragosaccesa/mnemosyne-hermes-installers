@@ -931,28 +931,44 @@ if ($_teamMemoryRefusal) {
 # specifically because "a profile's .env overrides stale shell exports".
 function Set-EnvVarPin {
     <# Rewrite a single VAR=value line in a profile's .env, preserving
-       every other line, via Get-Content/Set-Content line comparison
-       (never a regex substitution built from the value itself, so a
-       bank path containing regex-special characters is written
-       verbatim -- same concern F4 raised for the Unix sed version). #>
+       every other line byte-exact, via a read/compare/write that goes
+       through [IO.File]::ReadAllLines/WriteAllLines with an explicit
+       UTF8Encoding($false) -- never Get-Content/Set-Content/Add-Content
+       with no -Encoding, and never a regex substitution built from the
+       value itself (so a bank path containing regex-special characters
+       is written verbatim -- same concern F4 raised for the Unix sed
+       version).
+       On Windows PowerShell 5.1 (the CI target) those cmdlets default to
+       the ANSI code page with no -Encoding: that both garbles a
+       non-ASCII bank path on write (review r3 minor #1 -- a non-ASCII
+       path would turn into '?' bytes, Hermes would then open a fresh,
+       empty DB there) and misreads an already-non-ASCII existing line (a
+       `--clone`d operator .env) back into memory before this function
+       rewrites the file. 5.1 also has no `utf8NoBOM` value for
+       -Encoding, so even an explicit `-Encoding UTF8` there would add a
+       BOM; Hermes' own loader tolerates a UTF-8 BOM
+       (hermes_cli/env_loader.py opens with `encoding="utf-8-sig"`), but
+       writing none is the simpler invariant and matches what Hermes
+       itself writes. [IO.File]::ReadAllLines auto-detects a BOM already
+       on disk and otherwise falls back to the UTF-8 encoding passed in,
+       so a pre-existing BOM-less UTF-8 file (what this function always
+       writes) decodes correctly either way. #>
     param([string] $ProfileDir, [string] $VarName, [string] $Value)
     New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
     $envFile = Join-Path $ProfileDir '.env'
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $line = "$VarName=$Value"
     $prefix = "$VarName="
     if (Test-Path -LiteralPath $envFile) {
-        $existingLines = @(Get-Content -LiteralPath $envFile)
+        $existingLines = [System.IO.File]::ReadAllLines($envFile, [System.Text.Encoding]::UTF8)
         $found = $false
-        $newLines = $existingLines | ForEach-Object {
+        $newLines = @($existingLines | ForEach-Object {
             if ($_.StartsWith($prefix)) { $found = $true; $line } else { $_ }
-        }
-        if ($found) {
-            Set-Content -LiteralPath $envFile -Value $newLines
-        } else {
-            Add-Content -LiteralPath $envFile -Value $line
-        }
+        })
+        if (-not $found) { $newLines += $line }
+        [System.IO.File]::WriteAllLines($envFile, $newLines, $utf8NoBom)
     } else {
-        Set-Content -LiteralPath $envFile -Value $line
+        [System.IO.File]::WriteAllLines($envFile, @($line), $utf8NoBom)
     }
 }
 function Set-MnemosyneDataDirPin {
@@ -1201,9 +1217,14 @@ function Invoke-MnemosyneDataLink {
         [Console]::Error.WriteLine("Cannot resolve $Name's profile directory: $ProfileDir")
         exit 1
     }
-    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
-            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
-        [Console]::Error.WriteLine("$Name's profile directory ($ProfileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+    # F2 equality (review r3 minor #4): Test-PathIsOrUnder treats Desc -ieq
+    # Anc as is-or-under, so it alone would accept a profile dir that
+    # resolves to EXACTLY $HermesRoot\profiles (dev-qa -> profiles), not
+    # just one nested under it. Refuse that explicitly too.
+    if (((-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal)) `
+            -and (-not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal))) `
+            -or ($profileDirReal -ieq $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$Name's profile directory ($ProfileDir) resolves outside, or equal to, `$HermesRoot\profiles; refusing to touch its whole profile.")
         exit 1
     }
     $dataLink = Join-Path $ProfileDir 'mnemosyne'
@@ -1335,9 +1356,10 @@ foreach ($role in $Profiles.Keys) {
         [Console]::Error.WriteLine("Cannot resolve $name's profile directory: $profileDir")
         exit 1
     }
-    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
-            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
-        [Console]::Error.WriteLine("$name's profile directory ($profileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+    if (((-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal)) `
+            -and (-not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal))) `
+            -or ($profileDirReal -ieq $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$name's profile directory ($profileDir) resolves outside, or equal to, `$HermesRoot\profiles; refusing to touch its whole profile.")
         exit 1
     }
 
@@ -1411,12 +1433,18 @@ foreach ($role in $Profiles.Keys) {
     if ($mnemoLinkKind -eq 'copy') { $copied += "$name (mnemosyne plugin)" }
 
     # The plugin link above shares Mnemosyne's *code*. It does not share its
-    # *data*: the database path resolves from a MNEMOSYNE_HOME the Mnemosyne
-    # plugin itself computes at runtime, which defaults to
-    # $HERMES_HOME\mnemosyne - and a named profile has redirected
-    # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
-    # dedicated bank, unless -SeparateMemory asked for isolation. The
-    # operator's own bank ($HermesRoot\mnemosyne) is never a candidate here.
+    # *data*: the database path is steered by MNEMOSYNE_DATA_DIR / MNEMOSYNE_HOME,
+    # which this installer pins into each profile's own .env (Set-MnemosyneDataDirPin,
+    # above) so a directly-launched profile beats whatever the launching shell, the
+    # gateway, or the Windows User-scope environment already set
+    # (hermes_cli/env_loader.py:502-562 load_hermes_dotenv, override=True at :560).
+    # That pin does nothing for a profile run through a multiplex gateway -- the
+    # routed profile's own .env load is skipped there (env_loader.py:535-547) -- or
+    # for a managed worker, which returns before reading any .env at all
+    # (env_loader.py:513-515; agent/managed_worker.py:139-143). Point each profile's
+    # Mnemosyne data root at the team's dedicated bank, unless -SeparateMemory asked
+    # for isolation. The operator's own bank ($HermesRoot\mnemosyne) is never a
+    # candidate here.
     if (-not $SeparateMemory) {
         Invoke-MnemosyneDataLink -ProfileDir $profileDir -Name $name -Exists $exists `
             -TeamMemoryHome $TeamMemoryHome -AdoptTeamMemory:$AdoptTeamMemory -AdoptTimestamp $AdoptTimestamp `

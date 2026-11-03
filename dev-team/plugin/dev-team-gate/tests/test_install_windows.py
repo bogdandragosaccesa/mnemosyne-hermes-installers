@@ -117,6 +117,66 @@ class WindowsInstallerTests(unittest.TestCase):
                  "adopted directory is not moved aside as a backup")
         self.has("out of scope", self.text, "no out-of-scope note for merging old memories")
 
+    _PS51_LEGACY_ENCODING_PRELUDE = (
+        "$PSDefaultParameterValues['Set-Content:Encoding'] = 'Latin1'\n"
+        "$PSDefaultParameterValues['Add-Content:Encoding'] = 'Latin1'\n"
+        "$PSDefaultParameterValues['Get-Content:Encoding'] = 'Latin1'\n"
+    )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_env_pin_writes_utf8_even_under_ps51_ansi_defaults(self):  # review r3 minor #1
+        """pwsh 7 on Linux already defaults Get/Set/Add-Content to UTF-8, so a
+        naive version of this test is green before the fix. Model PS 5.1's
+        ANSI-code-page default explicitly via $PSDefaultParameterValues so an
+        unfixed Set-EnvVarPin (relying on those cmdlets' defaults) fails here
+        the same way it would on the real CI target. An explicit encoding or
+        a .NET call is unaffected by these defaults, which is the fix."""
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            bank = Path(tmp) / "Dr\u0103go\u0219" / "bank"
+            harness = Path(tmp) / "env_pin.ps1"
+            harness.write_text(
+                self._PS51_LEGACY_ENCODING_PRELUDE
+                + _function(self.text, "Set-EnvVarPin") + "\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '{bank}'\n"
+                + "Write-Output 'PIN_DONE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PIN_DONE", proc.stdout)
+            raw = (profile_dir / ".env").read_bytes()
+            decoded = raw.decode("utf-8")  # strict: raises/mismatches on ANSI-mangled bytes
+            self.assertEqual(decoded.strip(), f"MNEMOSYNE_HOME={bank}")
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), ".env must have no UTF-8 BOM")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_env_pin_rewrite_keeps_non_ascii_existing_lines_byte_exact(self):  # review r3 minor #1
+        """--clone copies the operator's root .env, and Set-EnvVarPin rewrites
+        that file in place -- a pre-existing non-ASCII line (comment or an
+        unrelated key) must survive the rewrite byte-exact, under the same
+        PS 5.1 ANSI-default modelling as the write test above."""
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            env_file = profile_dir / ".env"
+            env_file.write_bytes("# Dr\u0103go\u0219\nOTHER=\u0103\u0219\nMNEMOSYNE_HOME=/old\n".encode("utf-8"))
+            harness = Path(tmp) / "env_pin_rewrite.ps1"
+            harness.write_text(
+                self._PS51_LEGACY_ENCODING_PRELUDE
+                + _function(self.text, "Set-EnvVarPin") + "\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new'\n"
+                + "Write-Output 'PIN_DONE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            raw = env_file.read_bytes()
+            lines = raw.decode("utf-8").splitlines()
+            self.assertIn("# Dr\u0103go\u0219", lines, "non-ASCII comment line not preserved byte-exact")
+            self.assertIn("OTHER=\u0103\u0219", lines, "non-ASCII value line not preserved byte-exact")
+            self.assertIn("MNEMOSYNE_HOME=/new", lines)
+            self.assertNotIn("MNEMOSYNE_HOME=/old", lines)
+
     def _profile_dir_guard_harness(self, tmp, hermes_root, profile_dir, plugin_src_mnemo):
         """F2 (review r3): the real per-profile-loop prefix, from
         $profileDir's assignment through the plugins\\mnemosyne link --
@@ -179,6 +239,38 @@ class WindowsInstallerTests(unittest.TestCase):
                               "dev-team-prefix must not have been written to the operator root")
             self.assertEqual(_snapshot_tree(root / "plugins"), before_plugins,
                              "operator plugins\\ must be byte-identical (no delete, no self-link)")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_profile_dir_guard_refuses_profile_dir_equal_to_profiles_root(self):  # F2 equality, review r3 minor #4
+        """profiles\\dev-qa -> profiles (the profiles root itself, not merely
+        a path nested under it) must also be refused. Test-PathIsOrUnder
+        treats Desc -ieq Anc as is-or-under, so the guard used to ACCEPT a
+        profile dir that resolves to exactly $HermesRoot\\profiles and write
+        SOUL.md / the prefix file / the plugin link straight into it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            (root / "SOUL.md").write_text("operator soul\n")
+            plugin_src = root / "plugins" / "mnemosyne"
+            plugin_src.mkdir(parents=True)
+            (plugin_src / "marker.txt").write_text("plugin code\n")
+            before_plugins = _snapshot_tree(root / "plugins")
+            profiles_dir = root / "profiles"
+            profiles_dir.mkdir()
+            evil_profile = profiles_dir / "dev-qa"
+            evil_profile.symlink_to(profiles_dir)
+            harness = self._profile_dir_guard_harness(tmp, root, evil_profile, plugin_src)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("outside", proc.stderr)
+            self.assertNotIn("REACHED_PLUGIN_LINK", proc.stdout)
+            self.assertFalse((profiles_dir / "SOUL.md").exists(),
+                              "SOUL.md must not have been written into profiles\\ itself")
+            self.assertFalse((profiles_dir / "dev-team-prefix").exists(),
+                              "dev-team-prefix must not have been written into profiles\\ itself")
+            self.assertEqual(_snapshot_tree(root / "plugins"), before_plugins,
+                             "profiles\\ plugins must be byte-identical (no plugin link written)")
 
     def _separate_memory_harness(self, tmp, profile_dir, dry_run):
         """R3-1: the REAL per-profile-loop slice that runs right after the
@@ -1504,7 +1596,7 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
             self.assertIn(f"MNEMOSYNE_HOME={profile_dir / 'mnemosyne'}", env_file.read_text())  # F1 (review r3)
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
-    def test_separate_memory_path_links_and_pins_the_team_bank(self):
+    def test_new_profile_with_no_existing_mnemosyne_links_and_pins_the_team_bank(self):  # review r3 minor #4c
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "hermes"
             (root / "mnemosyne" / "data").mkdir(parents=True)
