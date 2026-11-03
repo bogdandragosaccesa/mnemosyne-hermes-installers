@@ -381,12 +381,62 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertEqual((new / "deciders-ledger.jsonl").read_text(), "ledger-data")
             self.assertFalse((new / "old-team-home").exists(), "data nested one level too deep")
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_N2_N4_conflict_text_relinks_to_the_root_and_hides_the_sentinel(self):
-        # Review r2 N2/N4 (static): the conflict block must not print a
-        # comment naming an installer-internal function as the relink step,
-        # and must not show the '__root_link__' sentinel to the user.
-        self.assertNotIn("# relink ${profileName}: New-DirLink", self.text)
-        self.assertNotIn("linked from: $($entry.Profiles -join ' ')", self.text)
+        # Review r2 N2/N4 (behavioural): drive a real conflict where one
+        # candidate is keyed '__root_link__' (the root dev-team link
+        # itself, not a named profile) and assert on
+        # Resolve-TeamHomeMigrationPlan's actual output -- not on static
+        # source-text patterns that could pass while the real message
+        # still leaks the sentinel or names an internal function.
+        #
+        # Old (static) assertions this replaces, and their behavioural
+        # equivalents below:
+        #   1. assertNotIn("# relink ${profileName}: New-DirLink", self.text)
+        #      -> replaced by: every relink line in the real conflict
+        #      message is a '#' comment telling the operator to re-run
+        #      the installer (proves the fixed relink step is what the
+        #      function actually emits, not merely absent from a
+        #      hand-picked source string).
+        #   2. assertNotIn("linked from: $($entry.Profiles -join ' ')", self.text)
+        #      -> replaced by: '__root_link__' never appears anywhere in
+        #      the real message, and "the root dev-team link" does
+        #      appear (proves the sentinel is translated for the
+        #      operator in the function's actual output).
+        # Both old checks are preserved as behaviour, not weakened: the
+        # old test could only ever fail to notice a reintroduced literal
+        # with a slightly different spelling; this one fails whenever
+        # the real conflict text leaks the sentinel or drops the comment
+        # prefix, regardless of exact source wording.
+        with tempfile.TemporaryDirectory() as tmp:
+            root_old = Path(tmp) / "root-area" / "dev-team"
+            root_old.mkdir(parents=True)
+            (root_old / "deciders-ledger.jsonl").write_text("root-ledger")
+            pm_old = Path(tmp) / "pm-area" / "dev-team"
+            pm_old.mkdir(parents=True)
+            (pm_old / "model-tiers.json").write_text("pm-tiers")
+            new = Path(tmp) / "new-team-home"
+            harness = self._plan_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    "$candidates = @{ '__root_link__' = '" + str(root_old) + "'; "
+                    "'dev-pm' = '" + str(pm_old) + "' }\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' -CandidateTargets $candidates\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output $r.Message\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=conflict", proc.stdout, "no conflict was produced")
+            self.assertNotIn("__root_link__", proc.stdout,
+                              "the sentinel key leaked into the operator-facing message")
+            self.assertIn("the root dev-team link", proc.stdout,
+                           "the root-link candidate was not described in plain language")
+            relink_lines = [ln.strip() for ln in proc.stdout.splitlines()
+                             if "re-run this installer" in ln]
+            self.assertTrue(relink_lines, "no relink-and-re-run line in the conflict message")
+            for ln in relink_lines:
+                self.assertTrue(ln.startswith("#"), f"relink line is not a '#' comment: {ln!r}")
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_migration_refuses_when_both_homes_hold_data(self):
