@@ -75,7 +75,8 @@ def _find_dotenv_python():
     return None
 
 
-MNEMOSYNE_VENV_PYTHON = Path("/home/bogdan-dragos/.mnemosyne-venv/bin/python3")
+MNEMOSYNE_VENV_PYTHON = Path(os.environ.get("MNEMOSYNE_VENV_PYTHON")
+                              or (Path.home() / ".mnemosyne-venv" / "bin" / "python3"))
 
 
 def _read_env_value_via_mnemosyne_reader(env_file, var_name):
@@ -585,6 +586,43 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertIn("--team-memory contains a newline", proc.stderr)
         self.assertFalse((self.root / "profiles").exists())
 
+    def test_team_memory_symlink_target_with_hash_is_refused(self):  # review round 2 of fix round 1, finding 1(a)
+        """env_value_unsafe_reason() used to run only on the RAW
+        --team-memory string, before path resolution. A symlink whose
+        TARGET contains the refused ' #' shape sailed through the raw
+        check, got resolved by _resolve_or_die(), and was pinned
+        unquoted -- exactly the shape python-dotenv truncates. The guard
+        must cover the value that is actually resolved and pinned, not
+        just the argument as typed."""
+        real_bank = self.tmp / "real #bank"
+        real_bank.mkdir()
+        safe_link = self.tmp / "safe-link"
+        safe_link.symlink_to(real_bank)
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", str(safe_link), "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace immediately followed by '#'", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
+    def test_relative_team_memory_under_a_hash_cwd_is_refused(self):  # review round 2 of fix round 1, finding 1(b)
+        """A relative --team-memory is resolved against the installer's
+        cwd (finding #3, test_team_memory_flag_is_made_absolute_before_use
+        above). When that cwd itself contains the refused ' #' shape, the
+        RAW argument ('relbank') looks perfectly safe, but the resolved
+        path that actually gets pinned does not. Must be refused before
+        anything is written."""
+        cwd = self.tmp / "cwd #x"
+        cwd.mkdir()
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = subprocess.run(
+            ["bash", str(INSTALLER), "--skip-model", "--team-memory", "relbank", "--only", "qa"],
+            cwd=str(cwd), env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace immediately followed by '#'", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
     def test_team_memory_accepts_safe_special_characters_and_round_trips(self):  # item 4a, operator round-2 decision
         """'&', '|', a non-edge quote, a non-edge backslash and non-ASCII
         are all safe under the unquoted-no-escaping format (F4's original
@@ -619,16 +657,17 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         mnemosyne_home, mnemosyne_home_reason = _read_env_value_via_mnemosyne_reader(
             env_file, "MNEMOSYNE_HOME")
         if mnemosyne_data_reason or mnemosyne_home_reason:
-            # Fall back to a reimplementation of the one-line rule
-            # (mcp_server.py: `v.strip().strip("'\"")`), and say so loudly:
-            # this is the ONLY branch that does not exercise the real
-            # module, and only because it could not be imported here.
-            print("WARNING: mnemosyne.mcp_server not importable "
-                  f"({mnemosyne_data_reason or mnemosyne_home_reason}); "
-                  "falling back to a reimplementation of its one-line "
-                  "v.strip().strip(\"'\\\"\") rule for this assertion.")
-            mnemosyne_data = data_lines[0][len("MNEMOSYNE_DATA_DIR="):].strip().strip("'\"")
-            mnemosyne_home = home_lines[0][len("MNEMOSYNE_HOME="):].strip().strip("'\"")
+            # Finding 2 (review round 2 of fix round 1): a print() here
+            # let this branch pass invisibly in CI -- the WARNING scrolled
+            # past with no trace in the result summary. skipTest instead,
+            # same as the python-dotenv branch below, so a CI run that
+            # cannot reach the real reader reports it as a skip, not a
+            # silent pass under a reimplementation.
+            self.skipTest(
+                "mnemosyne.mcp_server not importable "
+                f"({mnemosyne_data_reason or mnemosyne_home_reason}); "
+                "cannot exercise the real Mnemosyne reader for this assertion")
+            return
         self.assertEqual(mnemosyne_data, expected_data)
         self.assertEqual(mnemosyne_home, expected_home)
 

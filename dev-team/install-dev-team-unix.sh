@@ -534,6 +534,58 @@ if [[ -n "$_team_memory_refusal" ]]; then
     exit 2
 fi
 
+# Review round 2 of fix round 1 (safety finding): env_value_unsafe_reason()
+# above runs only on the RAW --team-memory string (_raw_team_memory),
+# before resolve_abs_nearest. But every .env pin below is written from a
+# RESOLVED path -- TEAM_MEMORY_HOME / TEAM_MEMORY_HOME/data (pin site:
+# pin_mnemosyne_data_dir, call sites further down), or
+# $profile_dir/mnemosyne[/data] when --separate-memory applies, or a
+# profile keeps its own private bank. Resolution -- following a symlink,
+# or joining a relative path against an unsafe cwd, or a tainted
+# $HERMES_ROOT -- can introduce the one byte sequence the raw check was
+# written to catch, which the raw check alone never sees (repro: a
+# --team-memory symlink whose TARGET contains ' #'; a relative
+# --team-memory run from a cwd containing ' #'; a tainted $HERMES_ROOT
+# surfacing in $HERMES_ROOT/profiles/<name>/mnemosyne). Check every value
+# this run will actually pin, for every profile that will be touched,
+# BEFORE the mutation loop below creates or writes to ANY profile -- not
+# inside set_env_var mid-loop, where an earlier profile would already be
+# on disk by the time a later one's unsafe value is caught. Message
+# blames --team-memory only when the user actually passed it; otherwise
+# it points at the default location (derived from $HERMES_ROOT) instead.
+_check_pin_value_or_die() {  # value description(no-raw-check)
+    local _reason
+    _reason="$(env_value_unsafe_reason "$1")"
+    [[ -n "$_reason" ]] || return 0
+    echo "$2 $_reason; it would not read back identically from .env. Pick a path without that." >&2
+    exit 2
+}
+if [[ -n $SHARED_DATA ]]; then
+    if [[ -n "${TEAM_MEMORY:-}" ]]; then
+        _team_home_subject="--team-memory's resolved path ($_team_home_real)"
+        _team_data_subject="--team-memory's resolved data path ($_team_home_real/data)"
+    else
+        _team_home_subject="the default team memory bank path ($_team_home_real, under \$HERMES_ROOT)"
+        _team_data_subject="the default team memory bank's data path ($_team_home_real/data, under \$HERMES_ROOT)"
+    fi
+    _check_pin_value_or_die "$_team_home_real" "$_team_home_subject"
+    _check_pin_value_or_die "$_team_home_real/data" "$_team_data_subject"
+fi
+for _preflight_role in "${NAMES[@]}"; do
+    selected "$_preflight_role" || continue
+    _preflight_name="$PREFIX$_preflight_role"
+    if hermes profile show "$_preflight_name" >/dev/null 2>&1; then
+        _preflight_profile_dir="$(dirname "$(hermes -p "$_preflight_name" config path)")"
+    else
+        _preflight_profile_dir="$HERMES_ROOT/profiles/$_preflight_name"
+    fi
+    _check_pin_value_or_die "$_preflight_profile_dir/mnemosyne" \
+        "$_preflight_name's resolved mnemosyne home path (\$HERMES_ROOT/profiles/$_preflight_name/mnemosyne)"
+    _check_pin_value_or_die "$_preflight_profile_dir/mnemosyne/data" \
+        "$_preflight_name's resolved mnemosyne data path (\$HERMES_ROOT/profiles/$_preflight_name/mnemosyne/data)"
+done
+unset _preflight_role _preflight_name _preflight_profile_dir _team_home_subject _team_data_subject
+
 # F1 (review r3): also pin MNEMOSYNE_HOME alongside MNEMOSYNE_DATA_DIR.
 # MNEMOSYNE_DATA_DIR only steers the CLI (mnemosyne/cli.py:20-23) and
 # call-time modules (core/banks.py, core/triples.py, core/canonical.py,
