@@ -85,8 +85,16 @@ class WindowsInstallerTests(unittest.TestCase):
 
     def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
         # Both the dry-run and real-run key notes used to say "add
-        # OPENROUTER_DECIDERS_KEY to each profile's .env".
-        self.assertNotIn(".env", self.text, "still points at a plaintext .env file")
+        # OPENROUTER_DECIDERS_KEY to each profile's .env". Checks the
+        # OpenRouter guidance specifically rather than banning the bare
+        # substring ".env" everywhere: D1's fix legitimately writes
+        # MNEMOSYNE_DATA_DIR (never a secret) into each profile's own .env,
+        # which is an unrelated, non-credential use of the same file name.
+        occurrences = [m.start() for m in re.finditer(r"OpenRouter key for deciders", self.text)]
+        self.assertTrue(occurrences, "no OpenRouter key guidance found")
+        for idx_start in occurrences:
+            window = self.text[idx_start: idx_start + 200]
+            self.assertNotIn(".env", window, f"OpenRouter guidance still points at .env: {window!r}")
         self.has("setx OPENROUTER_DECIDERS_KEY", self.text,
                  "no setx guidance for a user environment variable")
 
@@ -1013,6 +1021,74 @@ class WindowsTeamMemoryTests(unittest.TestCase):
             (Path(tmp) / "outer").symlink_to(Path(tmp) / "rel")
             self._assert_refused(self._run_harness(tmp, root, Path(tmp) / "outer" / "mnemosyne" / "x"))
 
+    # --- D1: MNEMOSYNE_DATA_DIR is the variable that actually controls
+    # Mnemosyne's data directory, so it must be treated as an operator
+    # location exactly like MNEMOSYNE_HOME.
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_mnemosyne_data_dir_env_var(self):  # D1
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            decoy = Path(tmp) / "decoy-data-dir"
+            decoy.mkdir()
+            proc = self._run_harness(tmp, root, decoy, env_extra={"MNEMOSYNE_DATA_DIR": str(decoy)})
+        self._assert_refused(proc, needle="MNEMOSYNE_DATA_DIR")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_mnemosyne_data_dir_user_scope_value(self):  # D1
+        # The Windows Mnemosyne installer persists a relocated bank as a
+        # User-scope environment variable (no live session variable
+        # needed for a NEW process to see it) -- simulate that by reading
+        # it back with the same [Environment]::GetEnvironmentVariable
+        # call the installer uses, redirected to a throwaway registry-like
+        # store is not practical in a unit test, so this checks the
+        # fallback branch exists and is wired to the refusal, via the
+        # static source check below plus the live env-var path above
+        # (same code path, 'User' is just a different GetEnvironmentVariable
+        # scope argument that cannot be faked without the real registry).
+        body = _function(self.text, "Test-TouchesOperatorBank")
+        source_text = self.text[max(0, self.text.index("_mnemosyneDataDirRaw") - 400):
+                                 self.text.index("_mnemosyneDataDirRaw") + 400]
+        self.assertIn("GetEnvironmentVariable('MNEMOSYNE_DATA_DIR', 'User')", source_text)
+        self.assertIn("_mnemosyneDataDirReal", body)
+
+    # --- D5: -TeamMemory inside profiles\ or dev-team\ breaks every link
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_path_under_profiles_directory(self):  # D5
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            proc = self._run_harness(tmp, root, root / "profiles" / "dev-qa" / "mnemosyne")
+        self._assert_refused(proc, needle="profile directory")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_path_under_dev_team_directory(self):  # D5
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            proc = self._run_harness(tmp, root, root / "dev-team" / "mnemosyne")
+        self._assert_refused(proc, needle="dev-team")
+
+    # --- D4: a bind mount (device+inode identity, read via `stat` on the
+    # non-Windows pwsh this suite runs under) gives a path identical to the
+    # operator bank with no symlink in it anywhere.
+    @unittest.skipUnless(shutil.which("pwsh") and shutil.which("unshare"), "needs pwsh and unshare")
+    def test_team_memory_refuses_an_alias_via_bind_mount(self):  # D4
+        import shlex
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            alias = Path(tmp) / "bind-alias"
+            alias.mkdir()
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(alias))
+            script = (
+                f"export HOME={shlex.quote(str(Path(tmp)))}\n"
+                f"mount --bind {shlex.quote(str(root / 'mnemosyne'))} {shlex.quote(str(alias))} || exit 99\n"
+                f"exec pwsh -NoProfile -NonInteractive -File {shlex.quote(str(harness))}\n"
+            )
+            proc = subprocess.run(
+                ["unshare", "--mount", "--map-root-user", "--propagation", "private", "bash", "-c", script],
+                capture_output=True, text=True, timeout=60)
+        if proc.returncode == 99 or "cannot create snap home dir" in proc.stderr:
+            self.skipTest("unprivileged bind mount + snap-confined pwsh unavailable in this sandbox")
+        self._assert_refused(proc)
+
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_team_memory_refuses_a_dangling_link_into_the_operator_bank(self):  # r3 #2
         with tempfile.TemporaryDirectory() as tmp:
@@ -1064,16 +1140,25 @@ class WindowsTeamMemoryTests(unittest.TestCase):
         self.assertIn(f"TEAM_HOME={Path(os.path.realpath(real)) / 'bank'}", proc.stdout)
 
     def test_relink_note_checks_both_operator_locations_by_containment(self):  # r3 #4
-        start = self.text.index("Re-run, already a junction")
-        block = self.text[start:self.text.index("$kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome", start)]
-        self.assertIn("Test-PathIsOrUnder -Anc $_operatorHomeReal", block)
-        self.assertIn("Test-PathIsOrUnder -Anc $_mnemosyneHomeReal", block)
+        start = self.text.index("function Invoke-MnemosyneDataLink")
+        end = self.text.index("\n}\n", start)
+        block = self.text[start:end]
+        self.assertIn("Test-TouchesOperatorBank", block)
         self.assertIn("Resolve-TeamMemoryRealPath", block)
+        # Test-TouchesOperatorBank itself (defined alongside the refusal
+        # logic, above) is what actually checks both locations -- assert
+        # that on its own body too, so a future refactor that drops one of
+        # them out of touches_operator_bank still fails this test.
+        touches_body = _function(self.text, "Test-TouchesOperatorBank")
+        self.assertIn("$_operatorHomeReal", touches_body)
+        self.assertIn("$_mnemosyneHomeReal", touches_body)
+        self.assertIn("$_mnemosyneDataDirReal", touches_body)
 
     def _note_harness(self, tmp, root, data_link):
-        """The setup snippet plus the real relink-NOTE block, run live."""
+        """The setup snippet plus the real relink-NOTE block (now inside
+        Invoke-MnemosyneDataLink, D6), run live."""
         harness = self._team_memory_harness(tmp, root)
-        start = self.text.index("            if ($isLink) {", self.text.index("Re-run, already a junction"))
+        start = self.text.index("    if ($isLink) {\n        $prevTarget = $null")
         end = self.text.index("$kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome", start)
         harness.write_text(harness.read_text() +
                            f"$dataLink = '{data_link}'\n$isLink = $true\n" + self.text[start:end] + "\n")
@@ -1101,6 +1186,150 @@ class WindowsTeamMemoryTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                     note = f"NOTE: {link} was linked to the operator's own bank"
                     (self.assertIn if expect else self.assertNotIn)(note, proc.stdout)
+
+
+class WindowsMnemosyneDataLinkTests(unittest.TestCase):
+    """D2/D3/D6/D8: Invoke-MnemosyneDataLink, run directly with pwsh (the
+    extraction D6 asked for -- the same move already made for
+    Resolve-TeamHomeMigrationPlan)."""
+
+    def setUp(self):
+        self.text = PS1.read_text(encoding="utf-8")
+
+    def _datalink_harness(self, tmp, hermes_root, call_kwargs, dry_run=False):
+        start = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        end = self.text.index("# Team state (forge project records")
+        snippet = self.text[start:end]
+        fn_start = self.text.index("function Invoke-MnemosyneDataLink")
+        fn_end = self.text.index("\n}\n", fn_start) + 2
+        fn_body = self.text[fn_start:fn_end]
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        dirlink_fn = _function(self.text, "New-DirLink")
+        harness = Path(tmp) / "datalink_harness.ps1"
+        kwargs_lines = "\n".join(f"${k} = {v}" for k, v in call_kwargs.items())
+        harness.write_text(
+            f"$HermesRoot = '{hermes_root}'\n$TeamMemory = $null\n"
+            + norm_fn + "\n" + dirlink_fn + "\n" + snippet + "\n" + fn_body +
+            "\nNew-Item -ItemType Directory -Path $TeamMemoryHome -Force | Out-Null\n"
+            f"\n{kwargs_lines}\n"
+            f"$r = Invoke-MnemosyneDataLink -ProfileDir $ProfileDirArg -Name $NameArg -Exists $ExistsArg "
+            f"-TeamMemoryHome $TeamMemoryHome -AdoptTeamMemory:$AdoptArg -AdoptTimestamp $TsArg "
+            f"-DryRun:${'true' if dry_run else 'false'} -HermesRootProfilesReal $HermesRootProfilesReal\n"
+            f"Write-Output \"RESULT_COPIED=$($r.Copied)\"\nWrite-Output \"RESULT_ADOPTED=$($r.Adopted)\"\n"
+            f"Write-Output \"RESULT_UNSHARED=$($r.Unshared)\"\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D2_refuses_when_profile_dir_resolves_outside_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            (root / "mnemosyne" / "data").mkdir(parents=True)
+            # Reviewer's repro: the profile dir is itself a symlink to the root.
+            profiles_dir = root / "profiles"
+            profiles_dir.mkdir()
+            evil_profile = profiles_dir / "dev-qa"
+            evil_profile.symlink_to(root)
+            kwargs = {
+                "ProfileDirArg": f"'{evil_profile}'", "NameArg": "'dev-qa'", "ExistsArg": "$true",
+                "AdoptArg": "$true", "TsArg": "'20261103000000'",
+            }
+            harness = self._datalink_harness(tmp, root, kwargs)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("outside", proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D3_backup_collision_gets_a_unique_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            (root / "mnemosyne" / "data").mkdir(parents=True)
+            profile_dir = root / "profiles" / "dev-qa"
+            (profile_dir / "mnemosyne" / "data").mkdir(parents=True)
+            (profile_dir / "mnemosyne" / "data" / "mnemosyne.db").write_text("qa's own memories")
+            # Pre-create the exact backup path a fixed timestamp would use.
+            collide = profile_dir / "mnemosyne.pre-team-memory-20261103105748"
+            collide.mkdir()
+            (collide / "pre-existing.txt").write_text("unrelated contents")
+            kwargs = {
+                "ProfileDirArg": f"'{profile_dir}'", "NameArg": "'dev-qa'", "ExistsArg": "$true",
+                "AdoptArg": "$true", "TsArg": "'20261103105748'",
+            }
+            harness = self._datalink_harness(tmp, root, kwargs)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((collide / "pre-existing.txt").read_text(), "unrelated contents")
+            moved = profile_dir / "mnemosyne.pre-team-memory-20261103105748.1"
+            self.assertEqual((moved / "data" / "mnemosyne.db").read_text(), "qa's own memories")
+            self.assertIn("RESULT_ADOPTED=True", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D8_dry_run_with_adopt_reports_would_back_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            (root / "mnemosyne" / "data").mkdir(parents=True)
+            profile_dir = root / "profiles" / "dev-qa"
+            (profile_dir / "mnemosyne" / "data").mkdir(parents=True)
+            (profile_dir / "mnemosyne" / "data" / "mnemosyne.db").write_text("qa's own memories")
+            kwargs = {
+                "ProfileDirArg": f"'{profile_dir}'", "NameArg": "'dev-qa'", "ExistsArg": "$true",
+                "AdoptArg": "$true", "TsArg": "'20261103105748'",
+            }
+            harness = self._datalink_harness(tmp, root, kwargs, dry_run=True)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(f"would back up: {profile_dir / 'mnemosyne'} ->", proc.stdout)
+            self.assertIn("would link:", proc.stdout)
+            # Dry run: nothing actually moved.
+            self.assertTrue((profile_dir / "mnemosyne" / "data" / "mnemosyne.db").exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_keep_private_path_pins_the_profiles_own_data_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            (root / "mnemosyne" / "data").mkdir(parents=True)
+            profile_dir = root / "profiles" / "dev-qa"
+            (profile_dir / "mnemosyne" / "data").mkdir(parents=True)
+            (profile_dir / "mnemosyne" / "data" / "mnemosyne.db").write_text("qa's own memories")
+            kwargs = {
+                "ProfileDirArg": f"'{profile_dir}'", "NameArg": "'dev-qa'", "ExistsArg": "$true",
+                "AdoptArg": "$false", "TsArg": "'20261103105748'",
+            }
+            harness = self._datalink_harness(tmp, root, kwargs)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("RESULT_UNSHARED=True", proc.stdout)
+            env_file = profile_dir / ".env"
+            self.assertIn(f"MNEMOSYNE_DATA_DIR={profile_dir / 'mnemosyne' / 'data'}", env_file.read_text())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_separate_memory_path_links_and_pins_the_team_bank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            (root / "mnemosyne" / "data").mkdir(parents=True)
+            profile_dir = root / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            kwargs = {
+                "ProfileDirArg": f"'{profile_dir}'", "NameArg": "'dev-qa'", "ExistsArg": "$false",
+                "AdoptArg": "$false", "TsArg": "'20261103105748'",
+            }
+            harness = self._datalink_harness(tmp, root, kwargs)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            # New-Item -ItemType Junction is a documented Windows-only
+            # reparse point; on this non-Windows pwsh sandbox it returns
+            # success without creating anything on disk (a platform
+            # limitation of PowerShell Core on Linux, not of this
+            # installer -- WindowsInstallerTests.test_new_dirlink_... only
+            # checks New-DirLink's source text for the same reason). The
+            # D1 pin this test exists for is independent of that and is
+            # checked below.
+            env_file = profile_dir / ".env"
+            self.assertIn(f"MNEMOSYNE_DATA_DIR={root / 'dev-team-mnemosyne' / 'data'}", env_file.read_text())
 
 
 class WorkflowTests(unittest.TestCase):
