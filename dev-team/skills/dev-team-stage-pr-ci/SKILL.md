@@ -17,15 +17,23 @@ name: `forge`. Every other soul and skill in `dev-team` stays vendor-neutral.
 by the time a `pr-ci` card runs, the project record below should already exist. Treat the steps
 here as the fallback for when it doesn't:
 
-Check whether a project record already exists at
-`$HERMES_HOME/dev-team/projects/<repo-slug>.json` (`<repo-slug>` is the `repo` string the
-intake card recorded — see `dev-team-stage-intake`). If it does not:
+Resolve the canonical team-home path first — `$HERMES_HOME` is per profile, but every profile's
+`dev-team` directory is a symlink into the same shared tree, so `pwd -P` from inside it gives
+the one real path every profile agrees on:
+
+```
+TEAM_HOME="$(cd "$HERMES_HOME/dev-team" && pwd -P)"
+```
+
+Check whether a project record already exists at `$TEAM_HOME/projects/<repo-slug>.json`
+(`<repo-slug>` is the `repo` string the intake card recorded — see `dev-team-stage-intake`). If
+it does not:
 
 1. Clone the repository — never the operator's own clone — to
-   `$HERMES_HOME/dev-team/repos/<repo-slug>/`.
+   `$TEAM_HOME/repos/<repo-slug>/`.
 2. Add `.worktrees/` to that clone's `.git/info/exclude` (local only — never committed, never
    written into the target repository itself).
-3. Run `forge detect --repo-dir $HERMES_HOME/dev-team/repos/<repo-slug>/ --slug <repo-slug>`
+3. Run `forge detect --repo-dir $TEAM_HOME/repos/<repo-slug>/ --slug <repo-slug>`
    (`--repo-dir` is required; always pass `--slug` with intake's `repo` string explicitly —
    without it, `forge detect` defaults the slug to the clone directory's name, not intake's
    `repo`). If it exits `2` with `"ambiguous: pass --pr-adapter"`, decide the PR and CI
@@ -34,14 +42,23 @@ intake card recorded — see `dev-team-stage-intake`). If it does not:
    reads `repo_url` from the clone's `git remote get-url origin` (with any credentials in the
    URL stripped) and `default_branch` from `git symbolic-ref refs/remotes/origin/HEAD`. If it
    exits `2` saying it cannot read the default branch, run
-   `git -C $HERMES_HOME/dev-team/repos/<repo-slug>/ remote set-head origin --auto` and re-run
+   `git -C $TEAM_HOME/repos/<repo-slug>/ remote set-head origin --auto` and re-run
    it. It refuses to overwrite an existing record; if the record is genuinely wrong (the
    repository moved, or its default branch changed), block with `forge: record-stale` and let
    the operator decide whether to re-run with `--force`. A slug containing `/`, `\`, or equal
    to `.` or `..` is refused. Credentials never go in the record.
-5. Set the board's `default_workdir` to that team-owned clone
-   (`hermes kanban boards set-default-workdir`), so every later card on this board works there
-   instead of in the operator's checkout.
+5. Check the board's `default_workdir` (`hermes kanban boards list --json`, find the entry
+   whose `slug` is `<repo-slug>`, read its `default_workdir` field) against `$TEAM_HOME/repos/<repo-slug>/`.
+   The pm sets `default_workdir` at board-creation time (`running-the-pipeline`'s
+   `--default-workdir`, already written in this same canonical form) — this step never sets or
+   changes it. Compare **resolved real paths, not raw strings**: `realpath` both sides
+   (`realpath "<default_workdir>"` vs. `realpath "$TEAM_HOME/repos/<repo-slug>"`) and ignore a
+   trailing slash — the stored value and your own clone path are produced by two different
+   profiles' shells and are not guaranteed to be byte-identical even when they name the same
+   directory. If the resolved paths differ, or `default_workdir` is missing, block with a clear
+   reason (e.g. `onboarding: default_workdir missing/mismatched — expected
+   $TEAM_HOME/repos/<repo-slug>/, got <default_workdir>`) and let the operator fix the board;
+   never mutate it yourself, and never fall back to the operator's own checkout.
 
 This record is what the guard itself reads later (`_record_default_branch`) to know which
 branch `git push` must never target on this project, and what `forge ci-status` resolves

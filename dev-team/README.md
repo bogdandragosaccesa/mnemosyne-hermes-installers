@@ -130,6 +130,8 @@ naming what couldn't be checked — the guard fails closed, never open.
 | `--skip-model` | `-SkipModel` | Leave each profile's model at whatever it inherited. |
 | `--keep-soul` | `-KeepSoul` | Do not overwrite an existing `SOUL.md`. |
 | `--separate-memory` | `-SeparateMemory` | Give each profile its own Mnemosyne database instead of sharing the root one. Roles then cannot read each other's notes, so the board no longer hands work between them cleanly. |
+| `--team-memory DIR` | `-TeamMemory` | Use `DIR` as the team's shared Mnemosyne bank instead of the default `$HERMES_ROOT/dev-team-mnemosyne`. Created if missing. `DIR` is made absolute before use (a relative value no longer becomes a dangling relative symlink or a bank created under the installer's cwd). Refused when it resolves to, is nested under, or contains the operator's own bank (`$HERMES_ROOT/mnemosyne`) or any `MNEMOSYNE_HOME` the operator has set — checked in both directions after canonicalising the path (`.`/`..` collapsed, every symlink/junction on it followed; a link cycle is refused). |
+| `--adopt-team-memory` | `-AdoptTeamMemory` | For each existing profile that already has a real, private `mnemosyne/` directory: move it aside to `mnemosyne.pre-team-memory-<timestamp>` (a backup, never deleted), then link it to the team bank. Without this flag such a directory is kept, unlinked, and named in the summary. Either way, merging old private memories into the team bank is out of scope for this installer — that is on the operator. |
 | `--dry-run` | `-DryRun` | Print what would happen and change nothing. |
 
 Both installers are idempotent (re-running upgrades the SOUL, model, plugin link and skills in
@@ -141,43 +143,119 @@ put `forge` where the gateway resolves it — `~/.local/bin/forge` on Unix, `for
 profile, exiting non-zero otherwise. The plugin checks are retried for a few seconds first, because
 right after `plugins enable` the list can lag the reload. If a `forge` already exists there and
 this installer didn't write it (Laravel Forge, Foundry), the installer refuses before it touches
-any profile; move the other tool aside and re-run. A profile this run creates gets its
-`mnemosyne` directory (the one `profile create --clone` makes) replaced by a link to the shared
-bank. A profile that already existed and has a real `mnemosyne` directory keeps it and is named in
-the final summary. Symlinks on Unix become
+any profile; move the other tool aside and re-run.
+
+**The team's shared memory bank is a dedicated directory**, `$HERMES_ROOT/dev-team-mnemosyne`
+(Windows: `Join-Path $HermesRoot 'dev-team-mnemosyne'`), created when missing. Every installed
+profile's `mnemosyne` links there unless `--separate-memory`/`-SeparateMemory` was passed. **The
+operator's own bank — `$HERMES_ROOT/mnemosyne`, any `MNEMOSYNE_HOME`, and any `MNEMOSYNE_DATA_DIR`
+the operator has set (including the Windows User-scope value the Mnemosyne installer persists
+after a `MNEMOSYNE_HOME`-based relocation) — is never linked into, read from, or written to by
+this installer**; none of those variables select the team bank, and `--team-memory`/`-TeamMemory`
+refuses a value that resolves to, is nested under, or contains the operator's own bank,
+`MNEMOSYNE_HOME`, or `MNEMOSYNE_DATA_DIR` (checked in both directions, and by filesystem identity —
+not just path string — so a bind mount, a Windows 8.3 short name, or a `subst` drive is caught
+too). `--team-memory` is also refused if it resolves under `$HERMES_ROOT/profiles` or
+`$HERMES_ROOT/dev-team`: either would break every profile's own link. The value is canonicalised
+before the check, and the canonical form is what gets created and linked: made absolute,
+`.`/`..`/repeated separators collapsed (also in the part that does not exist yet, so
+`$HERMES_ROOT/nonexist/../mnemosyne` is refused and `nonexist` is never created), and every
+symlink/junction anywhere on the path — live or dangling — followed, with a link cycle refused
+(exit 2). A relative value therefore cannot become a dangling relative symlink or create the bank
+under the installer's working directory. `--adopt-team-memory`/`-AdoptTeamMemory` canonicalises
+the profile directory and its `mnemosyne` before any move, and refuses rather than acts if the
+profile directory resolves outside `$HERMES_ROOT/profiles`, if `mnemosyne` resolves to the
+operator's own bank, or if it already is the team bank; an existing backup path (a directory or a
+link) is never merged into — a new, unique name is picked instead. `--dry-run`/`-DryRun` with
+`--adopt-team-memory` prints `would back up: <dir> -> <backup>` for each private bank it would
+move. On a re-run, a profile whose `mnemosyne` link pointed at, into, or above either operator
+location is repointed with a NOTE. A profile this run creates gets its `mnemosyne` directory (the
+one `profile
+create --clone` makes) replaced by a link to the team bank. A profile that already existed and
+has a real `mnemosyne` directory keeps it by default and is named in the final summary; pass
+`--adopt-team-memory`/`-AdoptTeamMemory` to move that directory aside as a timestamped backup
+(never deleted) and link it to the team bank instead — the installer never merges its old
+memories into the team bank itself. Symlinks on Unix become
 directory junctions on Windows (no Developer Mode or elevation needed), falling back to a copy
 with a warning when even a junction can't be created. On a re-run an existing junction is
 removed with `[System.IO.Directory]::Delete` and never with `Remove-Item -Recurse`. On Windows
-PowerShell 5.1 that cmdlet follows the junction and deletes the shared bank's contents.
+PowerShell 5.1 that cmdlet follows the junction and deletes the team bank's contents.
+
+**`MNEMOSYNE_DATA_DIR` is the variable that actually decides the CLI's and the call-time modules'
+data directory** — `mnemosyne/cli.py:20-23`, and `core/banks.py`, `core/triples.py`,
+`core/canonical.py` and `core/media.py` all check it before anything else. It does **not**,
+however, decide the Hermes provider's own main database: Hermes always injects `hermes_home`
+(`agent/memory_manager.py:920-923`), the provider builds that DB's path explicitly as
+`$HERMES_HOME/mnemosyne/data/…` (`mnemosyne_hermes/__init__.py:2690-2721`), and `BeamMemory`
+itself resolves an explicit path ahead of either env var (`mnemosyne/core/beam.py:5960`) — so the
+provider's main DB always follows the per-profile `mnemosyne/` link this installer sets up,
+regardless of `MNEMOSYNE_DATA_DIR`.
+
+**`MNEMOSYNE_HOME` is read by the installed Mnemosyne package itself** — contrary to an earlier
+version of this document — for the MCP shared-surface DB and federation:
+`mnemosyne/mcp_tools.py:167-173` builds the shared-surface DB path from it, and so do
+`core/fleet_census.py:149-155`, `core/federation_handshake.py:263-267` and `mcp_server.py:799`. If
+either `MNEMOSYNE_HOME` or `MNEMOSYNE_DATA_DIR` is set in the shell or gateway environment a
+`hermes -p dev-*` process launches from, it silently overrides this installer's links, the same
+way a live operator session was found to leak the operator's own bank into a `dev-pm` chat
+despite `profiles/dev-pm/mnemosyne` pointing at the team bank. This installer closes that gap by
+pinning **both** `MNEMOSYNE_DATA_DIR` and `MNEMOSYNE_HOME` into each profile's own `.env` file:
+Hermes loads a profile's `.env` with `override=True` specifically so it beats a value already in
+the process environment (`hermes_cli/env_loader.py:502-562`).
+
+**The pinned `.env` values do not win regardless, though: they do nothing in a multiplex
+gateway.** While a routed profile-home override is active, the gateway deliberately skips loading
+that profile's own `.env` into the shared process environment, to avoid exposing one profile's
+credentials to sibling turns (`env_loader.py:530-545`). A dev-team profile run through a
+multiplex gateway therefore still inherits whatever `MNEMOSYNE_HOME`/`MNEMOSYNE_DATA_DIR` the
+gateway process itself was launched with — the `.env` pin only protects a profile launched
+directly (`hermes -p dev-pm chat`, a cron fire, a worker spawn). **The gateway process, and every
+non-routed `hermes -p dev-*` launch, should still run with `MNEMOSYNE_HOME` and
+`MNEMOSYNE_DATA_DIR` unset.**
 
 ## Onboarding a project
 
 Each repository gets its own board and its own forge project record — the hard isolation
 boundary workers cannot see past. `pm`'s `running-the-pipeline` skill sequences a `devops`
-onboarding card *before* the first `implement` card ever runs, so the team's own clone, the
-project record, and the board's `default_workdir` exist first:
+onboarding card *before* the first `implement` card ever runs, so the team's own clone and the
+project record exist first. The pm sets the board's `default_workdir` at creation time —
+deterministic, pointing at the clone path devops will create — so onboarding never has a
+step that sets or changes it.
+
+`$HERMES_HOME` is set per installed profile, but every profile's `dev-team` directory is a
+symlink into the same shared tree, so resolve the canonical team-home path with `pwd -P` before
+using it — a raw `$HERMES_HOME/dev-team/...` string differs across profiles even when it names
+the same real directory:
 
 ```bash
-hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline"
-hermes kanban boards switch <repo-slug>
+TEAM_HOME="$(cd "$HERMES_HOME/dev-team" && pwd -P)"
+hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir "$TEAM_HOME/repos/<repo-slug>"
 ```
+
+Every later `hermes kanban` command that targets this board must name it explicitly with
+`--board <repo-slug>`. Nothing in the team runs `hermes kanban boards switch` — it mutates the
+machine-wide current board, shared across every repository and the operator's own session.
 
 Then devops runs `forge detect`, pointed at the team's own clone — never the operator's own
 checkout:
 
 ```bash
-forge detect --repo-dir ~/.hermes/dev-team/repos/<repo-slug>/ --slug <repo-slug>
+forge detect --repo-dir "$TEAM_HOME/repos/<repo-slug>/" --slug <repo-slug>
 ```
 
 `--slug` must be passed explicitly with intake's `repo` string; without it, `detect` falls back
 to the clone directory's name. A slug containing `/` or `\`, or equal to `.` or `..`, is
 refused. `detect` writes the whole project record itself
-(`~/.hermes/dev-team/projects/<repo-slug>.json`): the PR and CI adapters, `repo_url` from the
+(`$TEAM_HOME/projects/<repo-slug>.json`): the PR and CI adapters, `repo_url` from the
 clone's `git remote get-url origin` (credentials in the URL stripped), and `default_branch`
 from `git symbolic-ref refs/remotes/origin/HEAD` (run `git remote set-head origin --auto` first
 if that ref is missing). Never hand-edit the record. `detect` refuses to overwrite an existing
 record unless the operator passes `--force`. Exit 2 with `"ambiguous: pass --pr-adapter"`
-means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly.
+means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly. Devops compares
+the board's `default_workdir` against its own clone path by resolved real path (`realpath` both
+sides, trailing slash ignored), never by raw string — the two values are produced by different
+profiles' shells. If the resolved paths differ, or `default_workdir` is missing, devops blocks
+with a clear reason instead of changing the board.
 
 **The terminal guard is a seatbelt against mistakes, not a security boundary.** It reads
 shell commands as text — tokenised, not matched by substring, so it catches shell nesting,
@@ -264,9 +342,10 @@ guard for them:
 
 ## Running it
 
-- **The board.** `hermes kanban ls`, `hermes kanban show <id>` on the active board (switched
-  per repository, above). A card's guarded stage is whatever `dev-team-stage-<stage>` skill it
-  carries — check that, not the title, when in doubt.
+- **The board.** Every command names its board explicitly: `hermes kanban --board <repo-slug>
+  ls`, `hermes kanban --board <repo-slug> show <id>` (see Onboarding a project, above — nothing
+  in the team switches the machine-wide current board). A card's guarded stage is whatever
+  `dev-team-stage-<stage>` skill it carries — check that, not the title, when in doubt.
 - **Talking to pm.** Give `pm` one sentence, a budget and a repository; its soul's own
   **Intake: Turning One Line Into A Plan** section drives everything else. From intake it
   creates the `plan` card, and from there each stage's own skill creates its required child —
@@ -283,8 +362,8 @@ guard for them:
 ## Attention labels
 
 Every `kanban_block` on this pipeline starts with a failure-class label, so pm's ledger
-(`hermes kanban ls --status blocked`) can count recurring classes instead of treating three
-occurrences as three unrelated incidents:
+(`hermes kanban --board <repo-slug> ls --status blocked`) can count recurring classes instead of
+treating three occurrences as three unrelated incidents:
 
 | Label | Meaning |
 | --- | --- |

@@ -23,33 +23,50 @@ come out the other end as that card's `kanban_complete` metadata. See
 ## One board per repository
 
 Each repository this team works on gets its own board — the hard isolation boundary workers
-cannot see past:
+cannot see past. `$HERMES_HOME` is set per installed profile (every profile gets its own
+directory, symlinked to the same shared `dev-team` tree), so a raw `$HERMES_HOME/dev-team/...`
+string differs across profiles even though it resolves to the same real directory. Resolve it
+to the canonical team-home path with `pwd -P` *before* creating the board, so every profile that
+later reads `default_workdir` sees the identical string:
 
 ```
-hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline"
-hermes kanban boards switch <repo-slug>
+TEAM_HOME="$(cd "$HERMES_HOME/dev-team" && pwd -P)"
+hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir "$TEAM_HOME/repos/<repo-slug>"
 ```
 
+The `--default-workdir` path is deterministic at creation time — it is the clone path devops
+will create during onboarding below, not a path that exists yet. Setting it here, as the
+resolved real path rather than the profile-relative `$HERMES_HOME/dev-team`, means no later step
+ever needs to change it and every profile's own `$TEAM_HOME` resolution will match it exactly.
 Use the same `<repo-slug>` you will record as the intake card's `repo` field, so every later
-stage (forge onboarding, the project record, the guard's default-branch check) resolves
-against one consistent name. One repository, one board, one slug — never split a repository's
-work across boards or reuse a slug for a different repository.
+stage (forge onboarding, the project record, the guard's default-branch check) resolves against
+one consistent name. One repository, one board, one slug — never split a repository's work
+across boards or reuse a slug for a different repository.
+
+Every later `hermes kanban` command that targets this board — yours or any card you
+create — must name it explicitly with `--board <repo-slug>` (or `kanban_create(board=...)`).
+Nothing in the team may run `hermes kanban boards switch`: it mutates the machine-wide current
+board, which is shared across every repository this team (and the operator) touches.
 
 ## Devops onboarding before any implement card
 
-Before the first `implement` card ever runs on this board, the team's own clone, the forge
-project record and the board's `default_workdir` must already exist — otherwise implement
-worktrees get created in the operator's own checkout, and the guard's default-branch push
-protection covers only `main`/`master` for this repo until onboarding writes the project record
-(`_record_default_branch` in the guard reads it from there). Sequence it, not `pr-ci`, as the
-one doing this work:
+Before the first `implement` card ever runs on this board, the team's own clone and the forge
+project record must already exist at the `default_workdir` you set when you created the board —
+otherwise implement worktrees get created in the operator's own checkout, and the guard's
+default-branch push protection covers only `main`/`master` for this repo until onboarding writes
+the project record (`_record_default_branch` in the guard reads it from there). Sequence it, not
+`pr-ci`, as the one doing this work. Onboarding is unattended: devops only clones, excludes
+`.worktrees/`, and runs `forge detect` — it never sets or changes the board's
+`default_workdir`. If the path you created the board with is missing or does not match what
+`forge detect` expects, devops blocks with a clear reason instead of touching the board.
 
 1. After creating the board above, create an onboarding card assigned to `<prefix>devops`
    (`<prefix>` is the team prefix in `$HERMES_HOME/dev-team-prefix`, `dev-` by default; never
    the bare `devops`, which is a different, unguarded profile) — an ordinary card
    carrying no `dev-team-stage-*` skill, so the guard does not gate it — to run exactly the
    forge-onboarding steps documented in `dev-team-stage-pr-ci` (clone, `.worktrees/` exclude,
-   `forge detect`, `default_workdir`).
+   `forge detect`). Create it with `--board <repo-slug>` so it lands on this board without
+   touching the machine-wide current board.
 2. Don't let intake→plan→implement outrun it: hold the intake card's `kanban_complete` until
    the onboarding card is done, or, once the plan card exists, add the onboarding card as an
    extra parent of the plan card (`kanban_link`) so plan cannot proceed before onboarding has
@@ -102,8 +119,8 @@ Every `kanban_block` on this pipeline carries a reason starting with a failure-c
 ledger of blocked cards on this board, grouped by that label prefix:
 
 ```
-hermes kanban ls --status blocked
-hermes kanban show <id>     # the labelled reason, verbatim
+hermes kanban --board <repo-slug> ls --status blocked
+hermes kanban --board <repo-slug> show <id>     # the labelled reason, verbatim
 ```
 
 Count blocks per label. A label that keeps recurring is not three unrelated incidents — it is

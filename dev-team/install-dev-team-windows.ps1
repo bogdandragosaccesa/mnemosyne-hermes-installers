@@ -74,6 +74,8 @@ param(
     [switch]   $SkipModel,
     [switch]   $KeepSoul,
     [switch]   $SeparateMemory,
+    [string]   $TeamMemory,
+    [switch]   $AdoptTeamMemory,
     [switch]   $DryRun,
     [string]   $TierFast,
     [string]   $TierStandard,
@@ -385,6 +387,22 @@ function Test-IsAncestorOrEqualPath {
     return $d.StartsWith("$a$([char]92)", [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-AllProfileDirs {
+    <#
+      N3 (review): the refusal in Get-UnsafeOldHomeReason must cover every
+      directory under $HermesRoot\profiles, not only the dev-team-prefixed
+      ones this installer's own role scan discovers -- otherwise a
+      candidate equal to some other, unrelated profile directory slips
+      through and "migrating" it would move that whole profile. Mirrors
+      the Unix installer's "$HERMES_ROOT"/profiles/*/ glob.
+    #>
+    param([string] $HermesRoot)
+    $profilesRoot = Join-Path $HermesRoot 'profiles'
+    if (-not (Test-Path -LiteralPath $profilesRoot)) { return @() }
+    return @(Get-ChildItem -LiteralPath $profilesRoot -Directory -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
+}
+
 function Get-UnsafeOldHomeReason {
     <#
       D1 (review): a candidate old-home target must actually be named
@@ -643,9 +661,313 @@ if ((Split-Path -Leaf (Split-Path -Parent $HermesRoot)) -eq 'profiles') {
     $HermesRoot = Split-Path -Parent (Split-Path -Parent $HermesRoot)
 }
 $PluginSrcMnemo = Join-Path $HermesRoot 'plugins\mnemosyne'
-# The one real Mnemosyne data root, which every profile is pointed at unless
-# -SeparateMemory was passed. Honour MNEMOSYNE_HOME if the store was relocated.
-$MnemoHome = if ($env:MNEMOSYNE_HOME) { $env:MNEMOSYNE_HOME } else { Join-Path $HermesRoot 'mnemosyne' }
+# The team's shared Mnemosyne bank: a dedicated directory, never the
+# operator's own bank ($HermesRoot\mnemosyne, or whatever MNEMOSYNE_HOME
+# points at -- that store is never linked into, read from, or written to by
+# this installer). -TeamMemory overrides the location.
+function Get-TeamMemoryLinkTarget {
+    <#
+      For one path component: $null if it does not exist or is not a
+      link; otherwise the link's immediate target (a symlink OR a junction,
+      live or dangling). Uses the reparse-point attribute so a dangling link
+      is still seen as a link, then .NET 6+'s FileSystemInfo.LinkTarget
+      (PowerShell 7) with Get-Item's .Target as the Windows PowerShell 5.1
+      fallback.
+    #>
+    param([string] $Path)
+    $fi = New-Object System.IO.DirectoryInfo $Path
+    $attr = [int]$fi.Attributes          # -1 when nothing is there at all
+    if ($attr -eq -1) { return $null }
+    if (($attr -band [int][System.IO.FileAttributes]::ReparsePoint) -eq 0) { return $null }
+    $t = $null
+    if ($fi.PSObject.Properties['LinkTarget']) { $t = $fi.LinkTarget }
+    if (-not $t) {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.Target) { $t = $item.Target }
+    }
+    if ($t -is [System.Array]) { $t = $t[0] }
+    if (-not $t) { return $null }
+    $ntPrefix = [string]::Concat([char]92, '?', '?', [char]92)
+    if ($t.StartsWith($ntPrefix)) { $t = $t.Substring($ntPrefix.Length) }
+    return $t
+}
+function Resolve-TeamMemoryRealPath {
+    <#
+      Resolves $Path to a canonical absolute path (realpath -m semantics).
+      GetFullPath first (Windows' own lexical '.'/'..'/separator rules, and
+      a relative value becomes absolute -- r2 finding #3). Then every
+      component is walked from the root: wherever an existing prefix is a
+      symlink or junction -- at ANY depth, not just the nearest existing
+      ancestor (r3 review finding #2), and even when dangling -- its target
+      replaces that prefix and the walk restarts on target + remaining
+      components. Bounded to 40 hops: a link cycle throws (the caller
+      refuses with exit 2) instead of spinning or returning a half-resolved
+      path that could dodge the containment check.
+    #>
+    param([string] $Path)
+    if (-not $Path) { return $Path }
+    # Get-NormalizedPath trims a trailing backslash, which turns a bare
+    # drive root 'C:\' into the drive-RELATIVE 'C:'; put it back.
+    $fixRoot = { param($p) if ($p -match '^[A-Za-z]:$') { "$p\" } else { $p } }
+    $full = & $fixRoot (Get-NormalizedPath $Path)
+    $seps = [char[]]@([char]92, [char]47)
+    $hops = 0
+    while ($true) {
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $root) { return $full }
+        $parts = @($full.Substring($root.Length).Split($seps, [System.StringSplitOptions]::RemoveEmptyEntries))
+        $cur = $root
+        $restart = $null
+        for ($i = 0; $i -lt $parts.Count; $i++) {
+            $next = [System.IO.Path]::Combine($cur, $parts[$i])
+            $target = Get-TeamMemoryLinkTarget $next
+            if ($target) {
+                $hops++
+                if ($hops -gt 40) {
+                    throw "Too many levels of symbolic links resolving: $Path"
+                }
+                if (-not [System.IO.Path]::IsPathRooted($target)) {
+                    $target = [System.IO.Path]::Combine($cur, $target)
+                }
+                $rest = @($target) + @($parts | Select-Object -Skip ($i + 1))
+                $restart = & $fixRoot (Get-NormalizedPath ([System.IO.Path]::Combine([string[]]$rest)))
+                break
+            }
+            $cur = $next
+        }
+        if ($null -eq $restart) { break }
+        $full = $restart
+    }
+    if ($cur -eq [System.IO.Path]::GetPathRoot($cur)) { return $cur }
+    return (Get-NormalizedPath $cur)
+}
+function Test-SameFileIdentity {
+    <#
+      True if $A and $B denote the same real file-system object, by
+      identity rather than by path string (review D4: 8.3 short names and
+      `subst` drives both give a path a second name with no symlink or
+      junction anywhere in it, so Resolve-TeamMemoryRealPath's
+      link-resolution walk cannot see it).
+
+      On Windows: volume serial number + file index (nFileIndexHigh/Low
+      from GetFileInformationByHandle), the same identity pair
+      GetFinalPathNameByHandle-based approaches rely on, via a tiny P/Invoke
+      helper added once per session.
+
+      On the non-Windows pwsh this test suite actually runs under (and on
+      real PowerShell 7+ on Linux/macOS), the equivalent identity is
+      device + inode, read with `stat`, so a bind mount -- the same class
+      of alias the Unix installer's identity_overlap() guards against --
+      is caught the same way here.
+    #>
+    param([string] $A, [string] $B)
+    if (-not (Test-Path -LiteralPath $A) -or -not (Test-Path -LiteralPath $B)) { return $false }
+    if ($IsWindows) {
+        if (-not ([System.Management.Automation.PSTypeName]'DevTeamInstaller.NativeFileId').Type) {
+            Add-Type -Namespace DevTeamInstaller -Name NativeFileId -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+public static extern System.IntPtr CreateFile(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+    System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);
+[StructLayout(LayoutKind.Sequential)]
+public struct BY_HANDLE_FILE_INFORMATION {
+    public uint FileAttributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+}
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetFileInformationByHandle(System.IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool CloseHandle(System.IntPtr hObject);
+'@
+        }
+        $getId = {
+            param($p)
+            $h = [DevTeamInstaller.NativeFileId]::CreateFile($p, 0, 7, [System.IntPtr]::Zero, 3, 0x02000000, [System.IntPtr]::Zero)
+            if ($h -eq [System.IntPtr]::new(-1)) { return $null }
+            try {
+                $info = New-Object DevTeamInstaller.NativeFileId+BY_HANDLE_FILE_INFORMATION
+                if (-not [DevTeamInstaller.NativeFileId]::GetFileInformationByHandle($h, [ref]$info)) { return $null }
+                return "$($info.VolumeSerialNumber):$($info.FileIndexHigh):$($info.FileIndexLow)"
+            } finally { [void][DevTeamInstaller.NativeFileId]::CloseHandle($h) }
+        }
+        $ida = & $getId $A
+        $idb = & $getId $B
+        if (-not $ida -or -not $idb) { return $false }
+        return $ida -eq $idb
+    }
+    try {
+        $sa = & stat -c '%d:%i' -- $A 2>$null
+        $sb = & stat -c '%d:%i' -- $B 2>$null
+    } catch { return $false }
+    if (-not $sa -or -not $sb) { return $false }
+    return $sa -eq $sb
+}
+function Test-IdentityOverlap {
+    <# Either direction: true if $A or $B sits inside (or is) the other,
+       by filesystem identity rather than path string -- checked at every
+       EXISTING ancestor of the candidate against the other side's full
+       path (never against the other side's own ancestors: that would
+       match the shared Hermes root every path lives under). #>
+    param([string] $Candidate, [string] $Outer)
+    if (-not $Outer -or -not (Test-Path -LiteralPath $Outer)) { return $false }
+    $probe = $Candidate
+    while ($true) {
+        if ($probe -and (Test-Path -LiteralPath $probe)) {
+            if (Test-SameFileIdentity $probe $Outer) { return $true }
+        }
+        $parent = Split-Path -Parent $probe
+        if (-not $parent -or $parent -eq $probe) { break }
+        $probe = $parent
+    }
+    return $false
+}
+function Test-IdentityOverlapEither {
+    param([string] $A, [string] $B)
+    return (Test-IdentityOverlap -Candidate $A -Outer $B) -or (Test-IdentityOverlap -Candidate $B -Outer $A)
+}
+function Test-PathIsOrUnder {
+    <# True if $Desc (normalized) equals $Anc or is nested inside it. #>
+    param([string] $Anc, [string] $Desc)
+    if (-not $Anc -or -not $Desc) { return $false }
+    if ($Desc -ieq $Anc) { return $true }
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    return $Desc.StartsWith("$Anc$sep", [System.StringComparison]::OrdinalIgnoreCase)
+}
+$OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
+$rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
+# Every path below is canonical (no '.', '..', repeated separator, link or
+# junction anywhere on it): the value checked is the value later passed to
+# New-Item / New-DirLink.
+try {
+    $TeamMemoryHome = Resolve-TeamMemoryRealPath $rawTeamMemoryHome
+    $_operatorHomeReal = Resolve-TeamMemoryRealPath $OperatorMnemoHome
+    $_mnemosyneHomeReal = if ($env:MNEMOSYNE_HOME) { Resolve-TeamMemoryRealPath $env:MNEMOSYNE_HOME } else { $null }
+    # D1: MNEMOSYNE_DATA_DIR is the variable that actually decides the data
+    # directory the installed Mnemosyne package uses (mnemosyne/cli.py:20-23,
+    # mnemosyne/core/beam.py:358-366 both check it before anything else).
+    # The Windows Mnemosyne installer persists it as a User-scope
+    # environment variable whenever the bank was relocated with
+    # MNEMOSYNE_HOME (install-mnemosyne-hermes-windows.ps1:302-304), so a
+    # new process picks it up even without the live session variable --
+    # check both.
+    $_mnemosyneDataDirRaw = if ($env:MNEMOSYNE_DATA_DIR) { $env:MNEMOSYNE_DATA_DIR }
+        else { [Environment]::GetEnvironmentVariable('MNEMOSYNE_DATA_DIR', 'User') }
+    $_mnemosyneDataDirReal = if ($_mnemosyneDataDirRaw) { Resolve-TeamMemoryRealPath $_mnemosyneDataDirRaw } else { $null }
+    $HermesRootProfilesReal = Resolve-TeamMemoryRealPath (Join-Path $HermesRoot 'profiles')
+    $HermesRootDevTeamReal  = Resolve-TeamMemoryRealPath (Join-Path $HermesRoot 'dev-team')
+} catch {
+    [Console]::Error.WriteLine("-TeamMemory: cannot resolve the path: $($_.Exception.Message)")
+    exit 2
+}
+$_teamHomeReal = $TeamMemoryHome
+function Test-TouchesOperatorBank {
+    <# True if $Target (canonical) is, sits inside, or contains any
+       operator location -- the operator bank, MNEMOSYNE_HOME, or
+       MNEMOSYNE_DATA_DIR, whichever are set -- by path containment or by
+       filesystem identity (D4). #>
+    param([string] $Target)
+    foreach ($loc in @($_operatorHomeReal, $_mnemosyneHomeReal, $_mnemosyneDataDirReal)) {
+        if (-not $loc) { continue }
+        if ((Test-PathIsOrUnder -Anc $loc -Desc $Target) -or (Test-PathIsOrUnder -Anc $Target -Desc $loc) -or
+            (Test-IdentityOverlapEither $Target $loc)) {
+            return $true
+        }
+    }
+    return $false
+}
+$_teamMemoryRefusal = $null
+$_refusalPairs = @(
+    @{ Name = "the operator's own bank ($OperatorMnemoHome)"; Real = $_operatorHomeReal },
+    @{ Name = "MNEMOSYNE_HOME ($($env:MNEMOSYNE_HOME))"; Real = $_mnemosyneHomeReal },
+    @{ Name = "MNEMOSYNE_DATA_DIR ($_mnemosyneDataDirRaw)"; Real = $_mnemosyneDataDirReal }
+)
+foreach ($pair in $_refusalPairs) {
+    if (-not $pair.Real) { continue }
+    if ((Test-PathIsOrUnder -Anc $pair.Real -Desc $_teamHomeReal) -or
+        (Test-PathIsOrUnder -Anc $_teamHomeReal -Desc $pair.Real) -or
+        (Test-IdentityOverlapEither $_teamHomeReal $pair.Real)) {
+        $_teamMemoryRefusal = $pair.Name
+        break
+    }
+}
+# D5: -TeamMemory under $HermesRoot\profiles or $HermesRoot\dev-team breaks
+# every profile's memory (review repro: pointed at a profile's own
+# mnemosyne\, the link ends up pointing at itself).
+if (-not $_teamMemoryRefusal) {
+    if ((Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $_teamHomeReal) -or
+        (Test-IdentityOverlap -Candidate $_teamHomeReal -Outer $HermesRootProfilesReal)) {
+        $_teamMemoryRefusal = "a Hermes profile directory ($(Join-Path $HermesRoot 'profiles'))"
+    } elseif ((Test-PathIsOrUnder -Anc $HermesRootDevTeamReal -Desc $_teamHomeReal) -or
+              (Test-IdentityOverlap -Candidate $_teamHomeReal -Outer $HermesRootDevTeamReal)) {
+        $_teamMemoryRefusal = "the dev-team state directory ($(Join-Path $HermesRoot 'dev-team'))"
+    }
+}
+if ($_teamMemoryRefusal) {
+    [Console]::Error.WriteLine("-TeamMemory must not point at, be nested in, or contain $_teamMemoryRefusal.")
+    exit 2
+}
+# F1 (review r3): also pin MNEMOSYNE_HOME alongside MNEMOSYNE_DATA_DIR.
+# MNEMOSYNE_DATA_DIR only steers the CLI (mnemosyne/cli.py:20-23) and
+# call-time modules (core/banks.py, core/triples.py, core/canonical.py,
+# core/media.py); it does NOT steer the MCP shared-surface DB or
+# federation, which both read MNEMOSYNE_HOME directly
+# (mnemosyne/mcp_tools.py:167-173, core/fleet_census.py:149-155,
+# core/federation_handshake.py:263-267, mcp_server.py:799). An inherited
+# MNEMOSYNE_HOME therefore still leaked the operator's shared-surface DB
+# path into a dev-team profile even after MNEMOSYNE_DATA_DIR was pinned.
+# D1: pin this profile's own Mnemosyne data directory into its own .env
+# (see Set-MnemosyneDataDirPin below, called once per profile) so an
+# inherited MNEMOSYNE_DATA_DIR from the launching shell, the gateway, or
+# the Windows User-scope environment cannot redirect it away from the
+# bank this installer just linked. hermes_cli/env_loader.py:502-562
+# (load_hermes_dotenv) loads a profile's own .env with override=True
+# specifically because "a profile's .env overrides stale shell exports".
+function Set-EnvVarPin {
+    <# Rewrite a single VAR=value line in a profile's .env, preserving
+       every other line, via Get-Content/Set-Content line comparison
+       (never a regex substitution built from the value itself, so a
+       bank path containing regex-special characters is written
+       verbatim -- same concern F4 raised for the Unix sed version). #>
+    param([string] $ProfileDir, [string] $VarName, [string] $Value)
+    New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
+    $envFile = Join-Path $ProfileDir '.env'
+    $line = "$VarName=$Value"
+    $prefix = "$VarName="
+    if (Test-Path -LiteralPath $envFile) {
+        $existingLines = @(Get-Content -LiteralPath $envFile)
+        $found = $false
+        $newLines = $existingLines | ForEach-Object {
+            if ($_.StartsWith($prefix)) { $found = $true; $line } else { $_ }
+        }
+        if ($found) {
+            Set-Content -LiteralPath $envFile -Value $newLines
+        } else {
+            Add-Content -LiteralPath $envFile -Value $line
+        }
+    } else {
+        Set-Content -LiteralPath $envFile -Value $line
+    }
+}
+function Set-MnemosyneDataDirPin {
+    param([string] $ProfileDir, [string] $DataDir)
+    # F1: DataDir is always "<bank>\data" at every call site, so its
+    # parent is exactly the bank root MNEMOSYNE_HOME must name.
+    $homeDir = Split-Path -Parent $DataDir
+    if ($DryRun) {
+        Write-Host "  would pin in .env: MNEMOSYNE_DATA_DIR=$DataDir"
+        Write-Host "  would pin in .env: MNEMOSYNE_HOME=$homeDir"
+        return
+    }
+    Set-EnvVarPin -ProfileDir $ProfileDir -VarName 'MNEMOSYNE_DATA_DIR' -Value $DataDir
+    Set-EnvVarPin -ProfileDir $ProfileDir -VarName 'MNEMOSYNE_HOME' -Value $homeDir
+}
 # Team state (forge project records, team clones) must be visible to every
 # role: devops writes the project record at onboarding, pr-ci reads it to
 # open the PR, and the guard reads it from every other stage to verify the
@@ -732,13 +1054,17 @@ if (Test-Path -LiteralPath $decidersCmdPath) {
 # finding #3), so a junction that already points at the correct root is
 # never mistaken for an old one.
 $CandidateTargets = @{}
-$ProfileDirs = @()
+# N3 (review): pass every directory under $HermesRoot\profiles to
+# Get-UnsafeOldHomeReason, not only the $Prefix$role ones this loop scans
+# for live dev-team junctions -- matching the Unix installer's
+# profiles/*/ glob so a candidate equal to any other profile directory
+# (dev-team-prefixed or not) is refused.
+$ProfileDirs = Get-AllProfileDirs -HermesRoot $HermesRoot
 foreach ($role in $Profiles.Keys) {
     $candidateName = "$Prefix$role"
     Invoke-Hermes 'profile' 'show' $candidateName | Out-Null
     if ($LASTEXITCODE -ne 0) { continue }
     $candidateDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $candidateName 'config' 'path'))
-    $ProfileDirs += $candidateDir
     $candidateLink = Join-Path $candidateDir 'dev-team'
     $linkItem = Get-Item -LiteralPath $candidateLink -Force -ErrorAction SilentlyContinue
     if (-not $linkItem -or -not $linkItem.LinkType) { continue }
@@ -797,7 +1123,7 @@ Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"
 Write-Host "Model:         $modelLabel"
 Write-Host "Name prefix:   $Prefix"
-$memLabel = if ($SeparateMemory) { 'separate per profile' } else { "shared bank at $MnemoHome" }
+$memLabel = if ($SeparateMemory) { 'separate per profile' } else { "team bank at $TeamMemoryHome" }
 Write-Host "Memory:        $memLabel"
 Write-Host "Team state:    $DevTeamHome (shared across every profile)"
 Write-Host ''
@@ -829,6 +1155,136 @@ $created  = 0
 $updated  = 0
 $copied   = @()
 $unshared = @()
+$adopted  = @()
+
+if (-not $SeparateMemory) {
+    if ($DryRun) {
+        if (-not (Test-Path -LiteralPath $TeamMemoryHome)) { Write-Host "  would create: $TeamMemoryHome" }
+    } else {
+        New-Item -ItemType Directory -Path $TeamMemoryHome -Force | Out-Null
+    }
+}
+# One timestamp per run, reused for every profile -AdoptTeamMemory backs up:
+# distinct profiles live in distinct directories, so a shared timestamp
+# cannot collide.
+$AdoptTimestamp = Get-Date -Format 'yyyyMMddHHmmss'
+
+function Invoke-MnemosyneDataLink {
+    <#
+      D6: the whole per-profile Mnemosyne data-link decision, in one
+      function (the same move Resolve-TeamHomeMigrationPlan made for the
+      team-home junction), so it can be called -- and pwsh-tested -- the
+      same way whether $DryRun is set or not, instead of duplicating the
+      decision inline in both the dry-run early-exit and the real path.
+
+      D2: canonicalises $ProfileDir and $ProfileDir\mnemosyne BEFORE any
+      Move-Item/Remove-Item/New-DirLink, and refuses rather than acts if
+      the profile directory resolves outside $HermesRoot\profiles, or the
+      mnemosyne directory resolves to the operator's own bank, or to the
+      team bank already.
+
+      D3: an existing backup path (dir or junction) is never merged into;
+      a numeric suffix is appended until the name is free.
+
+      D1: pins MNEMOSYNE_DATA_DIR into the profile's own .env on every
+      branch that leaves it either freshly linked or kept private, via
+      Set-MnemosyneDataDirPin (defined above, beside the refusal logic).
+    #>
+    param(
+        [string] $ProfileDir, [string] $Name, [bool] $Exists,
+        [string] $TeamMemoryHome, [bool] $AdoptTeamMemory, [string] $AdoptTimestamp,
+        [bool] $DryRun, [string] $HermesRootProfilesReal
+    )
+    $result = @{ Copied = $false; Adopted = $false; Unshared = $false }
+    $profileDirReal = $null
+    try { $profileDirReal = Resolve-TeamMemoryRealPath $ProfileDir } catch {
+        [Console]::Error.WriteLine("Cannot resolve $Name's profile directory: $ProfileDir")
+        exit 1
+    }
+    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
+            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$Name's profile directory ($ProfileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+        exit 1
+    }
+    $dataLink = Join-Path $ProfileDir 'mnemosyne'
+    $existing = Get-Item -LiteralPath $dataLink -ErrorAction SilentlyContinue
+    $isLink   = [bool]($existing -and $existing.LinkType)
+    if ($existing -and -not $isLink -and $Exists) {
+        $profileMnemoReal = $null
+        try { $profileMnemoReal = Resolve-TeamMemoryRealPath $dataLink } catch {
+            [Console]::Error.WriteLine("Cannot resolve $Name's mnemosyne\: $dataLink")
+            exit 1
+        }
+        if (Test-TouchesOperatorBank $profileMnemoReal) {
+            [Console]::Error.WriteLine("$Name's mnemosyne\ ($dataLink) resolves to the operator's own bank; refusing to move, remove or relink it.")
+            exit 1
+        }
+        if (($profileMnemoReal -ieq $_teamHomeReal) -or (Test-IdentityOverlapEither $profileMnemoReal $_teamHomeReal)) {
+            [Console]::Error.WriteLine("$Name's mnemosyne\ ($dataLink) already resolves to the team bank; refusing to move it.")
+            exit 1
+        }
+        if ($AdoptTeamMemory) {
+            # D3: an existing backup path (dir or junction) is never merged into.
+            $backupDir = Join-Path $ProfileDir "mnemosyne.pre-team-memory-$AdoptTimestamp"
+            $suffix = 0
+            while (Test-Path -LiteralPath $backupDir) {
+                $suffix++
+                $backupDir = Join-Path $ProfileDir "mnemosyne.pre-team-memory-$AdoptTimestamp.$suffix"
+            }
+            if ($DryRun) {
+                Write-Host "  would back up: $dataLink -> $backupDir"
+                Write-Host "  would link: $dataLink -> $TeamMemoryHome"
+                Set-MnemosyneDataDirPin -ProfileDir $ProfileDir -DataDir (Join-Path $TeamMemoryHome 'data')
+                $result.Adopted = $true
+                return $result
+            }
+            Move-Item -LiteralPath $dataLink -Destination $backupDir
+            $kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome -Label 'the Mnemosyne data store'
+            if ($kind -eq 'copy') { $result.Copied = $true }
+            Write-Host "  ADOPTED: $Name's private mnemosyne\ moved to $backupDir"
+            Write-Host '           (backup, not deleted) and linked to the team bank.'
+            Write-Host '           Merging its old memories into the team bank is out'
+            Write-Host '           of scope for this installer.'
+            $result.Adopted = $true
+            Set-MnemosyneDataDirPin -ProfileDir $ProfileDir -DataDir (Join-Path $TeamMemoryHome 'data')
+            return $result
+        }
+        if ($DryRun) {
+            Write-Host "  would leave: $dataLink (private, real directory;"
+            Write-Host '               re-run with -AdoptTeamMemory to move it aside and share)'
+            Set-MnemosyneDataDirPin -ProfileDir $ProfileDir -DataDir (Join-Path $dataLink 'data')
+            $result.Unshared = $true
+            return $result
+        }
+        Write-Host "  NOTE: $dataLink is a real directory with its own database."
+        Write-Host '        Left as-is - this profile will not share the team bank.'
+        Write-Host '        Re-run with -AdoptTeamMemory to move it aside (as a'
+        Write-Host '        backup) and link to the team bank, or remove/merge it'
+        Write-Host '        yourself, then re-run.'
+        $result.Unshared = $true
+        Set-MnemosyneDataDirPin -ProfileDir $ProfileDir -DataDir (Join-Path $dataLink 'data')
+        return $result
+    }
+    if ($DryRun) {
+        Write-Host "  would link: $dataLink -> $TeamMemoryHome"
+        Set-MnemosyneDataDirPin -ProfileDir $ProfileDir -DataDir (Join-Path $TeamMemoryHome 'data')
+        return $result
+    }
+    if ($isLink) {
+        $prevTarget = $null
+        try { $prevTarget = Resolve-TeamMemoryRealPath $dataLink } catch { }
+        if ($prevTarget -and (Test-TouchesOperatorBank $prevTarget)) {
+            Write-Host "  NOTE: $dataLink was linked to the operator's own bank;"
+            Write-Host '        repointing to the team bank. The operator''s bank is'
+            Write-Host '        untouched, but this profile loses access to memories'
+            Write-Host '        only there.'
+        }
+    }
+    $kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome -Label 'the Mnemosyne data store'
+    if ($kind -eq 'copy') { $result.Copied = $true }
+    Set-MnemosyneDataDirPin -ProfileDir $ProfileDir -DataDir (Join-Path $TeamMemoryHome 'data')
+    return $result
+}
 
 foreach ($role in $Profiles.Keys) {
     if (-not (Test-Selected $role)) { continue }
@@ -865,6 +1321,26 @@ foreach ($role in $Profiles.Keys) {
         $profileDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $name 'config' 'path'))
     }
 
+    # F2 (review r3): canonicalise $profileDir itself FIRST, before SOUL,
+    # the prefix file, or any link -- not just before the mnemosyne\ link
+    # as D2 originally had it (that check lived inside
+    # Invoke-MnemosyneDataLink, called further down). Windows is worse
+    # than Unix here: step 4's New-DirLink on plugins\mnemosyne takes a
+    # Remove-Item -Recurse branch when the target is a real directory,
+    # which deleted the operator's actual plugin directory in the
+    # reviewer's repro (profiles\dev-qa -> $HermesRoot) before the old,
+    # later check ever ran.
+    $profileDirReal = $null
+    try { $profileDirReal = Resolve-TeamMemoryRealPath $profileDir } catch {
+        [Console]::Error.WriteLine("Cannot resolve $name's profile directory: $profileDir")
+        exit 1
+    }
+    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
+            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$name's profile directory ($profileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+        exit 1
+    }
+
     # 2. SOUL
     if ($KeepSoul -and (Test-Path -LiteralPath (Join-Path $profileDir 'SOUL.md'))) {
         Write-Host '  SOUL.md kept (-KeepSoul)'
@@ -888,7 +1364,16 @@ foreach ($role in $Profiles.Keys) {
     if ($DryRun) {
         Write-Host "  would link: $profileDir\plugins\mnemosyne -> $PluginSrcMnemo"
         if (-not $SeparateMemory) {
-            Write-Host "  would link: $profileDir\mnemosyne -> $MnemoHome"
+            Invoke-MnemosyneDataLink -ProfileDir $profileDir -Name $name -Exists $exists `
+                -TeamMemoryHome $TeamMemoryHome -AdoptTeamMemory:$AdoptTeamMemory -AdoptTimestamp $AdoptTimestamp `
+                -DryRun:$true -HermesRootProfilesReal $HermesRootProfilesReal | Out-Null
+        } else {
+            # F3 (review r3): Unix's -separate-memory pins the private
+            # path in .env too (install-dev-team-unix.sh's final `else`
+            # branch); -SeparateMemory must do the same, or a User-scope
+            # MNEMOSYNE_DATA_DIR/MNEMOSYNE_HOME still reaches a
+            # "separate" profile's CLI and call-time modules.
+            Set-MnemosyneDataDirPin -ProfileDir $profileDir -DataDir (Join-Path $profileDir 'mnemosyne\data')
         }
         Write-Host "  would link: $profileDir\plugins\dev-team-gate -> $PluginSrcGate"
         Write-Host "  would run:  hermes -p $name config set model.default ..."
@@ -926,35 +1411,23 @@ foreach ($role in $Profiles.Keys) {
     if ($mnemoLinkKind -eq 'copy') { $copied += "$name (mnemosyne plugin)" }
 
     # The plugin link above shares Mnemosyne's *code*. It does not share its
-    # *data*: the database path resolves from MNEMOSYNE_HOME, which defaults
-    # to $HERMES_HOME\mnemosyne - and a named profile has redirected
-    # HERMES_HOME. Point each profile's Mnemosyne data root at the one real
-    # store, unless -SeparateMemory asked for isolation.
+    # *data*: the database path resolves from a MNEMOSYNE_HOME the Mnemosyne
+    # plugin itself computes at runtime, which defaults to
+    # $HERMES_HOME\mnemosyne - and a named profile has redirected
+    # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
+    # dedicated bank, unless -SeparateMemory asked for isolation. The
+    # operator's own bank ($HermesRoot\mnemosyne) is never a candidate here.
     if (-not $SeparateMemory) {
-        $dataLink = Join-Path $profileDir 'mnemosyne'
-        $existing = Get-Item -LiteralPath $dataLink -ErrorAction SilentlyContinue
-        $isLink   = $existing -and $existing.LinkType
-        if ($existing -and -not $isLink -and $exists) {
-            # A real directory on a profile that already existed before this
-            # run means it has its own memories. Merging them is not ours to
-            # decide, so leave it and say so rather than deleting somebody's
-            # history.
-            Write-Host "  NOTE: $dataLink is a real directory with its own database."
-            Write-Host '        Left as-is - this profile will not share the team bank.'
-            $unshared += $name
-        } else {
-            # Either already a junction, or nothing there yet, or - the case
-            # this fixes - a real directory that `hermes profile create
-            # --clone` itself just created a few lines up in *this very
-            # run* ($exists was false for this profile at the top of the
-            # loop). That directory holds no memories yet; moving the link
-            # above this point in the script cannot help, because the
-            # clone call is itself the first `-p $name`-equivalent
-            # invocation that creates it. New-DirLink's Remove-Item +
-            # New-Item replaces it safely.
-            $kind = New-DirLink -LinkPath $dataLink -Target $MnemoHome -Label 'the Mnemosyne data store'
-            if ($kind -eq 'copy') { $copied += "$name (mnemosyne data)" }
-        }
+        Invoke-MnemosyneDataLink -ProfileDir $profileDir -Name $name -Exists $exists `
+            -TeamMemoryHome $TeamMemoryHome -AdoptTeamMemory:$AdoptTeamMemory -AdoptTimestamp $AdoptTimestamp `
+            -DryRun:$false -HermesRootProfilesReal $HermesRootProfilesReal | ForEach-Object {
+                if ($_.Copied)   { $copied   += "$name (mnemosyne data)" }
+                if ($_.Adopted)  { $adopted  += $name }
+                if ($_.Unshared) { $unshared += $name }
+            }
+    } else {
+        # F3 (review r3): see the DryRun branch above for why.
+        Set-MnemosyneDataDirPin -ProfileDir $profileDir -DataDir (Join-Path $profileDir 'mnemosyne\data')
     }
 
     # 4. dev-team-gate link (enabled in step 6, after the model is set).
@@ -1243,6 +1716,15 @@ Each was copied instead. A copy will not track later changes to its source
 (e.g. a Mnemosyne upgrade), so re-run this script for the affected profile
 after the source changes.
 "@
+}
+
+if ($adopted.Count -gt 0) {
+    Write-Host ''
+    Write-Host "Adopted into the team bank (-AdoptTeamMemory): $($adopted -join ', ')"
+    Write-Host "Each profile's old private mnemosyne\ was backed up alongside it as"
+    Write-Host 'mnemosyne.pre-team-memory-<timestamp> (never deleted) before linking.'
+    Write-Host 'Merging those old memories into the team bank is out of scope for this'
+    Write-Host 'installer.'
 }
 
 if ($unshared.Count -gt 0) {
