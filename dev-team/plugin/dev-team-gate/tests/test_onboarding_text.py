@@ -25,7 +25,14 @@ from pathlib import Path
 
 DEV_TEAM = Path(__file__).resolve().parents[3]
 
-FORBIDDEN = re.compile(r"boards switch|set-default-workdir")
+FORBIDDEN = re.compile(
+    r"boards\s+switch|boards\s+use|set-default-workdir|"
+    # D7 (PR #8 review): "boards create ... --switch" also mutates the
+    # machine-wide current board. Bounded to 200 chars so an unrelated
+    # later command elsewhere in the same file is never swept in.
+    r"boards\s+create(?:.){0,200}?--switch",
+    re.S,
+)
 
 # Lines that pair the forbidden phrase with an explicit prohibition are
 # tolerated deliberately (acceptance criterion 1 allows it) because they
@@ -72,21 +79,47 @@ class NoGlobalBoardSwitchTest(unittest.TestCase):
             self.assertTrue(path.is_file(), path)
 
     def test_no_file_instructs_boards_switch_or_set_default_workdir(self):
+        """D7 (PR #8 review): matches across line breaks -- a forbidden
+        command split across two lines (e.g. a long `hermes kanban boards
+        create ... --switch` wrapped for readability) must not slip past
+        this check the way a strictly per-line regex would."""
         offenders = []
         for path in TEXT_FILES:
             text = path.read_text(encoding="utf-8")
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                if not FORBIDDEN.search(line):
+            flat = text.replace("\n", " ")  # same length/offsets as text
+            for m in FORBIDDEN.finditer(flat):
+                lineno = text.count("\n", 0, m.start()) + 1
+                line = text.splitlines()[lineno - 1].strip()
+                if line in ALLOWED_PROHIBITION_LINES:
                     continue
-                if line.strip() in ALLOWED_PROHIBITION_LINES:
-                    continue
-                offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line.strip()}")
+                offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line} [matched: {m.group(0)!r}]")
         self.assertEqual(
             offenders,
             [],
-            "no skill, soul or README may instruct `boards switch` or "
-            "`set-default-workdir`; found:\n" + "\n".join(offenders),
+            "no skill, soul or README may instruct `boards switch`, `boards use`, "
+            "`set-default-workdir`, or `boards create ... --switch`; found:\n" + "\n".join(offenders),
         )
+
+    def test_forbidden_regex_matches_a_command_split_across_two_lines(self):
+        """Red-before/green-after proof for D7's cross-line-break claim,
+        exercised against the real FORBIDDEN regex and the real scanning
+        logic above (not a reimplementation): a `boards switch` split by a
+        line-wrap, a bare `boards use`, and a `boards create` ... `--switch`
+        pair split across lines must all be caught."""
+        import tempfile
+        cases = [
+            "Run `hermes kanban boards\nswitch team-a` first.\n",
+            "Then `hermes kanban boards use team-a`.\n",
+            "`hermes kanban boards create repo-x --default-workdir /x\n  --switch`\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "probe.md"
+                    path.write_text(text, encoding="utf-8")
+                    flat = text.replace("\n", " ")
+                    matches = list(FORBIDDEN.finditer(flat))
+                    self.assertTrue(matches, f"FORBIDDEN did not match: {text!r}")
 
     def test_pipeline_skill_board_creation_includes_default_workdir(self):
         text = PIPELINE_SKILL.read_text(encoding="utf-8")
