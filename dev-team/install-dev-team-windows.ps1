@@ -850,41 +850,28 @@ function Get-EnvUnsafeValueReason {
        escaped value comes back corrupted there). Unquoted values read
        back byte-exact through BOTH readers except for the shapes below,
        so refuse those up front instead of silently writing a value
-       either reader would misread. PR #9 review fix (item 1): every
-       shape is now matched by exact Unicode code point, via the two
-       character classes below, rather than .NET regex `\s` (which
-       covers Zs/Zl/Zp -- including NBSP, U+2028, U+2029 -- but NOT
-       \x1c-\x1f, so it under-refused relative to Python's
-       str.isspace()/str.splitlines(), the functions the two real .env
-       readers' line-splitting and edge-stripping ultimately reduce to):
-         - any code point Python's `str.splitlines()` treats as a line
-           break (10 code points: \n \r \v \f \x1c \x1d \x1e \x85 \u2028
-           \u2029) anywhere in the value -- would split into more than
-           one physical .env line;
-         - any code point Python's `str.isspace()` is true for (29 code
-           points total) at either end -- Mnemosyne's reader strips it,
+       either reader would misread:
+         - a newline (CR or LF) -- would split into more than one .env line;
+         - leading/trailing whitespace -- Mnemosyne's reader strips it,
            python-dotenv's parser does not, so the two readers would
            disagree on the stored value;
          - a leading/trailing quote character (' or ") -- Mnemosyne's
-           reader strips any number of bounding quote characters (not
-           "exactly one bounding pair"), python-dotenv's does not unless
-           the whole value is quoted, so the two disagree;
-         - one of the same 29 whitespace code points immediately
-           followed by '#' -- python-dotenv's parser truncates there
-           (`/t/x #y` becomes `/t/x`); Mnemosyne's naive reader does not;
-         - a literal '${' (review r3 round-2 coverage finding: `'C:\a\
-           ${HOME}\b'` comes back as `'C:\a\/home/<user>\b'` there),
-           while Mnemosyne's reader does not expand it at all and
-           returns the value verbatim; the two readers would disagree.
+           reader strips exactly one bounding pair, python-dotenv's does
+           not unless the whole value is quoted, so the two disagree;
+         - whitespace immediately followed by '#' -- python-dotenv's
+           parser truncates there (`/t/x #y` becomes `/t/x`); Mnemosyne's
+           naive reader does not;
+         - a literal '${' -- python-dotenv (via env_loader's
+           _resolve_dotenv_assignments) expands `${VAR}` in an unquoted
+           value (review r3 round-2 coverage finding: `'C:\a\${HOME}\b'`
+           comes back as `'C:\a\/home/<user>\b'` there), while
+           Mnemosyne's reader does not expand it at all and returns the
+           value verbatim; the two readers would disagree.
        Returns $null when $Value is safe, otherwise a human-readable
        reason. #>
     param([string] $Value)
-    # Exact code points, matched with explicit \uXXXX escapes in a .NET
-    # regex character class -- never \s or \p{Z}, and never a culture-
-    # sensitive range, so this does not depend on the current culture.
-    $NlPattern = '[\x0A\x0D\x0B\x0C\x1C\x1D\x1E\x85\u2028\u2029]'
-    $WsPattern = '[\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x20\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
-    if ($Value -match $NlPattern) { return 'contains a newline' }
+    if ($Value -match "`r|`n") { return 'contains a newline' }
+    if ($Value -match '^\s' -or $Value -match '\s$') { return 'starts or ends with whitespace' }
     if ($Value.Length -gt 0) {
         $first = $Value.Substring(0, 1)
         $last = $Value.Substring($Value.Length - 1, 1)
@@ -892,8 +879,7 @@ function Get-EnvUnsafeValueReason {
             return 'starts or ends with a quote character'
         }
     }
-    if ($Value -match "^$WsPattern" -or $Value -match "$WsPattern$") { return 'starts or ends with whitespace' }
-    if ($Value -match "$WsPattern#") { return "contains whitespace immediately followed by '#'" }
+    if ($Value -match '\s#') { return "contains whitespace immediately followed by '#'" }
     if ($Value.Contains('${')) { return 'contains a literal ${' }
     return $null
 }
@@ -1720,45 +1706,8 @@ Write-Host "wrapper python: $WrapperPython"
 # - the forge directory holds its own imports (adapters, forge_core) that
 # resolve off the script's own path, so the wrapper only needs to point
 # the resolved python at forge.py itself.
-function Get-CmdSafeEncoding([string] $Text, [int] $Build = [System.Environment]::OSVersion.Version.Build) {
-    <# PR #9 review finding (item 3): cmd.exe parses a .cmd/.bat file
-       using the console's OEM code page (exposed in .NET as
-       [CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) on every
-       supported Windows version. Separately, cmd.exe on Windows 10
-       1903 (build 18362) and later ALSO autodetects a UTF-8 byte-
-       order mark at the start of the file and switches that one run
-       to UTF-8; older cmd.exe does not recognise the BOM and tries to
-       execute its bytes as part of the first line, breaking
-       '@echo off'. There is no third encoding cmd.exe reads. The
-       prior code wrote both wrappers with -Encoding ascii, which
-       silently replaces every non-ASCII code point with '?' -- a
-       path with Romanian a-breve/s-comma in it became Dr?go?, and the
-       wrapper then failed to find python with a confusing error.
-       Evidence (checked on this change, pwsh 7.6.9 on a Linux .NET
-       runtime -- OEMCodePage still resolves there, to the 'OEM
-       United States' code page, 437): round-tripping U+0103 U+0219
-       through Encoding.GetEncoding(437) comes back as 'a?' -- lossy,
-       because those two code points do not exist in CP437. Order: (1) pure
-       ASCII needs no encoding decision; (2) the OEM code page if the
-       text round-trips through it losslessly -- this is correct on
-       every Windows version, no BOM or build dependency; (3) UTF-8
-       with a BOM, only on a build new enough to autodetect it; (4)
-       otherwise $null, so the caller refuses instead of writing a
-       wrapper cmd.exe would misparse. #>
-    if ($Text -match '^[\x00-\x7F]*$') { return [System.Text.Encoding]::ASCII }
-    $oemCp = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
-    $oemEnc = [System.Text.Encoding]::GetEncoding($oemCp)
-    if ($oemEnc.GetString($oemEnc.GetBytes($Text)) -eq $Text) { return $oemEnc }
-    if ($Build -ge 18362) { return New-Object System.Text.UTF8Encoding($true) }
-    return $null
-}
 $forgeCmdContent = "@echo off`r`n$ForgeMarker`r`n`"$WrapperPython`" `"$ForgePy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
-$WrapperCmdEncoding = Get-CmdSafeEncoding $forgeCmdContent
-if (-not $WrapperCmdEncoding) {
-    [Console]::Error.WriteLine("forge.cmd: the Python path `"$WrapperPython`" contains a character cmd.exe cannot read on this Windows version (needs the OEM code page or a UTF-8-BOM-aware cmd.exe, build 18362+). Install Python to a path without that character, then re-run.")
-    exit 1
-}
-[System.IO.File]::WriteAllText($forgeCmdPath, $forgeCmdContent, $WrapperCmdEncoding)
+Set-Content -LiteralPath $forgeCmdPath -Value $forgeCmdContent -NoNewline -Encoding ascii
 Write-Host ''
 Write-Host "forge installed: $forgeCmdPath"
 
@@ -1769,15 +1718,7 @@ Write-Host "forge installed: $forgeCmdPath"
 # ERRORLEVEL as its own exit code) sees exit 0 regardless of python's real
 # exit code. python's own exit code is the whole point of this check.
 $decidersCmdContent = "@echo off`r`n$DecidersMarker`r`n`"$WrapperPython`" `"$DecidersPy`" %*`r`nexit /b %ERRORLEVEL%`r`n"
-# Same $WrapperPython, so the same encoding decision applies; recompute
-# from this content rather than reuse $WrapperCmdEncoding blindly, in
-# case the two contents ever diverge.
-$DecidersCmdEncoding = Get-CmdSafeEncoding $decidersCmdContent
-if (-not $DecidersCmdEncoding) {
-    [Console]::Error.WriteLine("deciders.cmd: the Python path `"$WrapperPython`" contains a character cmd.exe cannot read on this Windows version (needs the OEM code page or a UTF-8-BOM-aware cmd.exe, build 18362+). Install Python to a path without that character, then re-run.")
-    exit 1
-}
-[System.IO.File]::WriteAllText($decidersCmdPath, $decidersCmdContent, $DecidersCmdEncoding)
+Set-Content -LiteralPath $decidersCmdPath -Value $decidersCmdContent -NoNewline -Encoding ascii
 Write-Host "deciders installed: $decidersCmdPath"
 
 # The OpenRouter key for deciders: this installer never reads, prompts for
