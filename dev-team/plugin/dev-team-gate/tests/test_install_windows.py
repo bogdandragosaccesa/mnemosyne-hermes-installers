@@ -69,8 +69,10 @@ class WindowsInstallerTests(unittest.TestCase):
 
     def test_team_bank_is_a_dedicated_directory_not_the_operator_bank(self):  # Task 2
         self.has("'dev-team-mnemosyne'", self.text, "no dedicated team bank directory name")
-        self.assertNotIn("$env:MNEMOSYNE_HOME", self.text,
+        self.assertNotIn("$TeamMemoryHome = $env:MNEMOSYNE_HOME", self.text,
                          "MNEMOSYNE_HOME must no longer select the team bank")
+        self.has("$env:MNEMOSYNE_HOME", self.text,
+                 "MNEMOSYNE_HOME must still be checked by the refusal guard (review finding #1)")
         self.has("-TeamMemory", self.text, "no -TeamMemory override parameter")
         self.has("-AdoptTeamMemory", self.text, "no -AdoptTeamMemory opt-in parameter")
         self.has("OperatorMnemoHome", self.text, "no explicit operator-bank variable")
@@ -740,6 +742,55 @@ class WindowsTeamMemoryTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("operator's own bank", proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_mnemosyne_home_env_var(self):  # r2 review finding #1
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            decoy = Path(tmp) / "decoy-mnemosyne-home"
+            decoy.mkdir()
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(decoy))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60,
+                                  env={**os.environ, "MNEMOSYNE_HOME": str(decoy)})
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("MNEMOSYNE_HOME", proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_path_nested_in_the_operator_bank(self):  # r2 review finding #2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            nested = root / "mnemosyne" / "team"
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(nested))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
+        self.assertFalse(nested.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_path_containing_the_operator_bank(self):  # r2 review finding #2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(root))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_param_is_made_absolute_before_use(self):  # r2 review finding #3
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            harness = self._team_memory_harness(tmp, root, team_memory_arg="relbank")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"TEAM_HOME={Path(tmp) / 'relbank'}", proc.stdout)
 
 
 class WorkflowTests(unittest.TestCase):

@@ -72,6 +72,9 @@ class InstallerSetupMixin:
         (self.root / "plugins" / "mnemosyne").mkdir(parents=True)
         (self.root / "mnemosyne" / "data").mkdir(parents=True)
         (self.root / "mnemosyne" / "data" / "mnemosyne.db").write_text("shared")
+        # review finding #5: more than one file in the tree, so a
+        # whole-tree snapshot comparison is actually exercised.
+        (self.root / "mnemosyne" / "data" / "mnemosyne.db-wal").write_text("wal-bytes")
         (self.root / "config.yaml").touch()
         self.home.mkdir()
         bindir = self.tmp / "bin"
@@ -93,6 +96,18 @@ class InstallerSetupMixin:
     def profile(self, role, prefix="dev-"):
         return self.root / "profiles" / f"{prefix}{role}"
 
+    def snapshot_tree(self, root):
+        """(relpath, sha256, mtime_ns) for every file under root, review
+        finding #5: a 'byte-identical' claim must cover the whole tree, not
+        one file's bytes plus its mtime."""
+        import hashlib
+        snap = {}
+        for p in sorted(Path(root).rglob("*")):
+            if p.is_file():
+                snap[str(p.relative_to(root))] = (
+                    hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns)
+        return snap
+
 
 class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
     def test_fresh_profiles_link_the_team_bank_not_the_operator_bank(self):  # Task 2
@@ -109,13 +124,10 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertTrue(team_home.is_dir())
 
     def test_operator_bank_is_never_touched(self):  # Task 2, acceptance #2
-        operator_db = self.root / "mnemosyne" / "data" / "mnemosyne.db"
-        before_bytes = operator_db.read_bytes()
-        before_mtime = operator_db.stat().st_mtime_ns
+        before = self.snapshot_tree(self.root / "mnemosyne")  # whole tree (finding #5)
         proc = self.install()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(operator_db.read_bytes(), before_bytes)
-        self.assertEqual(operator_db.stat().st_mtime_ns, before_mtime)
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
         for role in ROLES:
             link = self.profile(role) / "mnemosyne"
             self.assertNotEqual(link.resolve(), (self.root / "mnemosyne").resolve())
@@ -123,14 +135,60 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
     def test_mnemosyne_home_env_var_does_not_select_the_team_bank(self):  # Task 2, acc #1
         decoy = self.tmp / "decoy-mnemosyne-home"
         decoy.mkdir()
-        operator_db = self.root / "mnemosyne" / "data" / "mnemosyne.db"
-        before_bytes = operator_db.read_bytes()
+        (decoy / "data").mkdir()
+        (decoy / "data" / "mnemosyne.db").write_text("operator-relocated-bank")  # non-empty (finding #5)
+        before_operator = self.snapshot_tree(self.root / "mnemosyne")
+        before_decoy = self.snapshot_tree(decoy)
         proc = self.install(MNEMOSYNE_HOME=str(decoy))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse(any(decoy.iterdir()), "MNEMOSYNE_HOME must not be written to")
-        self.assertEqual(operator_db.read_bytes(), before_bytes)
+        self.assertEqual(self.snapshot_tree(decoy), before_decoy, "MNEMOSYNE_HOME must not be written to")
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before_operator)
         link = self.profile("pm") / "mnemosyne"
         self.assertEqual(link.resolve(), (self.root / "dev-team-mnemosyne").resolve())
+
+    def test_team_memory_flag_refuses_mnemosyne_home(self):  # Task 2 r2, finding #1
+        decoy = self.tmp / "decoy-mnemosyne-home"
+        decoy.mkdir()
+        proc = self.install("--team-memory", str(decoy), MNEMOSYNE_HOME=str(decoy))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("MNEMOSYNE_HOME", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertFalse(any(decoy.iterdir()))
+
+    def test_team_memory_flag_refuses_a_path_nested_in_the_operator_bank(self):  # finding #2
+        nested = self.root / "mnemosyne" / "team"
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", str(nested))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
+        self.assertFalse(nested.exists(), "the operator bank must not gain a new subdirectory")
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_flag_refuses_a_path_containing_the_operator_bank(self):  # finding #2
+        # --team-memory the Hermes root itself: the operator bank
+        # ($HERMES_ROOT/mnemosyne) sits INSIDE the requested team home, the
+        # reverse direction from the nested-path probe above.
+        proc = self.install("--team-memory", str(self.root))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_flag_is_made_absolute_before_use(self):  # finding #3
+        # A relative --team-memory used to be taken verbatim: `ln -sfn
+        # relbank` made a dangling relative symlink in every profile, and
+        # the bank was created relative to the installer's cwd.
+        cwd = self.tmp / "cwd"
+        cwd.mkdir()
+        proc = subprocess.run(["bash", str(INSTALLER), "--skip-model", "--team-memory", "relbank"],
+                              cwd=str(cwd), env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        link = self.profile("pm") / "mnemosyne"
+        self.assertTrue(link.is_symlink())
+        target = os.readlink(link)
+        self.assertTrue(os.path.isabs(target), f"link target {target!r} is not absolute")
+        self.assertEqual(Path(target).resolve(), (cwd / "relbank").resolve())
+        self.assertTrue((cwd / "relbank").is_dir())
 
     def test_team_memory_flag_overrides_the_default_location(self):  # Task 2, acc #1
         custom = self.tmp / "custom-team-bank"

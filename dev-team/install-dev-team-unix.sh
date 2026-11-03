@@ -352,12 +352,52 @@ PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 # operator's own bank ($HERMES_ROOT/mnemosyne, or whatever MNEMOSYNE_HOME
 # points at -- that store is never linked into, read from, or written to by
 # this installer). --team-memory overrides the location.
+
+# Resolves $1 to an absolute path (realpath -m semantics): walks up from
+# $1 to the nearest existing ancestor, resolves THAT via `cd ... && pwd -P`
+# (so a symlink hop in the existing part of the path is followed), then
+# re-appends whatever does not exist yet literally. Used both to make
+# --team-memory absolute before it is ever used (review finding #3: a
+# relative value must not become a dangling relative symlink or a bank
+# created under the cwd) and to resolve the operator bank / MNEMOSYNE_HOME
+# for the containment check below.
+resolve_abs_nearest() {
+    local p="$1" suffix="" cur
+    case "$p" in
+        /*) cur="$p" ;;
+        *)  cur="$PWD/$p" ;;
+    esac
+    while [[ ! -d "$cur" ]]; do
+        suffix="/${cur##*/}$suffix"
+        cur="${cur%/*}"
+        [[ -n "$cur" ]] || cur="/"
+    done
+    printf '%s' "$(cd "$cur" && pwd -P)$suffix"
+}
+
+# True if $2 (already resolved) is exactly $1 or nested under it. Called
+# with the arguments swapped at each use site, so both "team is inside
+# operator" and "operator is inside team" are caught (review finding #2).
+path_is_or_under() {
+    local outer="${1%/}" inner="${2%/}"
+    [[ "$inner" == "$outer" || "$inner" == "$outer"/* ]]
+}
+
 OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"
-TEAM_MEMORY_HOME="${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}"
-_operator_home_real="$(cd "$OPERATOR_MNEMO_HOME" 2>/dev/null && pwd -P || printf '%s' "${OPERATOR_MNEMO_HOME%/}")"
-_team_home_real="$(cd "$TEAM_MEMORY_HOME" 2>/dev/null && pwd -P || printf '%s' "${TEAM_MEMORY_HOME%/}")"
-if [[ "$_team_home_real" == "$_operator_home_real" ]]; then
-    echo "--team-memory must not point at the operator's own bank ($OPERATOR_MNEMO_HOME)." >&2
+TEAM_MEMORY_HOME="$(resolve_abs_nearest "${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}")"
+_operator_home_real="$(resolve_abs_nearest "$OPERATOR_MNEMO_HOME")"
+_team_home_real="$TEAM_MEMORY_HOME"
+_team_memory_refusal=""
+if path_is_or_under "$_operator_home_real" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_operator_home_real"; then
+    _team_memory_refusal="the operator's own bank ($OPERATOR_MNEMO_HOME)"
+elif [[ -n "${MNEMOSYNE_HOME:-}" ]]; then
+    _mnemosyne_home_real="$(resolve_abs_nearest "$MNEMOSYNE_HOME")"
+    if path_is_or_under "$_mnemosyne_home_real" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_mnemosyne_home_real"; then
+        _team_memory_refusal="MNEMOSYNE_HOME ($MNEMOSYNE_HOME)"
+    fi
+fi
+if [[ -n "$_team_memory_refusal" ]]; then
+    echo "--team-memory must not point at, be nested in, or contain $_team_memory_refusal." >&2
     exit 2
 fi
 # Team state (forge project records, team clones) must be visible to every
@@ -795,6 +835,16 @@ for i in "${!NAMES[@]}"; do
         if (( DRY_RUN )); then
             say "  would link: $profile_dir/mnemosyne -> $TEAM_MEMORY_HOME"
         elif [[ -L "$profile_dir/mnemosyne" ]]; then
+            # Re-run, already a link. If an older installer pointed it at
+            # the operator's own bank, say so: the operator loses this
+            # profile's access to those memories by repointing, even though
+            # the operator bank itself is untouched (review finding #6).
+            _prev_link_target="$(readlink -f -- "$profile_dir/mnemosyne" 2>/dev/null || true)"
+            if [[ -n "$_prev_link_target" && "$_prev_link_target" == "$_operator_home_real" ]]; then
+                say "  NOTE: $profile_dir/mnemosyne was linked to the operator's own bank;"
+                say "        repointing to the team bank. The operator's bank is untouched,"
+                say "        but this profile loses access to memories only there."
+            fi
             run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
         elif [[ -d "$profile_dir/mnemosyne" ]] && (( existed )); then
             if (( ADOPT_TEAM_MEMORY )); then

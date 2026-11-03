@@ -649,18 +649,64 @@ $PluginSrcMnemo = Join-Path $HermesRoot 'plugins\mnemosyne'
 # operator's own bank ($HermesRoot\mnemosyne, or whatever MNEMOSYNE_HOME
 # points at -- that store is never linked into, read from, or written to by
 # this installer). -TeamMemory overrides the location.
-$OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
-$TeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
-function Get-NormalizedExistingOrLiteral {
-    <# Resolves $Path via Get-NormalizedPath if it exists, else normalizes
-       the literal string (no trailing backslash) so a not-yet-created team
-       bank can still be compared against the operator's bank. #>
+function Resolve-TeamMemoryRealPath {
+    <#
+      Resolves $Path to an absolute path (realpath -m semantics: GetFullPath
+      always applies, even to a not-yet-created path -- review finding #3).
+      For whatever portion already exists, also follows the nearest existing
+      ancestor's symlink/junction target (bounded, to survive a cycle), so a
+      -TeamMemory that IS a junction to the operator bank, or that sits
+      through one, resolves to where it really lands (review findings #2
+      and #4) rather than to the junction's own literal path.
+    #>
     param([string] $Path)
-    if (Test-Path -LiteralPath $Path) { return Get-NormalizedPath $Path }
-    return $Path.TrimEnd('\')
+    if (-not $Path) { return $Path }
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $cur = Get-NormalizedPath $Path
+    $suffix = ''
+    while ($cur -and -not (Test-Path -LiteralPath $cur)) {
+        $suffix = "$sep$(Split-Path -Leaf $cur)$suffix"
+        $parent = Split-Path -Parent $cur
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent
+    }
+    for ($i = 0; $i -lt 10; $i++) {
+        $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+        if (-not ($item -and $item.LinkType -and $item.Target)) { break }
+        $target = $item.Target
+        if ($target -is [System.Array]) { $target = $target[0] }
+        $next = Get-NormalizedPath $target
+        if (-not $next -or $next -ieq $cur) { break }
+        $cur = $next
+    }
+    return (Get-NormalizedPath "$cur$suffix")
 }
-if ((Get-NormalizedExistingOrLiteral $TeamMemoryHome) -eq (Get-NormalizedExistingOrLiteral $OperatorMnemoHome)) {
-    [Console]::Error.WriteLine("-TeamMemory must not point at the operator's own bank ($OperatorMnemoHome).")
+function Test-PathIsOrUnder {
+    <# True if $Desc (normalized) equals $Anc or is nested inside it. #>
+    param([string] $Anc, [string] $Desc)
+    if (-not $Anc -or -not $Desc) { return $false }
+    if ($Desc -ieq $Anc) { return $true }
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    return $Desc.StartsWith("$Anc$sep", [System.StringComparison]::OrdinalIgnoreCase)
+}
+$OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
+$rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
+$TeamMemoryHome = Resolve-TeamMemoryRealPath $rawTeamMemoryHome
+$_operatorHomeReal = Resolve-TeamMemoryRealPath $OperatorMnemoHome
+$_teamHomeReal = $TeamMemoryHome
+$_teamMemoryRefusal = $null
+if ((Test-PathIsOrUnder -Anc $_operatorHomeReal -Desc $_teamHomeReal) -or
+    (Test-PathIsOrUnder -Anc $_teamHomeReal -Desc $_operatorHomeReal)) {
+    $_teamMemoryRefusal = "the operator's own bank ($OperatorMnemoHome)"
+} elseif ($env:MNEMOSYNE_HOME) {
+    $_mnemosyneHomeReal = Resolve-TeamMemoryRealPath $env:MNEMOSYNE_HOME
+    if ((Test-PathIsOrUnder -Anc $_mnemosyneHomeReal -Desc $_teamHomeReal) -or
+        (Test-PathIsOrUnder -Anc $_teamHomeReal -Desc $_mnemosyneHomeReal)) {
+        $_teamMemoryRefusal = "MNEMOSYNE_HOME ($($env:MNEMOSYNE_HOME))"
+    }
+}
+if ($_teamMemoryRefusal) {
+    [Console]::Error.WriteLine("-TeamMemory must not point at, be nested in, or contain $_teamMemoryRefusal.")
     exit 2
 }
 # Team state (forge project records, team clones) must be visible to every
@@ -1002,6 +1048,21 @@ foreach ($role in $Profiles.Keys) {
             # clone call is itself the first `-p $name`-equivalent
             # invocation that creates it. New-DirLink's Remove-Item +
             # New-Item replaces it safely.
+            #
+            # Re-run, already a junction: if an older installer pointed it
+            # at the operator's own bank, say so -- the operator loses this
+            # profile's access to those memories by repointing, even though
+            # the operator bank itself is untouched (review finding #6).
+            if ($isLink -and $existing.Target) {
+                $prevTarget = $existing.Target
+                if ($prevTarget -is [System.Array]) { $prevTarget = $prevTarget[0] }
+                if ((Get-NormalizedPath $prevTarget) -ieq $_operatorHomeReal) {
+                    Write-Host "  NOTE: $dataLink was linked to the operator's own bank;"
+                    Write-Host '        repointing to the team bank. The operator''s bank is'
+                    Write-Host '        untouched, but this profile loses access to memories'
+                    Write-Host '        only there.'
+                }
+            }
             $kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome -Label 'the Mnemosyne data store'
             if ($kind -eq 'copy') { $copied += "$name (mnemosyne data)" }
         }

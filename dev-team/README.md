@@ -130,7 +130,7 @@ naming what couldn't be checked — the guard fails closed, never open.
 | `--skip-model` | `-SkipModel` | Leave each profile's model at whatever it inherited. |
 | `--keep-soul` | `-KeepSoul` | Do not overwrite an existing `SOUL.md`. |
 | `--separate-memory` | `-SeparateMemory` | Give each profile its own Mnemosyne database instead of sharing the root one. Roles then cannot read each other's notes, so the board no longer hands work between them cleanly. |
-| `--team-memory DIR` | `-TeamMemory` | Use `DIR` as the team's shared Mnemosyne bank instead of the default `$HERMES_ROOT/dev-team-mnemosyne`. Created if missing. Refused if it resolves to the operator's own bank. |
+| `--team-memory DIR` | `-TeamMemory` | Use `DIR` as the team's shared Mnemosyne bank instead of the default `$HERMES_ROOT/dev-team-mnemosyne`. Created if missing. `DIR` is made absolute before use (a relative value no longer becomes a dangling relative symlink or a bank created under the installer's cwd). Refused when it resolves to, is nested under, or contains the operator's own bank (`$HERMES_ROOT/mnemosyne`) or any `MNEMOSYNE_HOME` the operator has set — checked in both directions, following symlinks/junctions on the existing part of the path. |
 | `--adopt-team-memory` | `-AdoptTeamMemory` | For each existing profile that already has a real, private `mnemosyne/` directory: move it aside to `mnemosyne.pre-team-memory-<timestamp>` (a backup, never deleted), then link it to the team bank. Without this flag such a directory is kept, unlinked, and named in the summary. Either way, merging old private memories into the team bank is out of scope for this installer — that is on the operator. |
 | `--dry-run` | `-DryRun` | Print what would happen and change nothing. |
 
@@ -150,8 +150,11 @@ any profile; move the other tool aside and re-run.
 profile's `mnemosyne` links there unless `--separate-memory`/`-SeparateMemory` was passed. **The
 operator's own bank — `$HERMES_ROOT/mnemosyne`, and any `MNEMOSYNE_HOME` the operator has set —
 is never linked into, read from, or written to by this installer**; `MNEMOSYNE_HOME` no longer
-selects the team bank, and `--team-memory`/`-TeamMemory` refuses a value that resolves to the
-operator's own bank. A profile this run creates gets its `mnemosyne` directory (the one `profile
+selects the team bank, and `--team-memory`/`-TeamMemory` refuses a value that resolves to, is
+nested under, or contains the operator's own bank or `MNEMOSYNE_HOME` (checked in both
+directions, following symlinks/junctions on the existing part of the path) — and is made
+absolute before it is ever used, so a relative value cannot become a dangling relative symlink
+or create the bank under the installer's working directory. A profile this run creates gets its `mnemosyne` directory (the one `profile
 create --clone` makes) replaced by a link to the team bank. A profile that already existed and
 has a real `mnemosyne` directory keeps it by default and is named in the final summary; pass
 `--adopt-team-memory`/`-AdoptTeamMemory` to move that directory aside as a timestamped backup
