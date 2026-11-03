@@ -60,6 +60,24 @@ def _function(text: str, name: str) -> str:
     return text[start:end + 2]
 
 
+ENV_PIN_CHECK_PY = DEV_TEAM / "scripts" / "env_pin_check.py"
+
+
+def _pin_prelude(text, python=None):
+    """What every harness that pins (or runs the -TeamMemory setup slice)
+    needs from outside its slice (A3): the interpreter the installer
+    resolves before any pin logic -- here the one running this suite -- the
+    checker's path, and the pin gate's functions. Redefining a function the
+    slice also defines is harmless: both definitions are the same text."""
+    import sys
+    py = (python or sys.executable).replace("'", "''")
+    return (f"$WrapperPython = '{py}'\n"
+            f"$EnvPinCheckPy = '{str(ENV_PIN_CHECK_PY).replace(chr(39), chr(39) * 2)}'\n"
+            + "".join(_function(text, f) + "\n" for f in (
+                "Format-EnvPinForDisplay", "Get-EnvPinCheckerReason",
+                "Get-EnvUnsafeValueReason", "Assert-EnvPinSafe")))
+
+
 class WindowsInstallerTests(unittest.TestCase):
     def setUp(self):
         # read_text translates CRLF, so "\n" works for either line ending
@@ -138,7 +156,7 @@ class WindowsInstallerTests(unittest.TestCase):
             harness = Path(tmp) / "env_pin.ps1"
             harness.write_text(
                 self._PS51_LEGACY_ENCODING_PRELUDE
-                + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '{bank}'\n"
                 + "Write-Output 'PIN_DONE'\n")
@@ -165,7 +183,7 @@ class WindowsInstallerTests(unittest.TestCase):
             harness = Path(tmp) / "env_pin_rewrite.ps1"
             harness.write_text(
                 self._PS51_LEGACY_ENCODING_PRELUDE
-                + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new'\n"
                 + "Write-Output 'PIN_DONE'\n")
@@ -198,7 +216,7 @@ class WindowsInstallerTests(unittest.TestCase):
             profile_dir.mkdir(parents=True)
             harness = Path(tmp) / "env_pin_special.ps1"
             harness.write_text(
-                _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value \"{bank}\"\n"
                 + "Write-Output 'PIN_DONE'\n")
@@ -242,7 +260,7 @@ class WindowsInstallerTests(unittest.TestCase):
             env_file.write_text("MNEMOSYNE_HOME='/old/quoted'\nOTHER=keep\n", encoding="utf-8")
             harness = Path(tmp) / "env_pin_rerun.ps1"
             harness.write_text(
-                _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new/bank'\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new/bank2'\n"
@@ -271,7 +289,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n"
             "$TeamMemory = $env:TEAM_MEMORY_ARG\n"
-            + norm_fn + "\n" + snippet +
+            + _pin_prelude(self.text) + norm_fn + "\n" + snippet +
             "\nWrite-Output \"TEAM_HOME=$TeamMemoryHome\"\n")
         return harness
 
@@ -379,7 +397,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness = Path(tmp) / "profile_dir_guard.ps1"
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n$TeamMemory = $null\n"
-            + norm_fn + "\n" + dirlink_fn + "\n" + helpers +
+            + _pin_prelude(self.text) + norm_fn + "\n" + dirlink_fn + "\n" + helpers +
             f"\n$name = 'dev-qa'\n$profileDir = '{profile_dir}'\n"
             f"$KeepSoul = $false\n$DryRun = $false\n$soul = '{hermes_root}\\SOUL.md'\n"
             f"$Prefix = 'dev-'\n$PluginSrcMnemo = '{plugin_src_mnemo}'\n"
@@ -472,7 +490,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness = Path(tmp) / "separate_memory.ps1"
         harness.write_text(
             _function(self.text, "New-DirLink") + "\n"
-            + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+            + _pin_prelude(self.text)
             + _function(self.text, "Set-EnvVarPin") + "\n"
             + _function(self.text, "Set-MnemosyneDataDirPin") + "\n"
             + f"$DryRun = ${'true' if dry_run else 'false'}\n$SeparateMemory = $true\n"
@@ -1299,7 +1317,7 @@ class WindowsTeamMemoryTests(unittest.TestCase):
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n"
             f"{team_memory_param}\n"
-            + norm_fn + "\n" + snippet +
+            + _pin_prelude(self.text) + norm_fn + "\n" + snippet +
             "\nWrite-Output \"TEAM_HOME=$TeamMemoryHome\"\n")
         return harness
 
@@ -1745,7 +1763,7 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
         kwargs_lines = "\n".join(f"${k} = {v}" for k, v in call_kwargs.items())
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n$TeamMemory = $null\n"
-            + norm_fn + "\n" + dirlink_fn + "\n" + snippet + "\n" + fn_body +
+            + _pin_prelude(self.text) + norm_fn + "\n" + dirlink_fn + "\n" + snippet + "\n" + fn_body +
             "\nNew-Item -ItemType Directory -Path $TeamMemoryHome -Force | Out-Null\n"
             f"\n{kwargs_lines}\n"
             f"$r = Invoke-MnemosyneDataLink -ProfileDir $ProfileDirArg -Name $NameArg -Exists $ExistsArg "

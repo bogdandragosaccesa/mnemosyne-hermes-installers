@@ -143,7 +143,16 @@ put `forge` where the gateway resolves it — `~/.local/bin/forge` on Unix, `for
 profile, exiting non-zero otherwise. The plugin checks are retried for a few seconds first, because
 right after `plugins enable` the list can lag the reload. If a `forge` already exists there and
 this installer didn't write it (Laravel Forge, Foundry), the installer refuses before it touches
-any profile; move the other tool aside and re-run.
+any profile; move the other tool aside and re-run. On Windows, `forge.cmd` and `deciders.cmd` name
+the Python and the dev-team checkout by absolute path, and cmd.exe reads a `.cmd` file in the
+console code page, so neither path can be non-ASCII. The installer picks the first ASCII-path
+Python it finds (Hermes's own, then `py -3`, then `python` on PATH). If there is none — e.g. a
+non-ASCII user name and no other Python — it exits 2 before touching any profile: install a
+Python 3 on an ASCII path (such as `C:\Python312`, on PATH) and re-run.
+
+Both installers check every `MNEMOSYNE_HOME`/`MNEMOSYNE_DATA_DIR` value they pin with
+`dev-team/scripts/env_pin_check.py`, run on the resolved value, and refuse (exit 2) any value
+Hermes's and Mnemosyne's `.env` readers would not both read back exactly.
 
 **The team's shared memory bank is a dedicated directory**, `$HERMES_ROOT/dev-team-mnemosyne`
 (Windows: `Join-Path $HermesRoot 'dev-team-mnemosyne'`), created when missing. Every installed

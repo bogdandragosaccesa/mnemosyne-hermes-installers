@@ -140,7 +140,11 @@ function Get-EnvPin([string] $Dir, [string] $Name) {
     $envFile = Join-Path $Dir '.env'
     if (-not (Test-Path -LiteralPath $envFile)) { return '' }
     $val = ''
-    foreach ($line in @(Get-Content -LiteralPath $envFile)) {
+    # The installer writes .env as BOM-less UTF-8 (Set-EnvVarPin). Under
+    # Windows PowerShell 5.1 (the ps51 job) Get-Content with no -Encoding
+    # decodes that as ANSI and mangles a non-ASCII pin (PR #9 review,
+    # section 3); ReadAllLines with UTF8 also honours a BOM if present.
+    foreach ($line in [System.IO.File]::ReadAllLines($envFile, [System.Text.Encoding]::UTF8)) {
         if ($line.StartsWith("$Name=")) { $val = $line.Substring($Name.Length + 1) }
     }
     return Unquote-EnvPin $val
