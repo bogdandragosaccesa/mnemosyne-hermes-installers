@@ -74,6 +74,8 @@ param(
     [switch]   $SkipModel,
     [switch]   $KeepSoul,
     [switch]   $SeparateMemory,
+    [string]   $TeamMemory,
+    [switch]   $AdoptTeamMemory,
     [switch]   $DryRun,
     [string]   $TierFast,
     [string]   $TierStandard,
@@ -643,9 +645,24 @@ if ((Split-Path -Leaf (Split-Path -Parent $HermesRoot)) -eq 'profiles') {
     $HermesRoot = Split-Path -Parent (Split-Path -Parent $HermesRoot)
 }
 $PluginSrcMnemo = Join-Path $HermesRoot 'plugins\mnemosyne'
-# The one real Mnemosyne data root, which every profile is pointed at unless
-# -SeparateMemory was passed. Honour MNEMOSYNE_HOME if the store was relocated.
-$MnemoHome = if ($env:MNEMOSYNE_HOME) { $env:MNEMOSYNE_HOME } else { Join-Path $HermesRoot 'mnemosyne' }
+# The team's shared Mnemosyne bank: a dedicated directory, never the
+# operator's own bank ($HermesRoot\mnemosyne, or whatever MNEMOSYNE_HOME
+# points at -- that store is never linked into, read from, or written to by
+# this installer). -TeamMemory overrides the location.
+$OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
+$TeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
+function Get-NormalizedExistingOrLiteral {
+    <# Resolves $Path via Get-NormalizedPath if it exists, else normalizes
+       the literal string (no trailing backslash) so a not-yet-created team
+       bank can still be compared against the operator's bank. #>
+    param([string] $Path)
+    if (Test-Path -LiteralPath $Path) { return Get-NormalizedPath $Path }
+    return $Path.TrimEnd('\')
+}
+if ((Get-NormalizedExistingOrLiteral $TeamMemoryHome) -eq (Get-NormalizedExistingOrLiteral $OperatorMnemoHome)) {
+    [Console]::Error.WriteLine("-TeamMemory must not point at the operator's own bank ($OperatorMnemoHome).")
+    exit 2
+}
 # Team state (forge project records, team clones) must be visible to every
 # role: devops writes the project record at onboarding, pr-ci reads it to
 # open the PR, and the guard reads it from every other stage to verify the
@@ -797,7 +814,7 @@ Write-Host "Mnemosyne:     $PluginSrcMnemo"
 Write-Host "dev-team-gate: $PluginSrcGate"
 Write-Host "Model:         $modelLabel"
 Write-Host "Name prefix:   $Prefix"
-$memLabel = if ($SeparateMemory) { 'separate per profile' } else { "shared bank at $MnemoHome" }
+$memLabel = if ($SeparateMemory) { 'separate per profile' } else { "team bank at $TeamMemoryHome" }
 Write-Host "Memory:        $memLabel"
 Write-Host "Team state:    $DevTeamHome (shared across every profile)"
 Write-Host ''
@@ -829,6 +846,19 @@ $created  = 0
 $updated  = 0
 $copied   = @()
 $unshared = @()
+$adopted  = @()
+
+if (-not $SeparateMemory) {
+    if ($DryRun) {
+        if (-not (Test-Path -LiteralPath $TeamMemoryHome)) { Write-Host "  would create: $TeamMemoryHome" }
+    } else {
+        New-Item -ItemType Directory -Path $TeamMemoryHome -Force | Out-Null
+    }
+}
+# One timestamp per run, reused for every profile -AdoptTeamMemory backs up:
+# distinct profiles live in distinct directories, so a shared timestamp
+# cannot collide.
+$AdoptTimestamp = Get-Date -Format 'yyyyMMddHHmmss'
 
 foreach ($role in $Profiles.Keys) {
     if (-not (Test-Selected $role)) { continue }
@@ -888,7 +918,7 @@ foreach ($role in $Profiles.Keys) {
     if ($DryRun) {
         Write-Host "  would link: $profileDir\plugins\mnemosyne -> $PluginSrcMnemo"
         if (-not $SeparateMemory) {
-            Write-Host "  would link: $profileDir\mnemosyne -> $MnemoHome"
+            Write-Host "  would link: $profileDir\mnemosyne -> $TeamMemoryHome"
         }
         Write-Host "  would link: $profileDir\plugins\dev-team-gate -> $PluginSrcGate"
         Write-Host "  would run:  hermes -p $name config set model.default ..."
@@ -926,22 +956,42 @@ foreach ($role in $Profiles.Keys) {
     if ($mnemoLinkKind -eq 'copy') { $copied += "$name (mnemosyne plugin)" }
 
     # The plugin link above shares Mnemosyne's *code*. It does not share its
-    # *data*: the database path resolves from MNEMOSYNE_HOME, which defaults
-    # to $HERMES_HOME\mnemosyne - and a named profile has redirected
-    # HERMES_HOME. Point each profile's Mnemosyne data root at the one real
-    # store, unless -SeparateMemory asked for isolation.
+    # *data*: the database path resolves from a MNEMOSYNE_HOME the Mnemosyne
+    # plugin itself computes at runtime, which defaults to
+    # $HERMES_HOME\mnemosyne - and a named profile has redirected
+    # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
+    # dedicated bank, unless -SeparateMemory asked for isolation. The
+    # operator's own bank ($HermesRoot\mnemosyne) is never a candidate here.
     if (-not $SeparateMemory) {
         $dataLink = Join-Path $profileDir 'mnemosyne'
         $existing = Get-Item -LiteralPath $dataLink -ErrorAction SilentlyContinue
         $isLink   = $existing -and $existing.LinkType
         if ($existing -and -not $isLink -and $exists) {
-            # A real directory on a profile that already existed before this
-            # run means it has its own memories. Merging them is not ours to
-            # decide, so leave it and say so rather than deleting somebody's
-            # history.
-            Write-Host "  NOTE: $dataLink is a real directory with its own database."
-            Write-Host '        Left as-is - this profile will not share the team bank.'
-            $unshared += $name
+            if ($AdoptTeamMemory) {
+                # Opt-in: back up the real private directory (never delete
+                # it), then link to the team bank. Merging its contents
+                # into the team bank is out of scope for this installer.
+                $backupDir = Join-Path $profileDir "mnemosyne.pre-team-memory-$AdoptTimestamp"
+                Move-Item -LiteralPath $dataLink -Destination $backupDir
+                $kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome -Label 'the Mnemosyne data store'
+                if ($kind -eq 'copy') { $copied += "$name (mnemosyne data)" }
+                Write-Host "  ADOPTED: $name's private mnemosyne\ moved to $backupDir"
+                Write-Host '           (backup, not deleted) and linked to the team bank.'
+                Write-Host '           Merging its old memories into the team bank is out'
+                Write-Host '           of scope for this installer.'
+                $adopted += $name
+            } else {
+                # A real directory on a profile that already existed before this
+                # run means it has its own memories. Merging them is not ours to
+                # decide, so leave it and say so rather than deleting somebody's
+                # history.
+                Write-Host "  NOTE: $dataLink is a real directory with its own database."
+                Write-Host '        Left as-is - this profile will not share the team bank.'
+                Write-Host '        Re-run with -AdoptTeamMemory to move it aside (as a'
+                Write-Host '        backup) and link to the team bank, or remove/merge it'
+                Write-Host '        yourself, then re-run.'
+                $unshared += $name
+            }
         } else {
             # Either already a junction, or nothing there yet, or - the case
             # this fixes - a real directory that `hermes profile create
@@ -952,7 +1002,7 @@ foreach ($role in $Profiles.Keys) {
             # clone call is itself the first `-p $name`-equivalent
             # invocation that creates it. New-DirLink's Remove-Item +
             # New-Item replaces it safely.
-            $kind = New-DirLink -LinkPath $dataLink -Target $MnemoHome -Label 'the Mnemosyne data store'
+            $kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome -Label 'the Mnemosyne data store'
             if ($kind -eq 'copy') { $copied += "$name (mnemosyne data)" }
         }
     }
@@ -1243,6 +1293,15 @@ Each was copied instead. A copy will not track later changes to its source
 (e.g. a Mnemosyne upgrade), so re-run this script for the affected profile
 after the source changes.
 "@
+}
+
+if ($adopted.Count -gt 0) {
+    Write-Host ''
+    Write-Host "Adopted into the team bank (-AdoptTeamMemory): $($adopted -join ', ')"
+    Write-Host "Each profile's old private mnemosyne\ was backed up alongside it as"
+    Write-Host 'mnemosyne.pre-team-memory-<timestamp> (never deleted) before linking.'
+    Write-Host 'Merging those old memories into the team bank is out of scope for this'
+    Write-Host 'installer.'
 }
 
 if ($unshared.Count -gt 0) {

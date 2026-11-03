@@ -67,6 +67,20 @@ class WindowsInstallerTests(unittest.TestCase):
         self.has("'anthropic/claude-haiku-4-5'", self.text, "no haiku fast default")
         self.assertFalse("liquid" in self.text, "a decisions model is still suggested")
 
+    def test_team_bank_is_a_dedicated_directory_not_the_operator_bank(self):  # Task 2
+        self.has("'dev-team-mnemosyne'", self.text, "no dedicated team bank directory name")
+        self.assertNotIn("$env:MNEMOSYNE_HOME", self.text,
+                         "MNEMOSYNE_HOME must no longer select the team bank")
+        self.has("-TeamMemory", self.text, "no -TeamMemory override parameter")
+        self.has("-AdoptTeamMemory", self.text, "no -AdoptTeamMemory opt-in parameter")
+        self.has("OperatorMnemoHome", self.text, "no explicit operator-bank variable")
+
+    def test_adopt_team_memory_backs_up_before_linking(self):  # Task 2, acc #3
+        self.has("mnemosyne.pre-team-memory-", self.text, "no backup directory naming")
+        self.has("Move-Item -LiteralPath $dataLink -Destination $backupDir", self.text,
+                 "adopted directory is not moved aside as a backup")
+        self.has("out of scope", self.text, "no out-of-scope note for merging old memories")
+
     def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
         # Both the dry-run and real-run key notes used to say "add
         # OPENROUTER_DECIDERS_KEY to each profile's .env".
@@ -668,6 +682,64 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             # (via a re-run), never at the just-moved chosen path.
             self.assertIn("    # then re-run this installer: it relinks every team profile", proc.stdout)
             self.assertNotIn("New-DirLink against", proc.stdout)
+
+
+class WindowsTeamMemoryTests(unittest.TestCase):
+    """Task 2: the team bank is a dedicated directory, never the operator's
+    own bank. Exercises the pure refusal/selection logic the same way the
+    T4 tests above exercise the root-climb and migration-plan pieces."""
+
+    def setUp(self):
+        self.text = PS1.read_text(encoding="utf-8")
+
+    def _team_memory_harness(self, tmp, hermes_root, team_memory_arg=None):
+        start = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        end = self.text.index("# Team state (forge project records")
+        snippet = self.text[start:end]
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        harness = Path(tmp) / "harness.ps1"
+        team_memory_param = f"$TeamMemory = '{team_memory_arg}'" if team_memory_arg else "$TeamMemory = $null"
+        harness.write_text(
+            f"$HermesRoot = '{hermes_root}'\n"
+            f"{team_memory_param}\n"
+            + norm_fn + "\n" + snippet +
+            "\nWrite-Output \"TEAM_HOME=$TeamMemoryHome\"\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_default_team_home_is_dev_team_mnemosyne_not_mnemosyne(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            harness = self._team_memory_harness(tmp, root)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"TEAM_HOME={root / 'dev-team-mnemosyne'}", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_param_overrides_the_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            custom = Path(tmp) / "custom-bank"
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(custom))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"TEAM_HOME={custom}", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_the_operators_own_bank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            operator_bank = root / "mnemosyne"
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(operator_bank))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
 
 
 class WorkflowTests(unittest.TestCase):

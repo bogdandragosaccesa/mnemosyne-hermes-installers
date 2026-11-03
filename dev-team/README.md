@@ -130,6 +130,8 @@ naming what couldn't be checked — the guard fails closed, never open.
 | `--skip-model` | `-SkipModel` | Leave each profile's model at whatever it inherited. |
 | `--keep-soul` | `-KeepSoul` | Do not overwrite an existing `SOUL.md`. |
 | `--separate-memory` | `-SeparateMemory` | Give each profile its own Mnemosyne database instead of sharing the root one. Roles then cannot read each other's notes, so the board no longer hands work between them cleanly. |
+| `--team-memory DIR` | `-TeamMemory` | Use `DIR` as the team's shared Mnemosyne bank instead of the default `$HERMES_ROOT/dev-team-mnemosyne`. Created if missing. Refused if it resolves to the operator's own bank. |
+| `--adopt-team-memory` | `-AdoptTeamMemory` | For each existing profile that already has a real, private `mnemosyne/` directory: move it aside to `mnemosyne.pre-team-memory-<timestamp>` (a backup, never deleted), then link it to the team bank. Without this flag such a directory is kept, unlinked, and named in the summary. Either way, merging old private memories into the team bank is out of scope for this installer — that is on the operator. |
 | `--dry-run` | `-DryRun` | Print what would happen and change nothing. |
 
 Both installers are idempotent (re-running upgrades the SOUL, model, plugin link and skills in
@@ -141,14 +143,24 @@ put `forge` where the gateway resolves it — `~/.local/bin/forge` on Unix, `for
 profile, exiting non-zero otherwise. The plugin checks are retried for a few seconds first, because
 right after `plugins enable` the list can lag the reload. If a `forge` already exists there and
 this installer didn't write it (Laravel Forge, Foundry), the installer refuses before it touches
-any profile; move the other tool aside and re-run. A profile this run creates gets its
-`mnemosyne` directory (the one `profile create --clone` makes) replaced by a link to the shared
-bank. A profile that already existed and has a real `mnemosyne` directory keeps it and is named in
-the final summary. Symlinks on Unix become
+any profile; move the other tool aside and re-run.
+
+**The team's shared memory bank is a dedicated directory**, `$HERMES_ROOT/dev-team-mnemosyne`
+(Windows: `Join-Path $HermesRoot 'dev-team-mnemosyne'`), created when missing. Every installed
+profile's `mnemosyne` links there unless `--separate-memory`/`-SeparateMemory` was passed. **The
+operator's own bank — `$HERMES_ROOT/mnemosyne`, and any `MNEMOSYNE_HOME` the operator has set —
+is never linked into, read from, or written to by this installer**; `MNEMOSYNE_HOME` no longer
+selects the team bank, and `--team-memory`/`-TeamMemory` refuses a value that resolves to the
+operator's own bank. A profile this run creates gets its `mnemosyne` directory (the one `profile
+create --clone` makes) replaced by a link to the team bank. A profile that already existed and
+has a real `mnemosyne` directory keeps it by default and is named in the final summary; pass
+`--adopt-team-memory`/`-AdoptTeamMemory` to move that directory aside as a timestamped backup
+(never deleted) and link it to the team bank instead — the installer never merges its old
+memories into the team bank itself. Symlinks on Unix become
 directory junctions on Windows (no Developer Mode or elevation needed), falling back to a copy
 with a warning when even a junction can't be created. On a re-run an existing junction is
 removed with `[System.IO.Directory]::Delete` and never with `Remove-Item -Recurse`. On Windows
-PowerShell 5.1 that cmdlet follows the junction and deletes the shared bank's contents.
+PowerShell 5.1 that cmdlet follows the junction and deletes the team bank's contents.
 
 ## Onboarding a project
 

@@ -30,6 +30,10 @@ KEEP_SOUL=0
 DRY_RUN=0
 PREFIX="dev-"
 SHARED_DATA=1
+# Override for the team bank directory; defaults to
+# $HERMES_ROOT/dev-team-mnemosyne when empty. Never the operator's own bank.
+TEAM_MEMORY=""
+ADOPT_TEAM_MEMORY=0
 # deciders tier table: PROVIDER:MODEL per tier, raw --tier-* values before
 # the colon split below. Unset unless the caller passes the flag (each tier
 # then defaults from FAST_MODEL/MID_MODEL/FRONTIER_MODEL).
@@ -56,6 +60,18 @@ Usage: install-dev-team-unix.sh [options]
                      sharing the root one. Roles then cannot read each
                      other's notes, so the board no longer hands work
                      between them.
+  --team-memory DIR  Use DIR as the team's shared Mnemosyne bank instead of
+                     the default $HERMES_ROOT/dev-team-mnemosyne. Created if
+                     missing. Never the operator's own bank
+                     ($HERMES_ROOT/mnemosyne) -- refused if it resolves there.
+  --adopt-team-memory
+                     For each existing profile that already has a real,
+                     private mnemosyne/ directory: move it to
+                     mnemosyne.pre-team-memory-<timestamp> (a backup, never
+                     deleted), then link it to the team bank. Without this
+                     flag such a directory is left alone. Either way, this
+                     installer never merges old private memories into the
+                     team bank -- that is on the operator.
   --tier-fast P:M     deciders tier table entry for the fast tier, as
                      PROVIDER:MODEL (e.g. anthropic:claude-haiku-4-5).
                      Default: $FAST_MODEL split on its first '/'.
@@ -80,6 +96,11 @@ while [[ $# -gt 0 ]]; do
         --skip-model) SKIP_MODEL=1; shift ;;
         --keep-soul)  KEEP_SOUL=1;  shift ;;
         --separate-memory) SHARED_DATA=""; shift ;;
+        --team-memory)
+            TEAM_MEMORY="${2:-}"
+            [[ -n $TEAM_MEMORY ]] || { echo "--team-memory needs a value" >&2; exit 2; }
+            shift 2 ;;
+        --adopt-team-memory) ADOPT_TEAM_MEMORY=1; shift ;;
         --tier-fast)
             TIER_FAST_PM="${2:-}"
             [[ -n $TIER_FAST_PM ]] || { echo "--tier-fast needs a value" >&2; exit 2; }
@@ -327,10 +348,18 @@ if [[ "$(basename "$(dirname "$HERMES_ROOT")")" == profiles ]]; then
     HERMES_ROOT="$(dirname "$(dirname "$HERMES_ROOT")")"
 fi
 PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
-# The one real Mnemosyne data root, which every profile will be pointed at
-# unless --separate-memory was passed. Honour MNEMOSYNE_HOME if the user has
-# already relocated the store.
-MNEMO_HOME="${MNEMOSYNE_HOME:-$HERMES_ROOT/mnemosyne}"
+# The team's shared Mnemosyne bank: a dedicated directory, never the
+# operator's own bank ($HERMES_ROOT/mnemosyne, or whatever MNEMOSYNE_HOME
+# points at -- that store is never linked into, read from, or written to by
+# this installer). --team-memory overrides the location.
+OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"
+TEAM_MEMORY_HOME="${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}"
+_operator_home_real="$(cd "$OPERATOR_MNEMO_HOME" 2>/dev/null && pwd -P || printf '%s' "${OPERATOR_MNEMO_HOME%/}")"
+_team_home_real="$(cd "$TEAM_MEMORY_HOME" 2>/dev/null && pwd -P || printf '%s' "${TEAM_MEMORY_HOME%/}")"
+if [[ "$_team_home_real" == "$_operator_home_real" ]]; then
+    echo "--team-memory must not point at the operator's own bank ($OPERATOR_MNEMO_HOME)." >&2
+    exit 2
+fi
 # Team state (forge project records, team clones) must be visible to every
 # role: devops writes the project record at onboarding, pr-ci reads it to
 # open the PR, and the guard reads it from every other stage to verify the
@@ -654,7 +683,7 @@ say "Mnemosyne:     $PLUGIN_SRC_MNEMO"
 say "dev-team-gate: $PLUGIN_SRC_GATE"
 say "Model:         $( ((SKIP_MODEL)) && echo '(unchanged)' || echo "$MODEL" )"
 [[ -n $PREFIX ]] && say "Name prefix:   $PREFIX"
-say "Memory:        $( [[ -n $SHARED_DATA ]] && echo "shared bank at $MNEMO_HOME" || echo 'separate per profile' )"
+say "Memory:        $( [[ -n $SHARED_DATA ]] && echo "team bank at $TEAM_MEMORY_HOME" || echo 'separate per profile' )"
 say "Team state:    $DEV_TEAM_HOME (shared across every profile)"
 say ""
 
@@ -676,7 +705,18 @@ else
 fi
 say ""
 
-created=0; updated=0; unshared=""
+created=0; updated=0; unshared=""; adopted=""
+if [[ -n $SHARED_DATA ]]; then
+    if (( DRY_RUN )); then
+        [[ -d $TEAM_MEMORY_HOME ]] || say "  would create: $TEAM_MEMORY_HOME"
+    else
+        run mkdir -p "$TEAM_MEMORY_HOME"
+    fi
+fi
+# One timestamp per run, reused for every profile --adopt-team-memory backs
+# up: distinct profiles live in distinct directories, so a shared timestamp
+# cannot collide.
+ADOPT_TS="$(date +%Y%m%d%H%M%S)"
 for i in "${!NAMES[@]}"; do
     role="${NAMES[$i]}"
     desc="${DESCS[$i]}"
@@ -745,37 +785,55 @@ for i in "${!NAMES[@]}"; do
     run ln -sfn "$PLUGIN_SRC_MNEMO" "$profile_dir/plugins/mnemosyne"
 
     # The plugin link above shares Mnemosyne's *code*. It does not share its
-    # *data*: the database path resolves from MNEMOSYNE_HOME, which defaults
-    # to $HERMES_HOME/mnemosyne — and a named profile has redirected
-    # HERMES_HOME. Point each profile's Mnemosyne data root at the one real
-    # store, unless --separate-memory asked for isolation.
+    # *data*: the database path resolves from a MNEMOSYNE_HOME the Mnemosyne
+    # plugin itself computes at runtime, which defaults to
+    # $HERMES_HOME/mnemosyne — and a named profile has redirected
+    # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
+    # dedicated bank, unless --separate-memory asked for isolation. The
+    # operator's own bank ($HERMES_ROOT/mnemosyne) is never a candidate here.
     if [[ -n $SHARED_DATA ]]; then
         if (( DRY_RUN )); then
-            say "  would link: $profile_dir/mnemosyne -> $MNEMO_HOME"
+            say "  would link: $profile_dir/mnemosyne -> $TEAM_MEMORY_HOME"
         elif [[ -L "$profile_dir/mnemosyne" ]]; then
-            run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
+            run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
         elif [[ -d "$profile_dir/mnemosyne" ]] && (( existed )); then
-            # A real directory on a profile that existed before this run
-            # means it has accumulated its own memories. Moving them is not
-            # ours to decide, so say so and leave it alone rather than
-            # deleting someone's history.
-            say "  NOTE: $profile_dir/mnemosyne is a real directory with its own"
-            say "        database. Left as-is — this profile will not share the"
-            say "        team bank. Remove or merge it, then re-run, to share."
-            unshared="$unshared $name"
+            if (( ADOPT_TEAM_MEMORY )); then
+                # Opt-in: back up the real private directory (never delete
+                # it), then link to the team bank. Merging its contents
+                # into the team bank is out of scope for this installer.
+                backup_dir="$profile_dir/mnemosyne.pre-team-memory-$ADOPT_TS"
+                run mv -- "$profile_dir/mnemosyne" "$backup_dir"
+                run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
+                say "  ADOPTED: $name's private mnemosyne/ moved to $backup_dir"
+                say "           (backup, not deleted) and linked to the team bank."
+                say "           Merging its old memories into the team bank is out"
+                say "           of scope for this installer."
+                adopted="$adopted $name"
+            else
+                # A real directory on a profile that existed before this run
+                # means it has accumulated its own memories. Moving them is not
+                # ours to decide, so say so and leave it alone rather than
+                # deleting someone's history.
+                say "  NOTE: $profile_dir/mnemosyne is a real directory with its own"
+                say "        database. Left as-is — this profile will not share the"
+                say "        team bank. Re-run with --adopt-team-memory to move it"
+                say "        aside (as a backup) and link to the team bank, or"
+                say "        remove/merge it yourself, then re-run."
+                unshared="$unshared $name"
+            fi
         else
             # Nothing there yet, or — the case this fixes — the real
             # directory `hermes profile create --clone` made a few lines up
             # in this very run. It holds no memories of this profile's own,
-            # so it is replaced by the link to the shared bank.
+            # so it is replaced by the link to the team bank.
             if [[ -d "$profile_dir/mnemosyne" ]]; then
-                if [[ "$(cd "$profile_dir/mnemosyne" && pwd -P)" == "$(cd "$MNEMO_HOME" && pwd -P)" ]]; then
-                    echo "$profile_dir/mnemosyne is the shared bank itself; refusing to remove it." >&2
+                if [[ "$(cd "$profile_dir/mnemosyne" && pwd -P)" == "$(cd "$TEAM_MEMORY_HOME" && pwd -P)" ]]; then
+                    echo "$profile_dir/mnemosyne is the team bank itself; refusing to remove it." >&2
                     exit 1
                 fi
                 rm -rf -- "$profile_dir/mnemosyne"
             fi
-            run ln -sfn "$MNEMO_HOME" "$profile_dir/mnemosyne"
+            run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
         fi
     fi
 
@@ -979,6 +1037,14 @@ done
 
 say ""
 say "Created $created, updated $updated."
+if [[ -n $adopted ]]; then
+    say ""
+    say "Adopted into the team bank (--adopt-team-memory):$adopted"
+    say "Each profile's old private mnemosyne/ was backed up alongside it as"
+    say "mnemosyne.pre-team-memory-<timestamp> (never deleted) before linking."
+    say "Merging those old memories into the team bank is out of scope for this"
+    say "installer."
+fi
 if [[ -n $unshared ]]; then
     say ""
     say "These profiles kept their own Mnemosyne database and will NOT see the"

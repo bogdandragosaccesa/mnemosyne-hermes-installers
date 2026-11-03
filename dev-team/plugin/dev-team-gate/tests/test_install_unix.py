@@ -95,16 +95,58 @@ class InstallerSetupMixin:
 
 
 class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
-    def test_fresh_profiles_link_the_shared_mnemosyne_bank(self):  # item 10
+    def test_fresh_profiles_link_the_team_bank_not_the_operator_bank(self):  # Task 2
         proc = self.install()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        team_home = self.root / "dev-team-mnemosyne"
         for role in ROLES:
             link = self.profile(role) / "mnemosyne"
             with self.subTest(role=role):
                 self.assertTrue(link.is_symlink(), f"{link} is not a symlink")
-                self.assertEqual(link.resolve(), (self.root / "mnemosyne").resolve())
-        self.assertEqual((self.root / "mnemosyne" / "data" / "mnemosyne.db").read_text(),
-                         "shared")
+                self.assertEqual(link.resolve(), team_home.resolve())
+                # Never the operator's own bank.
+                self.assertNotEqual(link.resolve(), (self.root / "mnemosyne").resolve())
+        self.assertTrue(team_home.is_dir())
+
+    def test_operator_bank_is_never_touched(self):  # Task 2, acceptance #2
+        operator_db = self.root / "mnemosyne" / "data" / "mnemosyne.db"
+        before_bytes = operator_db.read_bytes()
+        before_mtime = operator_db.stat().st_mtime_ns
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(operator_db.read_bytes(), before_bytes)
+        self.assertEqual(operator_db.stat().st_mtime_ns, before_mtime)
+        for role in ROLES:
+            link = self.profile(role) / "mnemosyne"
+            self.assertNotEqual(link.resolve(), (self.root / "mnemosyne").resolve())
+
+    def test_mnemosyne_home_env_var_does_not_select_the_team_bank(self):  # Task 2, acc #1
+        decoy = self.tmp / "decoy-mnemosyne-home"
+        decoy.mkdir()
+        operator_db = self.root / "mnemosyne" / "data" / "mnemosyne.db"
+        before_bytes = operator_db.read_bytes()
+        proc = self.install(MNEMOSYNE_HOME=str(decoy))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(any(decoy.iterdir()), "MNEMOSYNE_HOME must not be written to")
+        self.assertEqual(operator_db.read_bytes(), before_bytes)
+        link = self.profile("pm") / "mnemosyne"
+        self.assertEqual(link.resolve(), (self.root / "dev-team-mnemosyne").resolve())
+
+    def test_team_memory_flag_overrides_the_default_location(self):  # Task 2, acc #1
+        custom = self.tmp / "custom-team-bank"
+        proc = self.install("--team-memory", str(custom))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for role in ROLES:
+            link = self.profile(role) / "mnemosyne"
+            with self.subTest(role=role):
+                self.assertEqual(link.resolve(), custom.resolve())
+        self.assertFalse((self.root / "dev-team-mnemosyne").exists())
+
+    def test_team_memory_flag_refuses_the_operators_own_bank(self):  # Task 2, acc #2
+        proc = self.install("--team-memory", str(self.root / "mnemosyne"))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
 
     def test_preexisting_profile_keeps_its_own_mnemosyne(self):  # item 10
         own = self.profile("qa") / "mnemosyne" / "data"
@@ -116,6 +158,40 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertFalse((self.profile("qa") / "mnemosyne").is_symlink())
         self.assertEqual((own / "mnemosyne.db").read_text(), "qa's own memories")
         self.assertIn("dev-qa", proc.stdout)  # named in the not-shared summary
+        self.assertIn("--adopt-team-memory", proc.stdout)
+
+    def test_adopt_team_memory_backs_up_and_relinks(self):  # Task 2, acc #3
+        own = self.profile("qa") / "mnemosyne" / "data"
+        own.mkdir(parents=True)
+        (own / "mnemosyne.db").write_text("qa's own memories")
+        (self.profile("qa") / "config.yaml").touch()
+        proc = self.install("--adopt-team-memory")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        qa_dir = self.profile("qa")
+        link = qa_dir / "mnemosyne"
+        self.assertTrue(link.is_symlink(), f"{link} is not a symlink")
+        self.assertEqual(link.resolve(), (self.root / "dev-team-mnemosyne").resolve())
+
+        backups = list(qa_dir.glob("mnemosyne.pre-team-memory-*"))
+        self.assertEqual(len(backups), 1, backups)
+        self.assertEqual((backups[0] / "data" / "mnemosyne.db").read_text(),
+                          "qa's own memories")
+        self.assertIn("ADOPTED", proc.stdout)
+        self.assertIn("dev-qa", proc.stdout)
+        self.assertIn("out of scope", proc.stdout)  # merging old memories
+
+    def test_separate_memory_is_unchanged(self):  # Task 2, acc #4
+        proc = self.install("--separate-memory")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for role in ROLES:
+            link = self.profile(role) / "mnemosyne"
+            with self.subTest(role=role):
+                self.assertFalse(link.is_symlink(), f"{link} must stay a real directory")
+                self.assertTrue(link.is_dir())
+        # Not even created when every profile keeps its own database.
+        self.assertFalse((self.root / "dev-team-mnemosyne").exists())
+        self.assertIn("separate per profile", proc.stdout)
 
     def test_first_run_exits_0_when_the_plugin_list_lags(self):  # item 11
         proc = self.install(FAKE_PLUGIN_LIST_LAG="2")
