@@ -112,15 +112,27 @@ class InstallerSetupMixin:
         return self.root / "profiles" / f"{prefix}{role}"
 
     def snapshot_tree(self, root):
-        """(relpath, sha256, mtime_ns) for every file under root, review
-        finding #5: a 'byte-identical' claim must cover the whole tree, not
-        one file's bytes plus its mtime."""
+        """Every entry under root, review finding #5: a 'byte-identical'
+        claim must cover the whole tree, not one file's bytes plus its
+        mtime. Records symlinks (by target, never followed) and
+        directories as well as regular files (review r3 R3-3: the original
+        F2 bug's self-link $R/plugins/mnemosyne/mnemosyne is a symlink to a
+        directory, which a files-only snapshot never sees)."""
         import hashlib
         snap = {}
-        for p in sorted(Path(root).rglob("*")):
-            if p.is_file():
-                snap[str(p.relative_to(root))] = (
-                    hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            for n in dirnames + filenames:
+                p = Path(dirpath) / n
+                rel = str(p.relative_to(root))
+                if p.is_symlink():
+                    snap[rel] = ("symlink", os.readlink(p))
+                elif p.is_dir():
+                    snap[rel] = ("dir",)
+                elif p.is_file():
+                    snap[rel] = ("file", hashlib.sha256(p.read_bytes()).hexdigest(),
+                                 p.stat().st_mtime_ns)
+                else:
+                    snap[rel] = ("other",)
         return snap
 
 
@@ -397,6 +409,37 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         # Not even created when every profile keeps its own database.
         self.assertFalse((self.root / "dev-team-mnemosyne").exists())
         self.assertIn("separate per profile", proc.stdout)
+        # R3-1 (Unix side): each profile's .env pins its OWN bank, so an
+        # inherited MNEMOSYNE_DATA_DIR/MNEMOSYNE_HOME cannot redirect it.
+        for role in ROLES:
+            own = self.profile(role) / "mnemosyne"
+            with self.subTest(role=role):
+                lines = (self.profile(role) / ".env").read_text().splitlines()
+                self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")],
+                                 [f"MNEMOSYNE_DATA_DIR={own / 'data'}"])
+                self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_HOME=")],
+                                 [f"MNEMOSYNE_HOME={own}"])
+
+    def test_team_bank_path_with_ampersand_and_pipe_is_pinned_literally(self):  # R3-2 / F4
+        """F4: the .env rewrite used to be `sed` with the path in the
+        pattern/replacement, where & and | are special. Install twice (the
+        second run takes the rewrite-in-place path) and require the literal
+        value, exactly one line per variable, and other lines preserved."""
+        bank = self.tmp / "team & co | bank"
+        self.profile("qa").mkdir(parents=True)
+        (self.profile("qa") / ".env").write_text(
+            "FOO=bar\nMNEMOSYNE_DATA_DIR=/stale/value\nLAST=no-newline")
+        for run in (1, 2):
+            proc = self.install("--team-memory", str(bank), "--only", "qa")
+            self.assertEqual(proc.returncode, 0, f"run {run}: " + proc.stdout + proc.stderr)
+            lines = (self.profile("qa") / ".env").read_text().splitlines()
+            with self.subTest(run=run):
+                self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")],
+                                 [f"MNEMOSYNE_DATA_DIR={bank / 'data'}"])
+                self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_HOME=")],
+                                 [f"MNEMOSYNE_HOME={bank}"])
+                self.assertIn("FOO=bar", lines)
+                self.assertIn("LAST=no-newline", lines)
 
     def test_first_run_exits_0_when_the_plugin_list_lags(self):  # item 11
         proc = self.install(FAKE_PLUGIN_LIST_LAG="2")
@@ -665,6 +708,10 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         (profiles_dir / "dev-qa").symlink_to(self.root)
         (self.root / "SOUL.md").write_text("operator soul\n")
         before_soul = (self.root / "SOUL.md").read_bytes()
+        # R3-3: real plugin content, so a recursive delete or a self-link
+        # created inside it ($R/plugins/mnemosyne/mnemosyne, what
+        # `ln -sfn` does onto an existing directory) shows up.
+        (self.root / "plugins" / "mnemosyne" / "__init__.py").write_text("plugin code\n")
         before_plugins = self.snapshot_tree(self.root / "plugins")
         proc = self.install("--only", "qa")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)

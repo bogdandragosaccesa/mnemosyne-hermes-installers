@@ -33,6 +33,25 @@ PS1 = DEV_TEAM / "install-dev-team-windows.ps1"
 WORKFLOW = DEV_TEAM.parent / ".github" / "workflows" / "dev-team.yml"
 
 
+def _snapshot_tree(root):
+    """Every entry under root -- files by content, symlinks by target
+    (never followed), directories by presence -- so a recursive delete or
+    a self-link created inside a directory both show (review r3 R3-3)."""
+    import hashlib
+    snap = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for n in dirnames + filenames:
+            p = Path(dirpath) / n
+            rel = str(p.relative_to(root))
+            if p.is_symlink():
+                snap[rel] = ("symlink", os.readlink(p))
+            elif p.is_dir():
+                snap[rel] = ("dir",)
+            else:
+                snap[rel] = ("file", hashlib.sha256(p.read_bytes()).hexdigest())
+    return snap
+
+
 def _function(text: str, name: str) -> str:
     """The body of a top-level PowerShell function: up to its closing `}` at
     column 0."""
@@ -137,9 +156,13 @@ class WindowsInstallerTests(unittest.TestCase):
             root.mkdir()
             (root / "SOUL.md").write_text("operator soul\n")
             before_soul = (root / "SOUL.md").read_bytes()
-            plugin_src = Path(tmp) / "mnemosyne-plugin-src"
-            plugin_src.mkdir()
+            # R3-3: the real layout -- $PluginSrcMnemo IS
+            # $HermesRoot\plugins\mnemosyne, with real content -- so the
+            # PS 5.1 Remove-Item -Recurse (or a self-link inside it) shows.
+            plugin_src = root / "plugins" / "mnemosyne"
+            plugin_src.mkdir(parents=True)
             (plugin_src / "marker.txt").write_text("plugin code\n")
+            before_plugins = _snapshot_tree(root / "plugins")
             profiles_dir = root / "profiles"
             profiles_dir.mkdir()
             evil_profile = profiles_dir / "dev-qa"
@@ -154,8 +177,59 @@ class WindowsInstallerTests(unittest.TestCase):
                               "operator SOUL.md must be byte-identical")
             self.assertFalse((root / "dev-team-prefix").exists(),
                               "dev-team-prefix must not have been written to the operator root")
-            self.assertFalse((root / "plugins").exists(),
-                              "plugins\\mnemosyne link must never have been attempted")
+            self.assertEqual(_snapshot_tree(root / "plugins"), before_plugins,
+                             "operator plugins\\ must be byte-identical (no delete, no self-link)")
+
+    def _separate_memory_harness(self, tmp, profile_dir, dry_run):
+        """R3-1: the REAL per-profile-loop slice that runs right after the
+        prefix file -- the DryRun block (with its `continue`) and the real
+        plugin-link + data-link block -- with $SeparateMemory = $true, so
+        the F3 else-branches are what execute. Wrapped in a one-pass
+        foreach so the DryRun branch's `continue` is legal."""
+        start = self.text.index('    if ($DryRun) {\n        Write-Host "  would link: $profileDir\\plugins\\mnemosyne')
+        end = self.text.index("    # 4. dev-team-gate link")
+        slice_ = self.text[start:end]
+        self.assertIn("$SeparateMemory", slice_, "slice lost the -SeparateMemory branches")
+        plugin_src = Path(tmp) / "plugin-src"
+        plugin_src.mkdir(exist_ok=True)
+        harness = Path(tmp) / "separate_memory.ps1"
+        harness.write_text(
+            _function(self.text, "New-DirLink") + "\n"
+            + _function(self.text, "Set-EnvVarPin") + "\n"
+            + _function(self.text, "Set-MnemosyneDataDirPin") + "\n"
+            + f"$DryRun = ${'true' if dry_run else 'false'}\n$SeparateMemory = $true\n"
+            + f"$name = 'dev-qa'\n$profileDir = '{profile_dir}'\n$exists = $false\n"
+            + f"$PluginSrcMnemo = '{plugin_src}'\n$PluginSrcGate = '{plugin_src}'\n"
+            + f"$DevTeamHome = '{tmp}'\n$SkillsDir = '{tmp}'\n$copied = @()\n"
+            # Must never be reached with -SeparateMemory.
+            + "function Invoke-MnemosyneDataLink { Write-Output 'TEAM_LINK_ATTEMPTED' }\n"
+            + "foreach ($__once in 1) {\n" + slice_ + "}\nWrite-Output 'SLICE_DONE'\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_separate_memory_pins_each_profiles_own_bank(self):  # R3-1 / F3
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                profile_dir = Path(tmp) / "hermes" / "profiles" / "dev-qa"
+                profile_dir.mkdir(parents=True)
+                harness = self._separate_memory_harness(tmp, profile_dir, dry_run)
+                proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                      capture_output=True, text=True, timeout=60)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("TEAM_LINK_ATTEMPTED", proc.stdout)
+                own = profile_dir / "mnemosyne"
+                env_file = profile_dir / ".env"
+                if dry_run:
+                    self.assertIn(f"would pin in .env: MNEMOSYNE_DATA_DIR={own / 'data'}", proc.stdout)
+                    self.assertIn(f"would pin in .env: MNEMOSYNE_HOME={own}", proc.stdout)
+                    self.assertFalse(env_file.exists(), "a dry run must not write .env")
+                else:
+                    self.assertIn("SLICE_DONE", proc.stdout)
+                    lines = env_file.read_text().splitlines()
+                    self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")],
+                                     [f"MNEMOSYNE_DATA_DIR={own / 'data'}"])
+                    self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_HOME=")],
+                                     [f"MNEMOSYNE_HOME={own}"])
 
     def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
         # Both the dry-run and real-run key notes used to say "add
