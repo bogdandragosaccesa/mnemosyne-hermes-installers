@@ -148,17 +148,29 @@ any profile; move the other tool aside and re-run.
 **The team's shared memory bank is a dedicated directory**, `$HERMES_ROOT/dev-team-mnemosyne`
 (Windows: `Join-Path $HermesRoot 'dev-team-mnemosyne'`), created when missing. Every installed
 profile's `mnemosyne` links there unless `--separate-memory`/`-SeparateMemory` was passed. **The
-operator's own bank — `$HERMES_ROOT/mnemosyne`, and any `MNEMOSYNE_HOME` the operator has set —
-is never linked into, read from, or written to by this installer**; `MNEMOSYNE_HOME` no longer
-selects the team bank, and `--team-memory`/`-TeamMemory` refuses a value that resolves to, is
-nested under, or contains the operator's own bank or `MNEMOSYNE_HOME` (checked in both
-directions). The value is canonicalised before the check, and the canonical form is what gets
-created and linked: made absolute, `.`/`..`/repeated separators collapsed (also in the part that
-does not exist yet, so `$HERMES_ROOT/nonexist/../mnemosyne` is refused and `nonexist` is never
-created), and every symlink/junction anywhere on the path — live or dangling — followed, with a
-link cycle refused (exit 2). A relative value therefore cannot become a dangling relative symlink
-or create the bank under the installer's working directory. On a re-run, a profile whose
-`mnemosyne` link pointed at, into, or above either operator location is repointed with a NOTE. A profile this run creates gets its `mnemosyne` directory (the one `profile
+operator's own bank — `$HERMES_ROOT/mnemosyne`, any `MNEMOSYNE_HOME`, and any `MNEMOSYNE_DATA_DIR`
+the operator has set (including the Windows User-scope value the Mnemosyne installer persists
+after a `MNEMOSYNE_HOME`-based relocation) — is never linked into, read from, or written to by
+this installer**; none of those variables select the team bank, and `--team-memory`/`-TeamMemory`
+refuses a value that resolves to, is nested under, or contains the operator's own bank,
+`MNEMOSYNE_HOME`, or `MNEMOSYNE_DATA_DIR` (checked in both directions, and by filesystem identity —
+not just path string — so a bind mount, a Windows 8.3 short name, or a `subst` drive is caught
+too). `--team-memory` is also refused if it resolves under `$HERMES_ROOT/profiles` or
+`$HERMES_ROOT/dev-team`: either would break every profile's own link. The value is canonicalised
+before the check, and the canonical form is what gets created and linked: made absolute,
+`.`/`..`/repeated separators collapsed (also in the part that does not exist yet, so
+`$HERMES_ROOT/nonexist/../mnemosyne` is refused and `nonexist` is never created), and every
+symlink/junction anywhere on the path — live or dangling — followed, with a link cycle refused
+(exit 2). A relative value therefore cannot become a dangling relative symlink or create the bank
+under the installer's working directory. `--adopt-team-memory`/`-AdoptTeamMemory` canonicalises
+the profile directory and its `mnemosyne` before any move, and refuses rather than acts if the
+profile directory resolves outside `$HERMES_ROOT/profiles`, if `mnemosyne` resolves to the
+operator's own bank, or if it already is the team bank; an existing backup path (a directory or a
+link) is never merged into — a new, unique name is picked instead. `--dry-run`/`-DryRun` with
+`--adopt-team-memory` prints `would back up: <dir> -> <backup>` for each private bank it would
+move. On a re-run, a profile whose `mnemosyne` link pointed at, into, or above either operator
+location is repointed with a NOTE. A profile this run creates gets its `mnemosyne` directory (the
+one `profile
 create --clone` makes) replaced by a link to the team bank. A profile that already existed and
 has a real `mnemosyne` directory keeps it by default and is named in the final summary; pass
 `--adopt-team-memory`/`-AdoptTeamMemory` to move that directory aside as a timestamped backup
@@ -168,6 +180,23 @@ directory junctions on Windows (no Developer Mode or elevation needed), falling 
 with a warning when even a junction can't be created. On a re-run an existing junction is
 removed with `[System.IO.Directory]::Delete` and never with `Remove-Item -Recurse`. On Windows
 PowerShell 5.1 that cmdlet follows the junction and deletes the team bank's contents.
+
+**`MNEMOSYNE_DATA_DIR` is the variable that actually decides every Mnemosyne-reading process's
+data directory** — the installed Mnemosyne package checks it before anything else, including
+before the per-profile link this installer sets up (`mnemosyne/cli.py:20-23`,
+`mnemosyne/core/beam.py:358-366`). If it is set in the shell or gateway environment a `hermes -p
+dev-*` process launches from, it silently overrides this installer's link, the same way a live
+operator session was found to leak the operator's own bank into a `dev-pm` chat despite
+`profiles/dev-pm/mnemosyne` pointing at the team bank. This installer closes that gap by pinning
+`MNEMOSYNE_DATA_DIR` into each profile's own `.env` file: Hermes loads a profile's `.env` with
+`override=True` specifically so it beats a value already in the process environment
+(`hermes_cli/env_loader.py:502-562`), so the pinned value wins regardless of what the launching
+shell exported. **The gateway and every `hermes -p dev-*` launch should still run with
+`MNEMOSYNE_HOME` and `MNEMOSYNE_DATA_DIR` unset** — `MNEMOSYNE_HOME` is only used by this
+installer (and `install-mnemosyne-hermes-*`) to locate the operator's bank for the refusal check
+above, never by the installed Mnemosyne package itself, but an operator session that has either
+exported should not assume a plain `hermes -p dev-pm chat` picks up team-bank values it never
+asked to override.
 
 ## Onboarding a project
 
