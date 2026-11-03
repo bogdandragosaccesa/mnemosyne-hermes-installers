@@ -202,7 +202,11 @@ class _CheckContract:
             lay = Layout(tmp, private=("dev-pm",))
             self.assertFails(self.check(lay, init="dev-pm", private=("dev-pm",)), "dev-pm")
 
-    # --- item 4a (review r3): the installer now writes every pin quoted
+    # --- item 4a (review r3) / operator decision (round 2): the installer
+    # no longer writes pins quoted (reverted, see check-team-bank.sh's
+    # Unquote-EnvPin/unquote_env_pin comments); this exercises the
+    # legacy-only unquoting path in case a pin from that brief quoted
+    # window is still on disk.
     def test_quoted_env_pin_is_still_resolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             lay = Layout(tmp, private=("dev-pm",), quote_pins=True)
@@ -292,12 +296,15 @@ class WorkflowUsesTheTestedChecks(unittest.TestCase):
 
 
 class EnvPinUnquotingTests(unittest.TestCase):
-    """Item 4a (review r3): isolated contract tests for the exact escape
-    decoding, run directly against the real function bodies extracted from
-    each script (never a reimplementation), so a future edit to the real
-    unquoting logic still has to pass here. Covers the escape cases the
-    full-check Layout fixture cannot (its temp-dir paths never contain a
-    backslash or an apostrophe)."""
+    """Item 4a (review r3) / operator decision (round 2): isolated contract
+    tests for the LEGACY-ONLY escape decoding, run directly against the
+    real function bodies extracted from each script (never a
+    reimplementation), so a future edit to the real unquoting logic still
+    has to pass here. The installer no longer writes pins in this format
+    (reverted to unquoted); these functions only exist to still resolve a
+    pin left over from the brief window where the quoted format shipped.
+    Covers the escape cases the full-check Layout fixture cannot (its
+    temp-dir paths never contain a backslash or an apostrophe)."""
 
     CASES = [
         ("plain/no/specials", "plain/no/specials"),

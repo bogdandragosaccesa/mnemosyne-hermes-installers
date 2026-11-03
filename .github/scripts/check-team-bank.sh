@@ -49,13 +49,19 @@ env_pin() {  # profile_dir var -> value of VAR= in its .env (last wins), unquote
     done < "$1/.env"
     unquote_env_pin "$val"
 }
-# Item 4a (review r3): install-dev-team-unix.sh now writes every pin
-# single-quoted with python-dotenv's single-quote escapes
-# (dotenv/parser.py:25,32): '\' -> '\\', "'" -> "\'". Undo exactly that
-# here, so this naive CI reader still sees the real path instead of the
-# raw quoted literal. A legacy unquoted value (no surrounding single
-# quotes -- e.g. from a .env an older installer wrote) passes through
-# unchanged.
+# Item 4a (review r3) / operator decision (round 2): install-dev-team-
+# unix.sh now writes every pin UNQUOTED again (the single-quoted,
+# python-dotenv-escaped format from review r3 was reverted: Mnemosyne's
+# own .env reader never unescapes, so it would read an escaped pin back
+# corrupted). This unquoting function is therefore LEGACY-ONLY: kept so a
+# pin written by the brief window where 046cadc's quoted format shipped
+# (dotenv/parser.py:25,32 escapes: '\' -> '\\', "'" -> "\'") still
+# resolves correctly here, not because any pin written by the current
+# installer can be quoted -- it cannot: env_value_unsafe_reason() in
+# install-dev-team-unix.sh refuses any value that starts or ends with a
+# quote character before it ever reaches set_env_var(). A plain unquoted
+# value (every current pin, and any pre-existing legacy one) passes
+# through unchanged.
 unquote_env_pin() {
     local v=$1
     if (( ${#v} >= 2 )) && [[ ${v:0:1} == "'" && ${v: -1} == "'" ]]; then

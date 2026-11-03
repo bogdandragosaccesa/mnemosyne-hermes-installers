@@ -35,10 +35,91 @@ ROLES = ("pm", "architect", "uiux", "backend-db", "frontend", "qa", "reviewer", 
 
 
 def _quote_env(value):
-    """Mirror install-dev-team-unix.sh's quote_env_value(): python-dotenv's
-    single-quote escapes (\\ -> \\\\, ' -> \\'), wrapped in single quotes.
-    Item 4a (review r3)."""
-    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    """Operator decision (round 2 of the Stream B fix round): pins are
+    written UNQUOTED, UTF-8, no BOM, no escaping -- install-dev-team-unix.sh's
+    set_env_var() writes the value verbatim. This helper is now the
+    identity function; kept (rather than deleted) so every call site below
+    stays a one-line diff instead of a rewrite, and so a future re-quoting
+    attempt has exactly one place to change back. Reverts review r3's
+    single-quoted-with-python-dotenv-escapes format (item 4a, 046cadc),
+    which corrupted a backslash- or apostrophe-containing value when read
+    back through Mnemosyne's own naive .env reader."""
+    return value
+
+
+def _find_dotenv_python():
+    """A python executable where `import dotenv` works, else None. Tries
+    this interpreter first (sys.executable), then scans this host's
+    installed Hermes environments for one with python-dotenv. Never
+    invoked with `python3 -c` (this repo's own convention: write a probe
+    script to a temp file and run it by path); each candidate is probed
+    with a tiny script file."""
+    import sys
+    candidates = [sys.executable]
+    hermes_home = Path.home() / ".hermes"
+    candidates += sorted(str(p) for p in hermes_home.glob("installs/*/environments/*/venv/bin/python3"))
+    seen = set()
+    for py in candidates:
+        if not py or py in seen or not Path(py).exists():
+            continue
+        seen.add(py)
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe_dotenv.py"
+            probe.write_text("import dotenv\nprint('DOTENV_OK')\n")
+            try:
+                r = subprocess.run([py, str(probe)], capture_output=True, text=True, timeout=20)
+            except OSError:
+                continue
+        if r.returncode == 0 and "DOTENV_OK" in r.stdout:
+            return py
+    return None
+
+
+MNEMOSYNE_VENV_PYTHON = Path("/home/bogdan-dragos/.mnemosyne-venv/bin/python3")
+
+
+def _read_env_value_via_mnemosyne_reader(env_file, var_name):
+    """Reads var_name's value back exactly the way Mnemosyne's OWN
+    standalone MCP-server bootstrap does (mcp_server.py:_load_dotenv,
+    ~793-842), by importing the REAL installed module under its own venv
+    and calling its real _load_dotenv() against our .env file directly
+    (env_file_path is candidate #1, tried before any HERMES_HOME/
+    MNEMOSYNE_HOME search) -- never a reimplementation of the parsing
+    logic, because the real module is importable here. Returns
+    (value_or_None, None) on success, or (None, reason) when the real
+    module could not be reached, in which case the caller must fall back
+    to a reimplementation of the one-line rule
+    (`v.strip().strip("'\\"")`) and say so."""
+    if not MNEMOSYNE_VENV_PYTHON.exists():
+        return None, f"Mnemosyne venv python not found at {MNEMOSYNE_VENV_PYTHON}"
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = Path(tmp) / "probe_mnemosyne_reader.py"
+        probe.write_text(textwrap.dedent(f"""
+            import json, os, sys
+            try:
+                import mnemosyne.mcp_server as m
+            except Exception as exc:
+                print(json.dumps({{"error": repr(exc)}}))
+                sys.exit(0)
+            m._load_dotenv({str(env_file)!r})
+            print(json.dumps({{"value": os.environ.get({var_name!r})}}))
+        """))
+        try:
+            proc = subprocess.run([str(MNEMOSYNE_VENV_PYTHON), str(probe)],
+                                  capture_output=True, text=True, timeout=30,
+                                  env={"PATH": "/usr/bin:/bin"})
+        except OSError as exc:
+            return None, f"could not run the Mnemosyne venv python: {exc!r}"
+    if proc.returncode != 0:
+        return None, f"Mnemosyne venv python failed: {(proc.stderr or proc.stdout).strip()[:300]}"
+    import json
+    try:
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None, f"could not parse Mnemosyne reader probe output: {proc.stdout!r} {proc.stderr!r}"
+    if "error" in data:
+        return None, f"mnemosyne.mcp_server not importable: {data['error']}"
+    return data.get("value"), None
 
 # A stand-in for the parts of the hermes CLI the installer calls. A fresh
 # `profile create --clone` makes a real mnemosyne/ directory, as Hermes does.
@@ -448,53 +529,132 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
                 self.assertIn("FOO=bar", lines)
                 self.assertIn("LAST=no-newline", lines)
 
-    def test_team_bank_path_with_hash_is_quoted_and_round_trips(self):  # item 4a (review r3)
-        """python-dotenv truncates an UNQUOTED value at ' #' (its
-        _unquoted_value then strips r'\\s+#.*'), so a bank path containing
-        ' #' used to come back silently shortened on the next load. The
-        installer now writes every pin single-quoted with python-dotenv's
-        own single-quote escapes (dotenv/parser.py:25,32): '\\\\' -> '\\\\\\\\',
-        "'" -> "\\\\'". Decoded here two ways: a stdlib-only reimplementation
-        of that exact rule (meaningful even in a dotenv-less venv), and, if
-        importable, the real python-dotenv parser."""
+    def test_team_bank_path_with_space_then_hash_is_refused(self):  # item 4a, operator round-2 decision
+        """python-dotenv's real parser truncates an unquoted value at
+        ' #' (its _unquoted_value then strips r'\\s+#.*'); Mnemosyne's
+        naive reader does not. Unquoted pins (the operator's round-2
+        decision, reverting review r3's single-quoted format) cannot
+        represent this shape safely in both readers, so the installer
+        refuses it up front with exit 2 instead of silently writing a
+        value one reader would truncate."""
         bank = self.tmp / "team # tricky bank"
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", str(bank), "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory contains whitespace immediately followed by '#'", proc.stderr)
+        self.assertIn("it would not read back identically from .env", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
+    def test_team_memory_refuses_a_value_with_a_leading_quote(self):  # item 4a, operator round-2 decision
+        value = "'" + str(self.tmp / "bank")
+        proc = self.install("--team-memory", value, "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory starts or ends with a quote character", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_refuses_a_value_with_a_trailing_quote(self):  # item 4a, operator round-2 decision
+        value = str(self.tmp / "bank") + '"'
+        proc = self.install("--team-memory", value, "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory starts or ends with a quote character", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_refuses_a_value_with_trailing_whitespace(self):  # item 4a, operator round-2 decision
+        value = str(self.tmp / "bank") + " "
+        proc = self.install("--team-memory", value, "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory starts or ends with whitespace", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_refuses_a_value_with_leading_whitespace(self):  # item 4a, operator round-2 decision
+        value = " " + str(self.tmp / "bank")
+        proc = self.install("--team-memory", value, "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory starts or ends with whitespace", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_refuses_a_value_with_an_embedded_newline(self):  # item 4a, operator round-2 decision
+        # Passed via the environment default path (argv cannot carry a
+        # literal NUL, but bash argv entries can carry a newline fine;
+        # this exercises the guard the same way a malicious or mistaken
+        # wrapper script could).
+        value = str(self.tmp / "bank") + "\nEVIL=1"
+        proc = self.install("--team-memory", value, "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory contains a newline", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_accepts_safe_special_characters_and_round_trips(self):  # item 4a, operator round-2 decision
+        """'&', '|', a non-edge quote, a non-edge backslash and non-ASCII
+        are all safe under the unquoted-no-escaping format (F4's original
+        concern) and must NOT be refused by the new guard. This is the
+        round-trip table the operator's decision asked for: the written
+        value is checked against BOTH readers -- python-dotenv's real
+        parser (if importable anywhere on this host; skip with a reason
+        if not) and Mnemosyne's own real _load_dotenv() (imported from its
+        installed venv; a reimplementation would only be used, and stated
+        as such, if that import failed)."""
+        bank = (self.tmp / "it's a bank" / "a&b|c d" / "a\\b" / "ăș" / "bank#nofail")
         proc = self.install("--team-memory", str(bank), "--only", "qa")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        lines = (self.profile("qa") / ".env").read_text().splitlines()
+        env_file = self.profile("qa") / ".env"
+        lines = env_file.read_text(encoding="utf-8").splitlines()
         data_lines = [l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")]
         home_lines = [l for l in lines if l.startswith("MNEMOSYNE_HOME=")]
         self.assertEqual(len(data_lines), 1)
         self.assertEqual(len(home_lines), 1)
         expected_data = str(bank / "data")
         expected_home = str(bank)
-        # The raw on-disk line must actually be quoted (this is the RED
-        # case against the unfixed installer: an unquoted line here means
-        # python-dotenv would truncate expected_data/_home at ' #').
-        self.assertTrue(data_lines[0][len("MNEMOSYNE_DATA_DIR="):].startswith("'"),
-                         f"pin not quoted: {data_lines[0]!r}")
+        # Written verbatim: no quoting, no escaping (operator's round-2
+        # decision; this is the RED case against 046cadc, where this line
+        # would start with a single quote instead).
+        self.assertEqual(data_lines[0], f"MNEMOSYNE_DATA_DIR={expected_data}")
+        self.assertEqual(home_lines[0], f"MNEMOSYNE_HOME={expected_home}")
 
-        def stdlib_single_quote_decode(raw_value):
-            """Reimplements dotenv/parser.py's _single_quoted_value +
-            _single_quote_escapes using only stdlib re/codecs -- no
-            python-dotenv import required."""
-            import re
-            assert raw_value[0] == "'" and raw_value[-1] == "'", raw_value
-            inner = raw_value[1:-1]
-            return re.sub(r"\\[\\']", lambda m: m.group(0)[1], inner)
+        # Reader 1: Mnemosyne's own standalone MCP-server bootstrap
+        # (mcp_server.py:_load_dotenv), via the REAL installed module.
+        mnemosyne_data, mnemosyne_data_reason = _read_env_value_via_mnemosyne_reader(
+            env_file, "MNEMOSYNE_DATA_DIR")
+        mnemosyne_home, mnemosyne_home_reason = _read_env_value_via_mnemosyne_reader(
+            env_file, "MNEMOSYNE_HOME")
+        if mnemosyne_data_reason or mnemosyne_home_reason:
+            # Fall back to a reimplementation of the one-line rule
+            # (mcp_server.py: `v.strip().strip("'\"")`), and say so loudly:
+            # this is the ONLY branch that does not exercise the real
+            # module, and only because it could not be imported here.
+            print("WARNING: mnemosyne.mcp_server not importable "
+                  f"({mnemosyne_data_reason or mnemosyne_home_reason}); "
+                  "falling back to a reimplementation of its one-line "
+                  "v.strip().strip(\"'\\\"\") rule for this assertion.")
+            mnemosyne_data = data_lines[0][len("MNEMOSYNE_DATA_DIR="):].strip().strip("'\"")
+            mnemosyne_home = home_lines[0][len("MNEMOSYNE_HOME="):].strip().strip("'\"")
+        self.assertEqual(mnemosyne_data, expected_data)
+        self.assertEqual(mnemosyne_home, expected_home)
 
-        self.assertEqual(stdlib_single_quote_decode(data_lines[0][len("MNEMOSYNE_DATA_DIR="):]),
-                          expected_data)
-        self.assertEqual(stdlib_single_quote_decode(home_lines[0][len("MNEMOSYNE_HOME="):]),
-                          expected_home)
-
-        try:
-            from dotenv import dotenv_values  # noqa: PLC0415
-        except ImportError:
-            self.skipTest("python-dotenv not importable here; stdlib-only decode above already passed")
+        # Reader 2: the real python-dotenv parser, if importable anywhere
+        # on this host (this interpreter, or a Hermes install venv).
+        dotenv_python = _find_dotenv_python()
+        if not dotenv_python:
+            self.skipTest("python-dotenv not importable under this interpreter or any "
+                           "installed Hermes venv; Mnemosyne-reader round-trip above already passed")
             return
-        values = dotenv_values(str(self.profile("qa") / ".env"))
-        self.assertEqual(values.get("MNEMOSYNE_DATA_DIR"), expected_data)
-        self.assertEqual(values.get("MNEMOSYNE_HOME"), expected_home)
+        with tempfile.TemporaryDirectory() as probe_tmp:
+            probe = Path(probe_tmp) / "probe_dotenv_values.py"
+            probe.write_text(textwrap.dedent(f"""
+                import json
+                from dotenv import dotenv_values
+                values = dotenv_values({str(env_file)!r})
+                print(json.dumps(values))
+            """))
+            proc2 = subprocess.run([dotenv_python, str(probe)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
+        import json
+        values = json.loads(proc2.stdout.strip().splitlines()[-1])
+        self.assertEqual(values.get("MNEMOSYNE_DATA_DIR"), expected_data,
+                          f"real python-dotenv ({dotenv_python}) did not round-trip the value byte-exact")
+        self.assertEqual(values.get("MNEMOSYNE_HOME"), expected_home,
+                          f"real python-dotenv ({dotenv_python}) did not round-trip the value byte-exact")
 
     def test_first_run_exits_0_when_the_plugin_list_lags(self):  # item 11
         proc = self.install(FAKE_PLUGIN_LIST_LAG="2")
@@ -797,13 +957,21 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         profiles_dir.mkdir(parents=True)
         (profiles_dir / "dev-qa").symlink_to(profiles_dir)
         proc = self.install("--only", "qa")
-        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        profile_dir = profiles_dir / "dev-qa"
+        self.assertIn(
+            f"dev-qa's profile directory ({profile_dir}) resolves to $HERMES_ROOT/profiles "
+            "itself; refusing to touch its profile.",
+            proc.stderr)
         self.assertFalse((profiles_dir / "SOUL.md").exists(),
                           "SOUL.md must not be written into profiles/ itself")
         self.assertFalse((profiles_dir / "dev-team-prefix").exists(),
                           "dev-team-prefix must not be written into profiles/ itself")
         self.assertFalse((profiles_dir / "plugins" / "mnemosyne").exists(),
                           "the plugin link must not be created under profiles/ itself")
+        # profiles/ holds exactly the one entry this test itself created
+        # (the dev-qa symlink) -- nothing else was written into it.
+        self.assertEqual(sorted(p.name for p in profiles_dir.iterdir()), ["dev-qa"])
 
     # --- D2: the adopt branch must canonicalise before touching anything
     def test_adopt_team_memory_refuses_when_profile_dir_resolves_outside_profiles(self):  # D2

@@ -442,13 +442,38 @@ identity_overlap_either() {
     identity_overlap "$1" "$2" || identity_overlap "$2" "$1"
 }
 
+# Item 4a (review r3) / operator decision (round 2 of the Stream B fix
+# round): pins stay UNQUOTED, UTF-8, no BOM, no escaping -- see the
+# set_env_var() comment below for why. Checked here, on the raw
+# --team-memory argument (or its default), BEFORE path resolution, so this
+# fires even when the value cannot be resolved to a real path at all --
+# same place install-dev-team-windows.ps1 checks its -TeamMemory argument
+# (Get-EnvUnsafeValueReason).
+env_value_unsafe_reason() {  # value -> prints a reason if unsafe, else nothing
+    local v="$1"
+    if [[ $v == *$'\n'* || $v == *$'\r'* ]]; then
+        printf 'contains a newline'
+    elif [[ $v == \'* || $v == \"* || $v == *\' || $v == *\" ]]; then
+        printf 'starts or ends with a quote character'
+    elif [[ $v == [[:space:]]* || $v == *[[:space:]] ]]; then
+        printf 'starts or ends with whitespace'
+    elif [[ $v == *[[:space:]]'#'* ]]; then
+        printf "contains whitespace immediately followed by '#'"
+    fi
+}
 OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"
 # Every path below is canonical (no `.`, `..`, `//`, symlink): the value
 # checked is byte-for-byte the value later passed to mkdir/ln.
 _resolve_or_die() {
     resolve_abs_nearest "$1" || { echo "Cannot resolve $2: $1" >&2; exit 2; }
 }
-TEAM_MEMORY_HOME="$(_resolve_or_die "${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}" "--team-memory")" || exit 2
+_raw_team_memory="${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}"
+_team_memory_unsafe_reason="$(env_value_unsafe_reason "$_raw_team_memory")"
+if [[ -n "$_team_memory_unsafe_reason" ]]; then
+    echo "--team-memory $_team_memory_unsafe_reason; it would not read back identically from .env. Pick a path without that." >&2
+    exit 2
+fi
+TEAM_MEMORY_HOME="$(_resolve_or_die "$_raw_team_memory" "--team-memory")" || exit 2
 _operator_home_real="$(_resolve_or_die "$OPERATOR_MNEMO_HOME" "the operator bank")" || exit 2
 _mnemosyne_home_real=""
 if [[ -n "${MNEMOSYNE_HOME:-}" ]]; then
@@ -543,28 +568,30 @@ fi
 # out. Rewrite a single VAR=value line with plain bash string comparison
 # instead, so sed never sees the path at all.
 #
-# Item 4a (review r3): python-dotenv's unquoted-value grammar truncates at
-# ` #` (dotenv/parser.py: _unquoted_value then strips `\s+#.*`), so an
-# unquoted bank path containing " #" silently loses everything from the
-# `#` onward on the next load. Every pinned value is therefore written
-# single-quoted, using exactly python-dotenv's single-quote escapes:
-# `\` -> `\\`, `'` -> `\'` (dotenv/parser.py:25,32 -- _single_quoted_value
-# and _single_quote_escapes; nothing else is special inside single
-# quotes). This is the one format decided for both platforms; do not
-# change it without re-checking the round-trip in the completion metadata.
-quote_env_value() {  # value -> KEY='value' with python-dotenv's escapes
-    local v=$1
-    v=${v//\\/\\\\}
-    v=${v//\'/\\\'}
-    printf "'%s'" "$v"
-}
+# Item 4a (review r3) / operator decision (round 2): pins stay UNQUOTED,
+# UTF-8, no BOM, no escaping -- KEY=value, written verbatim. This reverts
+# review r3's single-quoted-with-python-dotenv-escapes format (046cadc).
+# That format round-tripped through the real python-dotenv parser, but
+# Mnemosyne's OWN .env reader (mcp_server.py:_load_dotenv, ~823-833:
+# `v.strip().strip("'\"")`) only strips a bounding whitespace/quote
+# character and never unescapes `\\` or `\'`, so it would read "it's"
+# pinned as `'it\'s'` back as the literal `it\'s` -- a corrupted bank
+# path. Unquoted values round-trip byte-exact through BOTH readers for
+# every value this installer can produce, because
+# env_value_unsafe_reason() above already refuses, before any value
+# reaches this function, every shape the two readers would disagree on:
+# an embedded newline, leading/trailing whitespace, a leading/trailing
+# quote character, and whitespace immediately followed by '#' (the one
+# case python-dotenv's unquoted-value grammar truncates at). Do not
+# re-quote; re-check the round-trip table in test_install_unix.py and the
+# completion metadata before changing this format again.
 set_env_var() {  # env_file var_name value
     local env_file="$1" var_name="$2" value="$3" line found=0 tmp
     local -a out_lines=()
     if [[ -f $env_file ]]; then
         while IFS= read -r line || [[ -n $line ]]; do
             if [[ $line == "$var_name="* ]]; then
-                out_lines+=("$var_name=$(quote_env_value "$value")")
+                out_lines+=("$var_name=$value")
                 found=1
             else
                 out_lines+=("$line")
@@ -572,7 +599,7 @@ set_env_var() {  # env_file var_name value
         done < "$env_file"
     fi
     if (( ! found )); then
-        out_lines+=("$var_name=$(quote_env_value "$value")")
+        out_lines+=("$var_name=$value")
     fi
     tmp="$(mktemp "${env_file}.XXXXXX")"
     printf '%s\n' "${out_lines[@]}" > "$tmp"

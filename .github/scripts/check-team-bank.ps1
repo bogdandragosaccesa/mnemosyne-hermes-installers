@@ -101,12 +101,20 @@ function Test-IsDirLink([string] $Path) {
     return [bool]($item -and (@('Junction', 'SymbolicLink') -contains [string]$item.LinkType))
 }
 function Unquote-EnvPin([string] $Value) {
-    # Item 4a (review r3): install-dev-team-unix.sh and
-    # install-dev-team-windows.ps1 now write every pin single-quoted with
-    # python-dotenv's single-quote escapes (dotenv/parser.py:25,32):
-    # '\' -> '\\', "'" -> "\'". Undo exactly that here, so this naive CI
-    # reader still sees the real path. A legacy unquoted value (no
-    # surrounding single quotes) passes through unchanged.
+    # Item 4a (review r3) / operator decision (round 2): install-dev-team-
+    # unix.sh and install-dev-team-windows.ps1 now write every pin
+    # UNQUOTED again (the single-quoted, python-dotenv-escaped format from
+    # review r3 was reverted: Mnemosyne's own .env reader never unescapes,
+    # so it would read an escaped pin back corrupted). This function is
+    # therefore LEGACY-ONLY: kept so a pin written by the brief window
+    # where the quoted format shipped (dotenv/parser.py:25,32 escapes:
+    # '\' -> '\\', "'" -> "\'") still resolves correctly here, not because
+    # any pin written by the current installer can be quoted -- it
+    # cannot: Get-EnvUnsafeValueReason in install-dev-team-windows.ps1 (and
+    # env_value_unsafe_reason() on Unix) refuses any value that starts or
+    # ends with a quote character before it ever reaches the writer. A
+    # plain unquoted value (every current pin, and any pre-existing
+    # legacy one) passes through unchanged.
     if ($Value.Length -ge 2 -and $Value.StartsWith("'") -and $Value.EndsWith("'")) {
         $inner = $Value.Substring(1, $Value.Length - 2)
         $sb = New-Object System.Text.StringBuilder
