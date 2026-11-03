@@ -33,22 +33,31 @@ def _fake_key() -> str:
 class FakeTransport:
     """Records every call; replays a queued response or raises a queued error.
 
-    I4: also asserts the live request shapes recorded in PROBES.md (see
-    test_deciders_core.py's FakeTransport for the same check)."""
+    I4: also records live request-shape violations recorded in PROBES.md
+    (see test_deciders_core.py's FakeTransport for the same check).
+
+    D4 (review): recorded into self.violations, not raised, so a test
+    driving main() can't pass just because main()'s catch-all turned the
+    violation into an ordinary-looking exit 2 -- see _assert_no_shape_violations
+    below, used by every call through _run()."""
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.violations = []
 
     def __call__(self, url, headers, body, timeout):
         self.calls.append((url, headers, body, timeout))
         if url == "https://openrouter.ai/api/alpha/decisions" and "questions" in body:
             questions = body["questions"]
-            assert isinstance(questions, dict), (
-                f"questions must be a record (dict), not {type(questions).__name__}")
-            for qid, spec in questions.items():
-                assert isinstance(spec, dict) and spec.get("type"), (
-                    f"questions[{qid!r}] must be an object with a 'type'")
+            if not isinstance(questions, dict):
+                self.violations.append(
+                    f"questions must be a record (dict), not {type(questions).__name__}")
+            else:
+                for qid, spec in questions.items():
+                    if not (isinstance(spec, dict) and spec.get("type")):
+                        self.violations.append(
+                            f"questions[{qid!r}] must be an object with a 'type'")
         if not self._responses:
             raise AssertionError("FakeTransport called more times than expected")
         resp = self._responses.pop(0)
@@ -64,6 +73,18 @@ def _env(key=None):
     return env
 
 
+def _assert_no_shape_violations(transport) -> None:
+    """D4 (review): see test_deciders_core.py's identical helper -- every
+    test driving main() through a FakeTransport must fail on a recorded
+    shape violation, not just on whatever exit code main() produced."""
+    violations = getattr(transport, "violations", None)
+    if violations:
+        raise AssertionError(
+            "FakeTransport recorded request-shape violation(s), but the "
+            "test did not fail on them: " + "; ".join(violations)
+        )
+
+
 def _run(argv, transport, env, home=None):
     import io
     out = io.StringIO()
@@ -74,8 +95,10 @@ def _run(argv, transport, env, home=None):
         # isn't writable.
         with tempfile.TemporaryDirectory() as tmp:
             code = main(argv, home=Path(tmp), env=env, transport=transport, out=out)
+            _assert_no_shape_violations(transport)
             return code, out.getvalue()
     code = main(argv, home=home, env=env, transport=transport, out=out)
+    _assert_no_shape_violations(transport)
     return code, out.getvalue()
 
 
@@ -432,6 +455,116 @@ class LedgerWrittenOnSuccessTests(unittest.TestCase):
             self.assertEqual(code2, EXIT_UNANSWERED)
             lines_after = ledger.read_text().splitlines()
             self.assertEqual(len(lines_after), 1)
+
+
+class DispatchedWorkerTaskIdTests(unittest.TestCase):
+    """T3: proves the real root cause and its fix.
+
+    A dispatched worker's *subprocess* environment (what `deciders` is
+    actually invoked with, via a plain shell or `secret exec`) was probed
+    directly on a live dispatched task: HERMES_KANBAN_BOARD,
+    HERMES_KANBAN_WORKSPACE and sibling vars were present, but
+    HERMES_KANBAN_TASK was not -- `printenv HERMES_KANBAN_TASK` failed
+    even with no `secret exec` involved. So `env.get("HERMES_KANBAN_TASK")`
+    alone can never populate the ledger's task_id from that process. This
+    test models exactly that environment (board set, task env var absent)
+    and proves the `--task-id` flag is what makes task_id non-null.
+    """
+
+    def test_task_id_env_var_absent_still_yields_non_null_task_id_via_flag(self):
+        fixture = _load_fixture("decide_ok.json")
+        # Models the probed dispatched-worker subprocess env exactly:
+        # board present, task id genuinely absent (not just empty).
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_BOARD"] = "dev-team-followups"
+        self.assertNotIn("HERMES_KANBAN_TASK", env)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json"),
+                 "--task-id", "t_a77c9659"],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["board"], "dev-team-followups")
+            self.assertEqual(record["task_id"], "t_a77c9659")
+
+    def test_task_id_flag_wins_over_env_var_when_both_present(self):
+        fixture = _load_fixture("decide_ok.json")
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_TASK"] = "t_stale_env_value"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, _ = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json"),
+                 "--task-id", "t_explicit"],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["task_id"], "t_explicit")
+
+    def test_no_task_id_flag_falls_back_to_env_var(self):
+        # Backward compatible: callers that still rely on the env var
+        # (e.g. a non-dispatched interactive session where it happens to
+        # be set) keep working with no flag passed at all.
+        fixture = _load_fixture("decide_ok.json")
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_TASK"] = "t_from_env"
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, _ = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["task_id"], "t_from_env")
+
+    def test_env_task_id_containing_key_is_recorded_as_null_not_failed(self):
+        # D2 (review): the same validation applies to the env fallback,
+        # but an invalid env value silently becomes null -- it never
+        # fails the call, because this runs after a billed transport
+        # call already succeeded.
+        fixture = _load_fixture("decide_ok.json")
+        key = _fake_key()
+        env = _env(key)
+        env["HERMES_KANBAN_TASK"] = key
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            self.assertNotIn(key, stdout)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertIsNone(record["task_id"])
+
+    def test_env_task_id_too_long_is_recorded_as_null_not_failed(self):
+        fixture = _load_fixture("decide_ok.json")
+        env = _env(_fake_key())
+        env["HERMES_KANBAN_TASK"] = "a" * 5000
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, _ = _run(
+                ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                 "--questions", str(FIXTURES / "decide_questions.json")],
+                FakeTransport([fixture]), env, home=home,
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertIsNone(record["task_id"])
 
 
 class M1LedgerWrittenOnFailedValidationTests(unittest.TestCase):

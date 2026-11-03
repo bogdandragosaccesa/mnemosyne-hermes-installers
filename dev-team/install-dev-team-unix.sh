@@ -317,6 +317,15 @@ fi
 # custom HERMES_HOME keeps working.
 ROOT_CONFIG="$(hermes config path)"
 HERMES_ROOT="$(dirname "$ROOT_CONFIG")"
+# T4: `hermes config path` returns the ACTIVE PROFILE's config.yaml
+# (…/profiles/<name>/config.yaml) when this installer itself is run under a
+# named profile -- so HERMES_ROOT above would be that profile's directory,
+# not the true Hermes root. Climb out of profiles/<name> exactly the way
+# kanban-budget.py's hermes_root() already does, so the team home below
+# lands at the Hermes root regardless of which profile ran the installer.
+if [[ "$(basename "$(dirname "$HERMES_ROOT")")" == profiles ]]; then
+    HERMES_ROOT="$(dirname "$(dirname "$HERMES_ROOT")")"
+fi
 PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 # The one real Mnemosyne data root, which every profile will be pointed at
 # unless --separate-memory was passed. Honour MNEMOSYNE_HOME if the user has
@@ -361,6 +370,284 @@ for key in memory.memory_enabled memory.user_profile_enabled; do
         say "         main installer with --disable-builtin-memory to turn it off."
     fi
 done
+
+# T4 migration: a team installed before HERMES_ROOT climbed out of a
+# profile may have every dev-* profile's dev-team symlink pointing at that
+# old, profile-rooted location -- which still holds the live data (project
+# records, the deciders ledger, model-tiers.json). Detect that *before*
+# anything below creates or writes to $DEV_TEAM_HOME, or the distinction
+# between "freshly created, empty" and "pre-existing data at the old wrong
+# path" is lost for good.
+#
+# The scan below walks every role in NAMES, not just the ones --only
+# selected: --only only limits which profiles this run *provisions*, and a
+# profile left out by --only still has a live dev-team link that the move
+# below would turn dangling if we only looked at the selected subset
+# (review finding #1). It also keeps every *distinct* populated old
+# location instead of stopping at the first, so a second, unrelated
+# populated home is reported rather than silently orphaned (review finding
+# #2).
+resolve_existing_link() {  # path -> prints its realpath, or nothing
+    [[ -L $1 ]] || return 1
+    readlink -f "$1" 2>/dev/null
+}
+dir_has_data() {  # path -> true if it exists and is non-empty
+    [[ -d $1 ]] && find "$1" -mindepth 1 -print -quit 2>/dev/null | grep -q .
+}
+list_top_level_entries() {  # dir -> prints one basename per line, dotfiles included
+    local d="$1" entry
+    for entry in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+        [[ -e $entry ]] || continue
+        basename "$entry"
+    done
+}
+
+# D1 (review): a candidate old-home link must resolve to something actually
+# named "dev-team", and must not equal, contain, or lie within/above the
+# Hermes root, the team home, or any profile directory -- otherwise the
+# "migration" would move a whole profile or the Hermes root itself (repros
+# F and H). Returns a non-empty reason string on stdout when the candidate
+# must be refused; silent and empty when it is safe.
+_is_ancestor_or_equal() {  # anc desc -> true if desc == anc or desc is inside anc
+    local anc="${1%/}" desc="${2%/}"
+    [[ "$desc" == "$anc" || "$desc" == "$anc"/* ]]
+}
+unsafe_old_home_reason() {  # target -> prints a reason if unsafe, else nothing
+    local target="${1%/}" base pd
+    base="$(basename "$target")"
+    if [[ "$base" != "dev-team" ]]; then
+        printf 'its basename is "%s", not "dev-team" (migrating it would move an entire profile or other directory, not a team-state folder)' "$base"
+        return
+    fi
+    if _is_ancestor_or_equal "$target" "$HERMES_ROOT"; then
+        printf 'it equals or contains the Hermes root (%s)' "$HERMES_ROOT"
+        return
+    fi
+    if _is_ancestor_or_equal "$target" "$DEV_TEAM_HOME"; then
+        printf 'it equals or contains the team home (%s)' "$DEV_TEAM_HOME"
+        return
+    fi
+    for pd in "$HERMES_ROOT"/profiles/*/; do
+        [[ -d $pd ]] || continue
+        pd="${pd%/}"
+        if _is_ancestor_or_equal "$target" "$pd"; then
+            printf 'it equals or contains profile directory %s' "$pd"
+            return
+        fi
+    done
+}
+refuse_unsafe_old_home() {  # label target reason
+    local label="$1" target="$2" reason="$3"
+    echo "Refusing to migrate: $label resolves to $target, $reason." >&2
+    echo "This link looks misconfigured, not a migratable old team home." >&2
+    echo "Fix it by hand (point it at a real dev-team directory, or remove the dangerous link) and re-run." >&2
+    exit 2
+}
+
+# D3 (review): mv is only atomic (and loses nothing between steps) when OLD
+# and NEW are on the same filesystem. Off it, refuse rather than silently
+# falling back to a copy that can lose concurrent writes.
+_fs_device_id() {  # path -> device id, or nothing if it cannot be determined
+    stat -c '%d' "$1" 2>/dev/null || stat -f '%d' "$1" 2>/dev/null || true
+}
+same_filesystem() {  # a b -> true if both resolve to the same device
+    local da db
+    da="$(_fs_device_id "$1")"
+    db="$(_fs_device_id "$2")"
+    [[ -n $da && -n $db && $da == $db ]]
+}
+
+# D4 (review): if $DEV_TEAM_HOME itself is a symlink/junction elsewhere,
+# readlink -f on it would resolve straight through to that other location --
+# corrupting every "is this target already the new root?" comparison below
+# into a false match. Keep the literal path as NEW_TEAM_HOME_CANON in that
+# case; the link's target is instead treated as another old-home candidate.
+if [[ -L $DEV_TEAM_HOME ]]; then
+    NEW_TEAM_HOME_CANON="$DEV_TEAM_HOME"
+else
+    NEW_TEAM_HOME_CANON="$(readlink -f "$DEV_TEAM_HOME" 2>/dev/null || printf '%s' "$DEV_TEAM_HOME")"
+fi
+
+# Parallel arrays (bash 3.2 has no associative arrays): OLD_TARGETS[i] is a
+# distinct populated location other than the new root; OLD_TARGET_ROLES[i]
+# is a space-separated list of "$PREFIX$role" profile names whose dev-team
+# link points there. "__root_link__" is a non-profile sentinel meaning
+# "the root dev-team link itself", used when D4 applies.
+OLD_TARGETS=()
+OLD_TARGET_ROLES=()
+add_old_target_role() {  # target role_name
+    local tgt="$1" nm="$2" i
+    for i in "${!OLD_TARGETS[@]}"; do
+        if [[ "${OLD_TARGETS[$i]}" == "$tgt" ]]; then
+            OLD_TARGET_ROLES[$i]="${OLD_TARGET_ROLES[$i]} $nm"
+            return
+        fi
+    done
+    OLD_TARGETS+=("$tgt")
+    OLD_TARGET_ROLES+=("$nm")
+}
+
+for role in "${NAMES[@]}"; do
+    name="$PREFIX$role"
+    hermes profile show "$name" >/dev/null 2>&1 || continue
+    pdir="$(dirname "$(hermes -p "$name" config path)")"
+    target="$(resolve_existing_link "$pdir/dev-team" || true)"
+    [[ -n $target ]] || continue
+    [[ $target == "$NEW_TEAM_HOME_CANON" ]] && continue
+    reason="$(unsafe_old_home_reason "$target")"
+    [[ -n $reason ]] && refuse_unsafe_old_home "$name/dev-team" "$target" "$reason"
+    dir_has_data "$target" || continue
+    add_old_target_role "$target" "$name"
+done
+
+# D4: the root link itself, if it is one, is also an old-home candidate.
+if [[ -L $DEV_TEAM_HOME ]]; then
+    root_target="$(readlink -f "$DEV_TEAM_HOME" 2>/dev/null || true)"
+    if [[ -n $root_target ]]; then
+        reason="$(unsafe_old_home_reason "$root_target")"
+        [[ -n $reason ]] && refuse_unsafe_old_home "the root dev-team link ($DEV_TEAM_HOME)" "$root_target" "$reason"
+        dir_has_data "$root_target" && add_old_target_role "$root_target" "__root_link__"
+    fi
+fi
+
+NEW_HAS_DATA=0
+# D4 (review): when the root dev-team path is itself a link, any data it
+# "has" is the same physical data as whatever old-home candidate it
+# resolves to -- counting it as a second, independently populated location
+# would manufacture a false conflict with itself. Only a *real* directory
+# at the root counts as the root already having its own data.
+if [[ ! -L $DEV_TEAM_HOME ]]; then
+    dir_has_data "$DEV_TEAM_HOME" && NEW_HAS_DATA=1
+fi
+POPULATED_COUNT=${#OLD_TARGETS[@]}
+(( NEW_HAS_DATA )) && POPULATED_COUNT=$((POPULATED_COUNT + 1))
+
+# D5 (review): print one concrete, working command sequence per candidate,
+# never a placeholder. Guard the backup-mv with `[ -e ... ] &&` so an absent
+# root (the commonest conflict shape) does not short-circuit the real mv
+# that follows it, and name every profile that needs relinking afterwards.
+_display_roles() {  # space-separated roles -> user-facing text (N4, review r2)
+    local r out=""
+    for r in $1; do
+        [[ $r == "__root_link__" ]] && r="the-root-dev-team-link"
+        out+=" $r"
+    done
+    printf '%s' "$out"
+}
+_relink_cmds_for_choice() {  # chosen_path (unused: every link goes to the root)
+    # N2 (review r2): after `mv <chosen> $DEV_TEAM_HOME`, the chosen path no
+    # longer exists, so every affected profile -- including the ones that
+    # linked to the chosen location -- must point at the root.
+    local i role pdir
+    for i in "${!OLD_TARGETS[@]}"; do
+        for role in ${OLD_TARGET_ROLES[$i]}; do
+            [[ "$role" == "__root_link__" ]] && continue
+            pdir="$(dirname "$(hermes -p "$role" config path)")"
+            echo "    ln -sfn \"$DEV_TEAM_HOME\" \"$pdir/dev-team\"" >&2
+        done
+    done
+    echo "    # or simply re-run this installer: it relinks every $PREFIX* profile to $DEV_TEAM_HOME" >&2
+}
+_print_candidate_choice() {  # label chosen_path
+    local label="$1" chosen="$2"
+    echo "  To keep $label ($chosen):" >&2
+    echo "    [ -e \"$DEV_TEAM_HOME\" ] && mv \"$DEV_TEAM_HOME\" \"$DEV_TEAM_HOME.bak-$(date +%Y%m%dT%H%M%S)\"" >&2
+    [[ "$chosen" != "$DEV_TEAM_HOME" ]] && echo "    mv \"$chosen\" \"$DEV_TEAM_HOME\"" >&2
+    _relink_cmds_for_choice "$chosen"
+}
+
+MIGRATION_CHOICE="none"
+MIGRATION_WHY="no pre-existing profile-rooted team home with data was found"
+if (( POPULATED_COUNT > 1 )); then
+    MIGRATION_CHOICE="refuse"
+    MIGRATION_WHY="more than one populated team home was found (${#OLD_TARGETS[@]} old location(s)$( ((NEW_HAS_DATA)) && echo ' plus the new root' || true )); moving any of them would silently discard the others, so refuse and let the operator reconcile by hand"
+    echo "Team home conflict: existing team state in more than one location:" >&2
+    if (( NEW_HAS_DATA )); then
+        echo "  $DEV_TEAM_HOME  (the correct Hermes-root location)" >&2
+    fi
+    for i in "${!OLD_TARGETS[@]}"; do
+        echo "  ${OLD_TARGETS[$i]}  (linked from:$(_display_roles "${OLD_TARGET_ROLES[$i]}"))" >&2
+    done
+    echo "Refusing to guess which is current. Reconcile by hand by choosing exactly one candidate below, then re-run:" >&2
+    (( NEW_HAS_DATA )) && _print_candidate_choice "the existing root location" "$DEV_TEAM_HOME"
+    for i in "${!OLD_TARGETS[@]}"; do
+        _print_candidate_choice "the location linked from:$(_display_roles "${OLD_TARGET_ROLES[$i]}")" "${OLD_TARGETS[$i]}"
+    done
+    exit 2
+elif (( ${#OLD_TARGETS[@]} == 1 )); then
+    OLD_TEAM_HOME="${OLD_TARGETS[0]}"
+    AFFECTED_PROFILES="${OLD_TARGET_ROLES[0]}"
+    MIGRATION_CHOICE="move"
+    MIGRATION_WHY="dev-* profiles' dev-team links ($AFFECTED_PROFILES) point at $OLD_TEAM_HOME, which holds the live team's data; $DEV_TEAM_HOME is empty or absent, so it is safe to move the data there without discarding anything"
+    backup="${OLD_TEAM_HOME}.pre-root-migration-$(date +%Y%m%dT%H%M%S)"
+    dest_fs_probe="$DEV_TEAM_HOME"
+    [[ -e $dest_fs_probe ]] || dest_fs_probe="$HERMES_ROOT"
+    if (( DRY_RUN )); then
+        say "Would migrate team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
+        say "  (backup would be kept at $backup)"
+        say "  entries that would move:"
+        while IFS= read -r entry; do say "    $entry"; done < <(list_top_level_entries "$OLD_TEAM_HOME" | sort -u)
+        for p in $AFFECTED_PROFILES; do
+            if [[ "$p" == "__root_link__" ]]; then
+                say "  would replace the root dev-team link with a real directory holding the data"
+            else
+                say "  would relink: $p/dev-team -> $DEV_TEAM_HOME"
+            fi
+        done
+    elif ! same_filesystem "$OLD_TEAM_HOME" "$dest_fs_probe"; then
+        echo "Refusing to migrate: $OLD_TEAM_HOME and $DEV_TEAM_HOME are on different filesystems, so an atomic rename is not possible." >&2
+        echo "Reconcile by hand:" >&2
+        echo "  mkdir -p \"$DEV_TEAM_HOME\"" >&2
+        echo "  cp -a \"$OLD_TEAM_HOME\"/. \"$DEV_TEAM_HOME\"/" >&2
+        echo "  mv \"$OLD_TEAM_HOME\" \"$backup\"" >&2
+        echo "  ln -s \"$DEV_TEAM_HOME\" \"$OLD_TEAM_HOME\"" >&2
+        for p in $AFFECTED_PROFILES; do
+            [[ "$p" == "__root_link__" ]] && continue
+            ppdir="$(dirname "$(hermes -p "$p" config path)")"
+            echo "  ln -sfn \"$DEV_TEAM_HOME\" \"$ppdir/dev-team\"" >&2
+        done
+        exit 2
+    else
+        entries_moved=()
+        while IFS= read -r entry; do entries_moved+=("$entry"); done < <(list_top_level_entries "$OLD_TEAM_HOME" | sort -u)
+        # D3 (review): rename first (atomic on one filesystem), then relink
+        # OLD -> NEW immediately, so every path that resolves through OLD --
+        # including a link outside the scanned $PREFIX$role set, e.g. a
+        # builder's own devops/dev-team -- keeps working with zero window
+        # where a concurrent write would land nowhere. Only after that is a
+        # backup copy made; it is redundant-but-cheap insurance, never
+        # load-bearing for correctness.
+        mkdir -p "$HERMES_ROOT"
+        # D4: if the root path is itself a (dangling-after-this) symlink,
+        # drop it first so the rename lands a real directory there instead
+        # of replacing the link target through it.
+        [[ -L $DEV_TEAM_HOME ]] && rm "$DEV_TEAM_HOME"
+        # N1 (review r2): an existing real root directory must go first, or
+        # `mv` moves OLD *into* it (dev-team/dev-team/...). The plan only gets
+        # here when the root holds no data; rmdir refuses a non-empty
+        # directory, so under set -e this can never delete anything.
+        [[ -d $DEV_TEAM_HOME && ! -L $DEV_TEAM_HOME ]] && rmdir "$DEV_TEAM_HOME"
+        mv "$OLD_TEAM_HOME" "$DEV_TEAM_HOME"
+        ln -s "$DEV_TEAM_HOME" "$OLD_TEAM_HOME"
+        mkdir -p "$backup"
+        cp -a "$DEV_TEAM_HOME"/. "$backup"/
+        say "Migrated team state: $OLD_TEAM_HOME -> $DEV_TEAM_HOME"
+        say "  (backup kept at $backup)"
+        say "  entries moved:"
+        for e in "${entries_moved[@]}"; do say "    $e"; done
+        # Every profile that pointed at the old home, not only the ones
+        # --only selected (review finding #1): the old location was just
+        # renamed out from under them, so leaving their link alone would
+        # make it dangling. The D3 symlink above already keeps it resolving,
+        # but a direct relink shortens the chain.
+        for p in $AFFECTED_PROFILES; do
+            [[ "$p" == "__root_link__" ]] && continue
+            ppdir="$(dirname "$(hermes -p "$p" config path)")"
+            ln -sfn "$DEV_TEAM_HOME" "$ppdir/dev-team"
+            say "  relinked: $ppdir/dev-team -> $DEV_TEAM_HOME"
+        done
+    fi
+fi
 
 say "Hermes home:   $HERMES_ROOT"
 say "Mnemosyne:     $PLUGIN_SRC_MNEMO"

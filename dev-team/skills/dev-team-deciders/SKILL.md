@@ -28,9 +28,9 @@ reasoning on a bounded, repeating question, this tool is not for that turn.
 
 ```
 if command -v secret >/dev/null 2>&1; then
-    secret exec OPENROUTER_DECIDERS_KEY=openrouter/deciders -- deciders <subcommand> ...
+    secret exec OPENROUTER_DECIDERS_KEY=openrouter/deciders -- deciders <subcommand> ... --task-id "<your kanban task id>"
 else
-    deciders <subcommand> ...   # relies on OPENROUTER_DECIDERS_KEY already in the environment
+    deciders <subcommand> ... --task-id "<your kanban task id>"   # relies on OPENROUTER_DECIDERS_KEY already in the environment
 fi
 ```
 
@@ -40,6 +40,17 @@ the key yourself. Elsewhere, call `deciders` directly and let the passed-through
 variable supply the key. Never print, log, or write the key value — `deciders` already scrubs
 its own stdout, but you must not route the value through anything that would re-expose it (a
 `terminal` echo, a card body, a commit).
+
+**Always pass `--task-id` with your own kanban task id, literally.** `deciders` ledgers every
+call's spend with the task that paid for it, reading `$HERMES_KANBAN_TASK` only as a fallback.
+Do not rely on that fallback: a dispatched worker's shell/subprocess environment (what
+`secret exec` or a plain `terminal` command actually runs with) is not guaranteed to carry
+`HERMES_KANBAN_TASK` even when sibling vars like `HERMES_KANBAN_BOARD` and
+`HERMES_KANBAN_WORKSPACE` are present there — confirmed by probing a real dispatched task's
+shell. You, the calling agent, already know your task id (it is in your dispatch context,
+`kanban_show()`, or the board/task text you were given) whether or not the shell inherits it, so
+pass it explicitly as `--task-id`. Never pass the key the same way — `--task-id` takes the task
+id string only, never a secret value.
 
 ## The three subcommands
 

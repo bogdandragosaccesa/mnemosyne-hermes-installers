@@ -40,33 +40,53 @@ def _fake_key() -> str:
 class FakeTransport:
     """Records every call; replays a queued response or raises a queued error.
 
-    I4: also asserts the live request shapes recorded in PROBES.md, so a
-    test that (re)introduces an array `questions` or a nested/list
-    `entities` fails here even if production code's own validation were
-    ever weakened or bypassed."""
+    I4: also records live request-shape violations recorded in PROBES.md,
+    so a test that (re)introduces an array `questions` or a nested/list
+    `entities` is caught here even if production code's own validation
+    were ever weakened or bypassed.
+
+    D4 (review): a shape violation is *recorded*, not raised. Raising
+    `AssertionError` here used to work by accident only because nothing
+    in `main()` swallowed it on the happy path -- but `main()`'s
+    catch-all `except Exception` DOES catch `AssertionError`, turns it
+    into a generic `{"error": ...}` + exit 2, and a test that only
+    checks `code == EXIT_UNANSWERED` (exit 2 means "answered with an
+    error", not specifically "the input was rejected before any call")
+    would pass even though the real bug -- a bad shape reaching the
+    transport at all -- went undetected. Recording into `self.violations`
+    and asserting that list is empty in `_run` (used by every test that
+    drives `main()`) makes the failure visible regardless of what exit
+    code `main()` happens to produce."""
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.violations = []
 
     def __call__(self, url, headers, body, timeout):
         self.calls.append((url, headers, body, timeout))
         if url == "https://openrouter.ai/api/alpha/decisions" and "questions" in body:
             questions = body["questions"]
-            assert isinstance(questions, dict), (
-                f"questions must be a record (dict), not {type(questions).__name__}")
-            for qid, spec in questions.items():
-                assert isinstance(spec, dict) and spec.get("type"), (
-                    f"questions[{qid!r}] must be an object with a 'type'")
+            if not isinstance(questions, dict):
+                self.violations.append(
+                    f"questions must be a record (dict), not {type(questions).__name__}")
+            else:
+                for qid, spec in questions.items():
+                    if not (isinstance(spec, dict) and spec.get("type")):
+                        self.violations.append(
+                            f"questions[{qid!r}] must be an object with a 'type'")
         if url == "https://openrouter.ai/api/v1/chat/completions":
             entities = (body.get("provider") or {}).get("options", {}).get(
                 "scaledown", {}).get("entities")
             if entities is not None:
-                assert isinstance(entities, dict), (
-                    f"entities must be a flat dict, not {type(entities).__name__}")
-                for name, desc in entities.items():
-                    assert isinstance(name, str) and isinstance(desc, str), (
-                        "entities must be a flat str -> str record")
+                if not isinstance(entities, dict):
+                    self.violations.append(
+                        f"entities must be a flat dict, not {type(entities).__name__}")
+                else:
+                    for name, desc in entities.items():
+                        if not (isinstance(name, str) and isinstance(desc, str)):
+                            self.violations.append(
+                                "entities must be a flat str -> str record")
         if not self._responses:
             raise AssertionError("FakeTransport called more times than expected")
         resp = self._responses.pop(0)
@@ -82,6 +102,21 @@ def _env(key=None):
     return env
 
 
+def _assert_no_shape_violations(transport) -> None:
+    """D4 (review): every test that drives `main()` through a FakeTransport
+    must fail -- not silently pass with whatever exit code `main()`
+    produced -- if the fake recorded a request-shape violation. Without
+    this, `main()`'s catch-all `except Exception` turns the fake's
+    detection into an ordinary-looking `{"error": ...}` / exit 2 that is
+    indistinguishable from a legitimate rejection."""
+    violations = getattr(transport, "violations", None)
+    if violations:
+        raise AssertionError(
+            "FakeTransport recorded request-shape violation(s), but the "
+            "test did not fail on them: " + "; ".join(violations)
+        )
+
+
 def _run(argv, transport, env, home=None):
     out = io.StringIO()
     if home is None:
@@ -91,8 +126,10 @@ def _run(argv, transport, env, home=None):
         # isn't writable.
         with tempfile.TemporaryDirectory() as tmp:
             code = main(argv, home=Path(tmp), env=env, transport=transport, out=out)
+            _assert_no_shape_violations(transport)
             return code, out.getvalue()
     code = main(argv, home=home, env=env, transport=transport, out=out)
+    _assert_no_shape_violations(transport)
     return code, out.getvalue()
 
 
@@ -341,6 +378,65 @@ class KeyRedactionTests(unittest.TestCase):
         code, stdout = _run(self._decide_argv(), transport, env)
         self.assertEqual(code, EXIT_UNANSWERED)
         self.assertNotIn(key, stdout)
+
+
+class TaskIdValidationTests(unittest.TestCase):
+    """D2 (review): `--task-id` is validated before the handler runs, so a
+    bad value never spends money and never reaches the ledger. Every
+    rejection is the same labelled `deciders: bad-input: task-id` --
+    never the rejected value itself."""
+
+    def _decide_argv(self, task_id):
+        return [
+            "decide", "--state", str(FIXTURES / "decide_ok.json"),
+            "--questions", str(FIXTURES / "decide_questions.json"),
+            "--task-id", task_id,
+        ]
+
+    def _assert_rejected(self, task_id):
+        key = _fake_key()
+        transport = FakeTransport([])  # never reached if rejection is pre-handler
+        env = _env(key)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(self._decide_argv(task_id), transport, env, home=home)
+            self.assertEqual(code, EXIT_UNANSWERED)
+            self.assertEqual(len(transport.calls), 0, "handler must not run on bad task-id")
+            data = json.loads(stdout)
+            self.assertTrue(data["error"].startswith("deciders: bad-input"))
+            self.assertIn("task-id", data["error"])
+            self.assertNotIn(key, stdout)
+            if task_id != key:
+                self.assertNotIn(task_id, stdout)
+            ledger = deciders_core.ledger_path(home)
+            self.assertFalse(ledger.exists(), "a rejected task-id must never reach the ledger")
+
+    def test_key_as_task_id_is_rejected(self):
+        self._assert_rejected(_fake_key())
+
+    def test_bearer_key_as_task_id_is_rejected(self):
+        self._assert_rejected(f"Bearer {_fake_key()}")
+
+    def test_5000_char_task_id_is_rejected(self):
+        self._assert_rejected("a" * 5000)
+
+    def test_task_id_with_newline_is_rejected(self):
+        self._assert_rejected("t_abc\ndef")
+
+    def test_valid_task_id_is_accepted(self):
+        fixture = _load_fixture("decide_ok.json")
+        key = _fake_key()
+        transport = FakeTransport([fixture])
+        env = _env(key)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, stdout = _run(
+                self._decide_argv("t_1a2b3c4d"), transport, env, home=home
+            )
+            self.assertEqual(code, EXIT_OK)
+            ledger = deciders_core.ledger_path(home)
+            record = json.loads(ledger.read_text().splitlines()[0])
+            self.assertEqual(record["task_id"], "t_1a2b3c4d")
 
 
 # --- Real classification: urllib_transport with urlopen patched -------------
@@ -628,16 +724,20 @@ class M2ErrorLabellingTests(unittest.TestCase):
 
     def test_argparse_error_is_labelled_bad_input_not_a_crash(self):
         out = io.StringIO()
+        transport = FakeTransport([])
         code = main(["decide", "--state"], home=Path("/nonexistent"), env={},
-                     transport=FakeTransport([]), out=out)
+                     transport=transport, out=out)
+        _assert_no_shape_violations(transport)
         self.assertEqual(code, EXIT_UNANSWERED)
         data = json.loads(out.getvalue())
         self.assertTrue(data["error"].startswith("deciders: bad-input"))
 
     def test_unknown_subcommand_is_labelled_bad_input_not_a_crash(self):
         out = io.StringIO()
+        transport = FakeTransport([])
         code = main(["not-a-command"], home=Path("/nonexistent"), env={},
-                     transport=FakeTransport([]), out=out)
+                     transport=transport, out=out)
+        _assert_no_shape_violations(transport)
         self.assertEqual(code, EXIT_UNANSWERED)
         data = json.loads(out.getvalue())
         self.assertTrue(data["error"].startswith("deciders: bad-input"))
@@ -668,6 +768,56 @@ class M2ErrorLabellingTests(unittest.TestCase):
         data = json.loads(stdout)
         self.assertTrue(data["error"].startswith("deciders: bad-input"))
         self.assertNotIn(key, stdout)
+
+
+class D4FakeShapeViolationIsNotSwallowedTests(unittest.TestCase):
+    """Review D4 regression: if `_require_questions_record`'s own
+    validation is ever bypassed, a bad shape reaching the transport must
+    fail the test outright -- not quietly produce the ordinary-looking
+    exit 2 that `main()`'s catch-all gives every other error.
+
+    Proof: with the real validator patched into a no-op, a deliberately
+    wrong `questions` shape (a list, not a record) now reaches
+    FakeTransport. The fake records the violation; `_run`'s
+    `_assert_no_shape_violations` call turns that into a hard
+    `AssertionError`, which is what this test expects. Before the D4
+    fix (FakeTransport raising a plain `AssertionError` inside
+    `__call__`, with no post-hoc list to check), that same AssertionError
+    was caught by `main()`'s `except Exception`, converted to
+    `{"error": "questions must be a record ..."}`, and `main()` returned
+    EXIT_UNANSWERED (2) -- a code indistinguishable from any other
+    legitimate rejection, so a test checking only `code == EXIT_UNANSWERED`
+    passed even though the real bug (a bad shape reaching the network
+    call) went completely undetected.
+    """
+
+    def test_bypassed_validation_is_caught_not_swallowed_as_exit_2(self):
+        fixture = _load_fixture("decide_ok.json")
+        transport = FakeTransport([fixture])
+        env = _env(_fake_key())
+        with tempfile.TemporaryDirectory() as tmp:
+            # Deliberately the wrong shape per PROBES.md: a list, not a
+            # record keyed by question id. With real validation in place
+            # this never reaches the transport at all (see
+            # I4RequestShapeTests); here we bypass that validator to
+            # reproduce exactly what D4 is about: a shape bug that
+            # reaches the wire.
+            questions_path = Path(tmp) / "bad_questions.json"
+            questions_path.write_text(json.dumps([{"type": "choice"}]))
+            with mock.patch(
+                "deciders_core._require_questions_record", side_effect=lambda q: q
+            ):
+                with self.assertRaises(AssertionError) as ctx:
+                    _run(
+                        ["decide", "--state", str(FIXTURES / "decide_ok.json"),
+                         "--questions", str(questions_path)],
+                        transport, env,
+                    )
+        self.assertIn("questions must be a record", str(ctx.exception))
+        # The fake really did get called with the bad shape -- this is
+        # not a test tautology, the request was actually sent.
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(len(transport.violations), 1)
 
 
 if __name__ == "__main__":
