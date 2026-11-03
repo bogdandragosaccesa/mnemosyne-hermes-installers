@@ -371,17 +371,21 @@ PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 resolve_abs_nearest() {
     local p="$1" resolved="" c target hops=0 i=0
     local -a parts tparts
+    [[ "$p" == /* ]] || p="$PWD/$p"
     # fix round 3 (safety finding 2): `IFS='/' read -r -a ... <<< "$target"`
     # below relies on bash `read`, which stops at the first newline --
     # silently shortening a path or symlink target that contains one,
-    # instead of failing. Refuse up front, before any splitting, rather
-    # than resolve a truncated (and possibly real, pre-existing) prefix
-    # as if it were the whole path.
+    # instead of failing. Refuse before any splitting, rather than resolve
+    # a truncated (and possibly real, pre-existing) prefix as if it were
+    # the whole path. PR #9 review section 3: this check runs AFTER the
+    # $PWD join, because a relative argument run from a cwd containing a
+    # newline (`--team-memory bank` from `$T/other-team-bank<LF>/w`) used
+    # to pass the check and then resolve to the unrelated `$T/other-team-bank`.
+    # Byte-exact ASCII test only (LF, CR): no locale-dependent class.
     if [[ "$p" == *$'\n'* || "$p" == *$'\r'* ]]; then
-        echo "Path contains a newline or carriage return, refusing to resolve: $1" >&2
+        printf 'Path contains a newline or carriage return, refusing to resolve: %q\n' "$p" >&2
         return 1
     fi
-    [[ "$p" == /* ]] || p="$PWD/$p"
     IFS='/' read -r -a parts <<< "$p"
     while (( i < ${#parts[@]} )); do
         c="${parts[i]}"
@@ -396,14 +400,26 @@ resolve_abs_nearest() {
                 echo "Too many levels of symbolic links resolving: $1" >&2
                 return 1
             fi
-            target="$(readlink -- "$resolved/$c")"
+            # Sentinel read (PR #9 known issue): `$(readlink ...)` strips
+            # ALL trailing newlines, so a target of "$T/decoy<LF>" used to
+            # come back as "$T/decoy" and resolve to that unrelated real
+            # directory. Append an `x` after readlink's output so command
+            # substitution has nothing to strip, then remove the `x` and
+            # exactly the ONE newline readlink itself prints. Whatever
+            # newline is left belongs to the target and is refused below.
+            target="$(readlink -- "$resolved/$c" && printf x)" || {
+                printf 'Cannot read symlink, refusing to resolve: %q\n' "$resolved/$c" >&2
+                return 1
+            }
+            target="${target%x}"
+            target="${target%$'\n'}"
             # Same newline/CR guard as above, for a target read back off
             # disk rather than passed in as an argument -- a symlink
             # target is exactly as attacker- or mistake-controlled as the
             # raw path (repro: a symlink whose target is truncated at a
             # newline to a shorter, unrelated, pre-existing directory).
             if [[ "$target" == *$'\n'* || "$target" == *$'\r'* ]]; then
-                echo "Symlink target contains a newline or carriage return, refusing to resolve: $resolved/$c -> $target" >&2
+                printf 'Symlink target contains a newline or carriage return, refusing to resolve: %q -> %q\n' "$resolved/$c" "$target" >&2
                 return 1
             fi
             # An absolute target restarts from `/`; a relative one is
@@ -463,20 +479,31 @@ identity_overlap_either() {
 
 # Item 4a (review r3) / operator decision (round 2 of the Stream B fix
 # round): pins stay UNQUOTED, UTF-8, no BOM, no escaping -- see the
-# set_env_var() comment below for why. Checked here, on the raw
-# --team-memory argument (or its default), BEFORE path resolution, so this
-# fires even when the value cannot be resolved to a real path at all --
-# same place install-dev-team-windows.ps1 checks its -TeamMemory argument
-# (Get-EnvUnsafeValueReason).
+# set_env_var() comment below for why.
+#
+# PR #9 follow-up (card A2): this bash function is now only a FAST PATH
+# for the obvious ASCII shapes, run on the raw --team-memory argument (or
+# its default) before path resolution so the message names what the
+# operator typed. It is NOT what decides safety: env_pin_check_or_die()
+# below runs dev-team/scripts/env_pin_check.py on every FINAL, resolved
+# value this run will pin, and that checker is authoritative. Every test
+# here is a byte-exact comparison against an explicit ASCII byte list --
+# no `[[:space:]]`, no `$'\u....'`, no non-ASCII `$'\x..'`, no ranges --
+# so the verdict cannot depend on the locale (the reverted bash attempt,
+# 830e8b7/07555b3/c8cfaa6, refused ą, Å and х because `$'\x85'` is a raw
+# byte that also occurs inside their UTF-8 encodings). The whitespace list
+# is Python's str.isspace() restricted to ASCII: TAB LF VT FF CR, FS GS RS
+# US (0x1c-0x1f) and SPACE.
+_ENV_ASCII_WS=$' \t\n\v\f\r\x1c\x1d\x1e\x1f'
 env_value_unsafe_reason() {  # value -> prints a reason if unsafe, else nothing
     local v="$1"
     if [[ $v == *$'\n'* || $v == *$'\r'* ]]; then
         printf 'contains a newline'
     elif [[ $v == \'* || $v == \"* || $v == *\' || $v == *\" ]]; then
         printf 'starts or ends with a quote character'
-    elif [[ $v == [[:space:]]* || $v == *[[:space:]] ]]; then
+    elif [[ $v == ["$_ENV_ASCII_WS"]* || $v == *["$_ENV_ASCII_WS"] ]]; then
         printf 'starts or ends with whitespace'
-    elif [[ $v == *[[:space:]]'#'* ]]; then
+    elif [[ $v == *["$_ENV_ASCII_WS"]'#'* ]]; then
         printf "contains whitespace immediately followed by '#'"
     elif [[ $v == *'${'* ]]; then
         # fix round 3 (safety finding 1): Hermes's own .env loader
@@ -487,6 +514,36 @@ env_value_unsafe_reason() {  # value -> prints a reason if unsafe, else nothing
         # Get-EnvUnsafeValueReason (a82da09: "contains a literal ${").
         printf 'contains a literal ${'
     fi
+}
+
+# The authoritative pin check (PR #9 review section 2(b), card A2). Runs
+# dev-team/scripts/env_pin_check.py KEY with the value passed ONLY through
+# the environment (DEV_TEAM_ENV_CHECK_VALUE -- the checker reads it as raw
+# bytes via os.environb, so neither the locale nor argv quoting can alter
+# it). Checker exit 0: safe. Exit 1: unsafe, one ASCII reason line on
+# stdout. Exit 2 or anything else: internal error. Both 1 and 2 -- and a
+# missing python3 or checker -- refuse with this installer's exit 2 (fail
+# closed). `python3 -I` so PYTHONPATH/PYTHONHOME/user site cannot swap in
+# a different module. Called directly (never inside `$(...)`), so its
+# `exit 2` ends the installer.
+ENV_PIN_CHECK_PY="$SCRIPT_DIR/scripts/env_pin_check.py"
+env_pin_check_or_die() {  # key value subject
+    local key="$1" value="$2" subject="$3" out rc=0
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "$subject: python3 not found on PATH, so the $key pin cannot be checked to read back identically from .env. Refusing (install python3 and re-run)." >&2
+        exit 2
+    fi
+    if [[ ! -f $ENV_PIN_CHECK_PY ]]; then
+        echo "$subject: pin checker missing ($ENV_PIN_CHECK_PY), so the $key pin cannot be checked. Refusing." >&2
+        exit 2
+    fi
+    out="$(DEV_TEAM_ENV_CHECK_VALUE="$value" python3 -I "$ENV_PIN_CHECK_PY" "$key")" || rc=$?
+    case $rc in
+        0) return 0 ;;
+        1) echo "$subject would not read back identically from .env as $key: ${out:-no reason given}. Pick a path without that." >&2 ;;
+        *) echo "$subject: the .env pin checker failed (exit $rc) checking $key; refusing rather than writing an unchecked pin." >&2 ;;
+    esac
+    exit 2
 }
 OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"
 # Every path below is canonical (no `.`, `..`, `//`, symlink): the value
@@ -580,23 +637,33 @@ fi
 # on disk by the time a later one's unsafe value is caught. Message
 # blames --team-memory only when the user actually passed it; otherwise
 # it points at the default location (derived from $HERMES_ROOT) instead.
-_check_pin_value_or_die() {  # value description(no-raw-check)
+#
+# Card A2 (PR #9 review section 2(b)): the bash fast path alone accepted
+# values Mnemosyne's reader splits (U+2028, 0x1c, 0x0b, a resolved symlink
+# target with U+2028) or that python-dotenv/both readers alter (U+00A0
+# before '#', a trailing U+00A0 or 0x1f, non-UTF-8 bytes). Safety is now
+# decided by env_pin_check_or_die (dev-team/scripts/env_pin_check.py) on
+# each exact value and key pin_mnemosyne_data_dir will write; the fast
+# path only gives the older, more specific messages first.
+_check_pin_value_or_die() {  # key value description(no-raw-check)
     local _reason
-    _reason="$(env_value_unsafe_reason "$1")"
-    [[ -n "$_reason" ]] || return 0
-    echo "$2 $_reason; it would not read back identically from .env. Pick a path without that." >&2
-    exit 2
+    _reason="$(env_value_unsafe_reason "$2")"
+    if [[ -n "$_reason" ]]; then
+        echo "$3 $_reason; it would not read back identically from .env. Pick a path without that." >&2
+        exit 2
+    fi
+    env_pin_check_or_die "$1" "$2" "$3"
 }
 if [[ -n $SHARED_DATA ]]; then
     if [[ -n "${TEAM_MEMORY:-}" ]]; then
-        _team_home_subject="--team-memory's resolved path ($_team_home_real)"
-        _team_data_subject="--team-memory's resolved data path ($_team_home_real/data)"
+        _team_home_subject="--team-memory's resolved path ($(printf '%q' "$_team_home_real"))"
+        _team_data_subject="--team-memory's resolved data path ($(printf '%q' "$_team_home_real/data"))"
     else
-        _team_home_subject="the default team memory bank path ($_team_home_real, under \$HERMES_ROOT)"
-        _team_data_subject="the default team memory bank's data path ($_team_home_real/data, under \$HERMES_ROOT)"
+        _team_home_subject="the default team memory bank path ($(printf '%q' "$_team_home_real"), under \$HERMES_ROOT)"
+        _team_data_subject="the default team memory bank's data path ($(printf '%q' "$_team_home_real/data"), under \$HERMES_ROOT)"
     fi
-    _check_pin_value_or_die "$_team_home_real" "$_team_home_subject"
-    _check_pin_value_or_die "$_team_home_real/data" "$_team_data_subject"
+    _check_pin_value_or_die MNEMOSYNE_HOME "$_team_home_real" "$_team_home_subject"
+    _check_pin_value_or_die MNEMOSYNE_DATA_DIR "$_team_home_real/data" "$_team_data_subject"
 fi
 for _preflight_role in "${NAMES[@]}"; do
     selected "$_preflight_role" || continue
@@ -606,9 +673,9 @@ for _preflight_role in "${NAMES[@]}"; do
     else
         _preflight_profile_dir="$HERMES_ROOT/profiles/$_preflight_name"
     fi
-    _check_pin_value_or_die "$_preflight_profile_dir/mnemosyne" \
+    _check_pin_value_or_die MNEMOSYNE_HOME "$_preflight_profile_dir/mnemosyne" \
         "$_preflight_name's resolved mnemosyne home path (\$HERMES_ROOT/profiles/$_preflight_name/mnemosyne)"
-    _check_pin_value_or_die "$_preflight_profile_dir/mnemosyne/data" \
+    _check_pin_value_or_die MNEMOSYNE_DATA_DIR "$_preflight_profile_dir/mnemosyne/data" \
         "$_preflight_name's resolved mnemosyne data path (\$HERMES_ROOT/profiles/$_preflight_name/mnemosyne/data)"
 done
 unset _preflight_role _preflight_name _preflight_profile_dir _team_home_subject _team_data_subject
@@ -655,15 +722,32 @@ unset _preflight_role _preflight_name _preflight_profile_dir _team_home_subject 
 # `v.strip().strip("'\"")`) only strips a bounding whitespace/quote
 # character and never unescapes `\\` or `\'`, so it would read "it's"
 # pinned as `'it\'s'` back as the literal `it\'s` -- a corrupted bank
-# path. Unquoted values round-trip byte-exact through BOTH readers for
-# every value this installer can produce, because
-# env_value_unsafe_reason() above already refuses, before any value
-# reaches this function, every shape the two readers would disagree on:
-# an embedded newline, leading/trailing whitespace, a leading/trailing
-# quote character, and whitespace immediately followed by '#' (the one
-# case python-dotenv's unquoted-value grammar truncates at). Do not
-# re-quote; re-check the round-trip table in test_install_unix.py and the
-# completion metadata before changing this format again.
+# path. Unquoted is kept; what makes it safe is a check, not the format.
+#
+# What guarantees the round trip (card A2; the claim this comment used to
+# make -- "unquoted values round-trip byte-exact through BOTH readers for
+# every value this installer can produce" -- was false, see the PR #9
+# review, pr9-review.md section 2(b) and (d)): every value reaches this
+# function only after env_pin_check_or_die() accepted that exact value for
+# that exact key, in the preflight above and again in
+# pin_mnemosyne_data_dir() below. dev-team/scripts/env_pin_check.py
+# accepts a value only if its cited TRANSCRIPTIONS of the readers all read
+# back exactly {KEY: value}, from this function's LF output, alone and
+# between other lines:
+#   * python-dotenv 1.2.2 (dotenv/parser.py:14-182, dotenv/main.py:32-39,
+#     :91-95, dotenv/variables.py:5-86), as Hermes calls it;
+#   * Hermes env_loader post-processing at hermes-agent bf0203a
+#     (hermes_cli/env_loader.py:295-499: sanitiser rewrite, ${} expansion,
+#     credential strip; hermes_cli/config.py:2556-2566);
+#   * Mnemosyne 4.0.0b6 mnemosyne/mcp_server.py:_load_dotenv :793-842
+#     (`splitlines()`, `v.strip().strip("'\"")`, :823-834).
+# The guarantee is therefore only as good as those transcriptions:
+# dev-team/scripts/tests/test_env_pin_check.py diffs them against the real
+# readers when installed (3004 cases, 0 mismatches, at A1/d7187e0), and a
+# reader upgrade needs that diff re-run. env_value_unsafe_reason() is only
+# an ASCII fast path for clearer messages and guarantees nothing on its
+# own. Do not re-quote; re-check test_env_pin_check.py and
+# test_install_unix_env_pins.py before changing this format again.
 set_env_var() {  # env_file var_name value
     local env_file="$1" var_name="$2" value="$3" line found=0 tmp
     local -a out_lines=()
@@ -690,6 +774,13 @@ pin_mnemosyne_data_dir() {
     # F1: data_dir is always "<bank>/data" at every call site below, so
     # its dirname is exactly the bank root MNEMOSYNE_HOME must name.
     home_dir="$(dirname -- "$data_dir")"
+    # Card A2: check the exact values about to be written, with their keys
+    # -- not only the preflight's reconstruction of them. The preflight
+    # above has already accepted these same strings, so this should never
+    # fire; if it does (a pin site the preflight does not mirror), refuse
+    # before this profile's .env is touched.
+    env_pin_check_or_die MNEMOSYNE_DATA_DIR "$data_dir" "$(basename -- "$profile_dir")'s MNEMOSYNE_DATA_DIR pin ($(printf '%q' "$data_dir"))"
+    env_pin_check_or_die MNEMOSYNE_HOME "$home_dir" "$(basename -- "$profile_dir")'s MNEMOSYNE_HOME pin ($(printf '%q' "$home_dir"))"
     if (( DRY_RUN )); then
         say "  would pin in .env: MNEMOSYNE_DATA_DIR=$data_dir"
         say "  would pin in .env: MNEMOSYNE_HOME=$home_dir"
