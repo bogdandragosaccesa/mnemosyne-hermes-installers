@@ -415,6 +415,33 @@ path_is_or_under() {
     [[ "$inner" == "$outer" || "$inner" == "$outer"/* ]]
 }
 
+# True if some EXISTING ancestor of $1 (the candidate, walked from itself
+# up to `/`) is filesystem-identical to $2 (the outer location, which must
+# itself exist). Catches a bind mount: `mount --bind $operator $alias`
+# gives $alias a name with no symlink in it anywhere, so
+# resolve_abs_nearest's symlink-only walk cannot see that it is really the
+# operator's bank (review D4). Deliberately does NOT walk $2's ancestors
+# too -- doing that would make every path under the same Hermes root match
+# every other one, since they all eventually share the root itself as a
+# common existing ancestor.
+identity_overlap() {
+    local candidate="${1%/}" outer="${2%/}" probe
+    [[ -n $outer && -e $outer ]] || return 1
+    probe="$candidate"
+    while :; do
+        [[ -n $probe && -e $probe ]] && { [[ "$probe" -ef "$outer" ]] && return 0; }
+        [[ -z $probe || $probe == / ]] && break
+        probe="${probe%/*}"
+        [[ -z $probe ]] && probe=/
+    done
+    return 1
+}
+# Either-direction identity overlap: true if $1 or $2 sits inside (or is)
+# the other, by filesystem identity rather than path string.
+identity_overlap_either() {
+    identity_overlap "$1" "$2" || identity_overlap "$2" "$1"
+}
+
 OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"
 # Every path below is canonical (no `.`, `..`, `//`, symlink): the value
 # checked is byte-for-byte the value later passed to mkdir/ln.
@@ -427,26 +454,92 @@ _mnemosyne_home_real=""
 if [[ -n "${MNEMOSYNE_HOME:-}" ]]; then
     _mnemosyne_home_real="$(_resolve_or_die "$MNEMOSYNE_HOME" "MNEMOSYNE_HOME")" || exit 2
 fi
+# D1: MNEMOSYNE_DATA_DIR is the variable that actually decides the data
+# directory the installed Mnemosyne package uses (mnemosyne/cli.py:20-23,
+# mnemosyne/core/beam.py:358-366 both check it before anything else,
+# including before $HERMES_HOME/mnemosyne/data). When it is set in this
+# installer's own environment it names an operator-controlled location
+# exactly like MNEMOSYNE_HOME, so the refusal check below must treat it
+# the same way.
+_mnemosyne_data_dir_real=""
+if [[ -n "${MNEMOSYNE_DATA_DIR:-}" ]]; then
+    _mnemosyne_data_dir_real="$(_resolve_or_die "$MNEMOSYNE_DATA_DIR" "MNEMOSYNE_DATA_DIR")" || exit 2
+fi
 _team_home_real="$TEAM_MEMORY_HOME"
-# True if $1 (canonical) is, sits inside, or contains either operator
-# location (the operator bank, or MNEMOSYNE_HOME when set).
+HERMES_ROOT_PROFILES_REAL="$(_resolve_or_die "$HERMES_ROOT/profiles" "\$HERMES_ROOT/profiles")" || exit 2
+HERMES_ROOT_DEV_TEAM_REAL="$(_resolve_or_die "$HERMES_ROOT/dev-team" "\$HERMES_ROOT/dev-team")" || exit 2
+# True if $1 (canonical) is, sits inside, or contains any operator
+# location -- the operator bank, MNEMOSYNE_HOME, or MNEMOSYNE_DATA_DIR,
+# whichever are set -- by path containment or by filesystem identity (D4).
 touches_operator_bank() {
-    path_is_or_under "$_operator_home_real" "$1" || path_is_or_under "$1" "$_operator_home_real" ||
-        { [[ -n "$_mnemosyne_home_real" ]] &&
-          { path_is_or_under "$_mnemosyne_home_real" "$1" || path_is_or_under "$1" "$_mnemosyne_home_real"; }; }
+    local target="$1" loc
+    for loc in "$_operator_home_real" "$_mnemosyne_home_real" "$_mnemosyne_data_dir_real"; do
+        [[ -n "$loc" ]] || continue
+        if path_is_or_under "$loc" "$target" || path_is_or_under "$target" "$loc" \
+                || identity_overlap_either "$target" "$loc"; then
+            return 0
+        fi
+    done
+    return 1
 }
 _team_memory_refusal=""
-if path_is_or_under "$_operator_home_real" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_operator_home_real"; then
-    _team_memory_refusal="the operator's own bank ($OPERATOR_MNEMO_HOME)"
-elif [[ -n "$_mnemosyne_home_real" ]]; then
-    if path_is_or_under "$_mnemosyne_home_real" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_mnemosyne_home_real"; then
-        _team_memory_refusal="MNEMOSYNE_HOME ($MNEMOSYNE_HOME)"
+_refusal_names=("the operator's own bank ($OPERATOR_MNEMO_HOME)" "MNEMOSYNE_HOME (${MNEMOSYNE_HOME:-})" "MNEMOSYNE_DATA_DIR (${MNEMOSYNE_DATA_DIR:-})")
+_refusal_reals=("$_operator_home_real" "$_mnemosyne_home_real" "$_mnemosyne_data_dir_real")
+for _i in "${!_refusal_reals[@]}"; do
+    _loc="${_refusal_reals[$_i]}"
+    [[ -n "$_loc" ]] || continue
+    if path_is_or_under "$_loc" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_loc" \
+            || identity_overlap_either "$_team_home_real" "$_loc"; then
+        _team_memory_refusal="${_refusal_names[$_i]}"
+        break
+    fi
+done
+# D5: a --team-memory under $HERMES_ROOT/profiles or $HERMES_ROOT/dev-team
+# breaks every profile's memory (review repro: pointed at a profile's own
+# mnemosyne/, the link ends up pointing at itself).
+if [[ -z "$_team_memory_refusal" ]]; then
+    if path_is_or_under "$HERMES_ROOT_PROFILES_REAL" "$_team_home_real" || identity_overlap "$_team_home_real" "$HERMES_ROOT_PROFILES_REAL"; then
+        _team_memory_refusal="a Hermes profile directory ($HERMES_ROOT/profiles)"
+    elif path_is_or_under "$HERMES_ROOT_DEV_TEAM_REAL" "$_team_home_real" || identity_overlap "$_team_home_real" "$HERMES_ROOT_DEV_TEAM_REAL"; then
+        _team_memory_refusal="the dev-team state directory ($HERMES_ROOT/dev-team)"
     fi
 fi
 if [[ -n "$_team_memory_refusal" ]]; then
     echo "--team-memory must not point at, be nested in, or contain $_team_memory_refusal." >&2
     exit 2
 fi
+
+# D1: pin this profile's own Mnemosyne data directory into its own .env so
+# an inherited MNEMOSYNE_DATA_DIR from the launching shell or gateway
+# cannot redirect it away from the bank this installer just linked.
+# hermes_cli/env_loader.py:502-562 (load_hermes_dotenv) loads a profile's
+# own .env with override=True specifically because "a profile's .env
+# overrides stale shell exports" -- confirmed by reading that function.
+# mnemosyne/cli.py:20-23 and mnemosyne/core/beam.py:358-366 both check
+# MNEMOSYNE_DATA_DIR before $HERMES_HOME/mnemosyne/data (the path this
+# installer's symlink otherwise relies on). Together these mean a
+# profile-level .env entry is the one thing Hermes applies with priority
+# over an inherited shell/gateway environment variable, so pinning it here
+# closes the gap the operator saw live with MNEMOSYNE_HOME (same class of
+# bug, actually caused by MNEMOSYNE_DATA_DIR per the operator's own
+# correction) without having to refuse the install outright.
+pin_mnemosyne_data_dir() {
+    local profile_dir="$1" data_dir="$2" env_file
+    env_file="$profile_dir/.env"
+    if (( DRY_RUN )); then
+        say "  would pin in .env: MNEMOSYNE_DATA_DIR=$data_dir"
+        return
+    fi
+    mkdir -p "$profile_dir"
+    if [[ -f $env_file ]] && grep -q '^MNEMOSYNE_DATA_DIR=' "$env_file"; then
+        local tmp
+        tmp="$(mktemp "${env_file}.XXXXXX")"
+        sed "s|^MNEMOSYNE_DATA_DIR=.*|MNEMOSYNE_DATA_DIR=$data_dir|" "$env_file" > "$tmp"
+        mv -- "$tmp" "$env_file"
+    else
+        printf 'MNEMOSYNE_DATA_DIR=%s\n' "$data_dir" >> "$env_file"
+    fi
+}
 # Team state (forge project records, team clones) must be visible to every
 # role: devops writes the project record at onboarding, pr-ci reads it to
 # open the PR, and the guard reads it from every other stage to verify the
@@ -871,16 +964,49 @@ for i in "${!NAMES[@]}"; do
     run mkdir -p "$profile_dir/plugins"
     run ln -sfn "$PLUGIN_SRC_MNEMO" "$profile_dir/plugins/mnemosyne"
 
+    # D2: canonicalise $profile_dir itself BEFORE acting on its mnemosyne/.
+    # Refuse if it resolves outside $HERMES_ROOT/profiles (review repro: a
+    # profile directory that is itself a symlink to the Hermes root turns
+    # "$profile_dir/mnemosyne" into the operator's own bank).
+    _profile_dir_real="$(resolve_abs_nearest "$profile_dir")" || {
+        echo "Cannot resolve $name's profile directory: $profile_dir" >&2
+        exit 1
+    }
+    if ! path_is_or_under "$HERMES_ROOT_PROFILES_REAL" "$_profile_dir_real" \
+            && ! identity_overlap "$_profile_dir_real" "$HERMES_ROOT_PROFILES_REAL"; then
+        echo "$name's profile directory ($profile_dir) resolves outside \$HERMES_ROOT/profiles; refusing to touch its mnemosyne/." >&2
+        exit 1
+    fi
+
     # The plugin link above shares Mnemosyne's *code*. It does not share its
-    # *data*: the database path resolves from a MNEMOSYNE_HOME the Mnemosyne
-    # plugin itself computes at runtime, which defaults to
-    # $HERMES_HOME/mnemosyne — and a named profile has redirected
+    # *data*: the database path resolves from MNEMOSYNE_DATA_DIR if set,
+    # else $HERMES_HOME/mnemosyne/data (mnemosyne/cli.py:20-23,
+    # mnemosyne/core/beam.py:358-366) -- and a named profile has redirected
     # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
     # dedicated bank, unless --separate-memory asked for isolation. The
     # operator's own bank ($HERMES_ROOT/mnemosyne) is never a candidate here.
     if [[ -n $SHARED_DATA ]]; then
         if (( DRY_RUN )); then
-            say "  would link: $profile_dir/mnemosyne -> $TEAM_MEMORY_HOME"
+            if [[ -d "$profile_dir/mnemosyne" && ! -L "$profile_dir/mnemosyne" ]] && (( existed )); then
+                if (( ADOPT_TEAM_MEMORY )); then
+                    backup_dir="$profile_dir/mnemosyne.pre-team-memory-$ADOPT_TS"
+                    if [[ -e "$backup_dir" || -L "$backup_dir" ]]; then
+                        _bk_n=1
+                        while [[ -e "$backup_dir.$_bk_n" || -L "$backup_dir.$_bk_n" ]]; do _bk_n=$((_bk_n + 1)); done
+                        backup_dir="$backup_dir.$_bk_n"
+                    fi
+                    say "  would back up: $profile_dir/mnemosyne -> $backup_dir"
+                    say "  would link: $profile_dir/mnemosyne -> $TEAM_MEMORY_HOME"
+                    pin_mnemosyne_data_dir "$profile_dir" "$TEAM_MEMORY_HOME/data"
+                else
+                    say "  would leave: $profile_dir/mnemosyne (private, real directory;"
+                    say "               re-run with --adopt-team-memory to move it aside and share)"
+                    pin_mnemosyne_data_dir "$profile_dir" "$profile_dir/mnemosyne/data"
+                fi
+            else
+                say "  would link: $profile_dir/mnemosyne -> $TEAM_MEMORY_HOME"
+                pin_mnemosyne_data_dir "$profile_dir" "$TEAM_MEMORY_HOME/data"
+            fi
         elif [[ -L "$profile_dir/mnemosyne" ]]; then
             # Re-run, already a link. If an older installer pointed it at
             # the operator's own bank -- $HERMES_ROOT/mnemosyne or
@@ -895,12 +1021,38 @@ for i in "${!NAMES[@]}"; do
                 say "        but this profile loses access to memories only there."
             fi
             run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
+            pin_mnemosyne_data_dir "$profile_dir" "$TEAM_MEMORY_HOME/data"
         elif [[ -d "$profile_dir/mnemosyne" ]] && (( existed )); then
+            # D2: canonicalise BEFORE the mv below and refuse if it would
+            # move the operator's own bank, or if it already IS the team
+            # bank (nothing to move).
+            _profile_mnemo_real="$(resolve_abs_nearest "$profile_dir/mnemosyne")" || {
+                echo "Cannot resolve $name's mnemosyne/: $profile_dir/mnemosyne" >&2
+                exit 1
+            }
+            if touches_operator_bank "$_profile_mnemo_real"; then
+                echo "$name's mnemosyne/ ($profile_dir/mnemosyne) resolves to the operator's own bank; refusing to move, remove or relink it." >&2
+                exit 1
+            fi
+            if [[ "$_profile_mnemo_real" == "$_team_home_real" ]] || identity_overlap_either "$_profile_mnemo_real" "$_team_home_real"; then
+                echo "$name's mnemosyne/ ($profile_dir/mnemosyne) already resolves to the team bank; refusing to move it." >&2
+                exit 1
+            fi
             if (( ADOPT_TEAM_MEMORY )); then
                 # Opt-in: back up the real private directory (never delete
                 # it), then link to the team bank. Merging its contents
                 # into the team bank is out of scope for this installer.
                 backup_dir="$profile_dir/mnemosyne.pre-team-memory-$ADOPT_TS"
+                # D3: an existing backup path (a directory or a link) must
+                # never be merged into -- `mv` would land the private bank
+                # INSIDE it, and if it is a link to the operator's bank
+                # this installer would write into that bank. Pick a new
+                # unique suffix instead.
+                if [[ -e "$backup_dir" || -L "$backup_dir" ]]; then
+                    _bk_n=1
+                    while [[ -e "$backup_dir.$_bk_n" || -L "$backup_dir.$_bk_n" ]]; do _bk_n=$((_bk_n + 1)); done
+                    backup_dir="$backup_dir.$_bk_n"
+                fi
                 run mv -- "$profile_dir/mnemosyne" "$backup_dir"
                 run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
                 say "  ADOPTED: $name's private mnemosyne/ moved to $backup_dir"
@@ -908,6 +1060,7 @@ for i in "${!NAMES[@]}"; do
                 say "           Merging its old memories into the team bank is out"
                 say "           of scope for this installer."
                 adopted="$adopted $name"
+                pin_mnemosyne_data_dir "$profile_dir" "$TEAM_MEMORY_HOME/data"
             else
                 # A real directory on a profile that existed before this run
                 # means it has accumulated its own memories. Moving them is not
@@ -919,6 +1072,7 @@ for i in "${!NAMES[@]}"; do
                 say "        aside (as a backup) and link to the team bank, or"
                 say "        remove/merge it yourself, then re-run."
                 unshared="$unshared $name"
+                pin_mnemosyne_data_dir "$profile_dir" "$profile_dir/mnemosyne/data"
             fi
         else
             # Nothing there yet, or — the case this fixes — the real
@@ -926,14 +1080,23 @@ for i in "${!NAMES[@]}"; do
             # in this very run. It holds no memories of this profile's own,
             # so it is replaced by the link to the team bank.
             if [[ -d "$profile_dir/mnemosyne" ]]; then
-                if [[ "$(cd "$profile_dir/mnemosyne" && pwd -P)" == "$(cd "$TEAM_MEMORY_HOME" && pwd -P)" ]]; then
-                    echo "$profile_dir/mnemosyne is the team bank itself; refusing to remove it." >&2
+                # D2: canonicalise BEFORE this rm -rf too.
+                _profile_mnemo_real="$(resolve_abs_nearest "$profile_dir/mnemosyne")" || {
+                    echo "Cannot resolve $name's mnemosyne/: $profile_dir/mnemosyne" >&2
+                    exit 1
+                }
+                if touches_operator_bank "$_profile_mnemo_real" || [[ "$_profile_mnemo_real" == "$_team_home_real" ]] \
+                        || identity_overlap_either "$_profile_mnemo_real" "$_team_home_real"; then
+                    echo "$profile_dir/mnemosyne resolves to the operator's own bank or the team bank; refusing to remove it." >&2
                     exit 1
                 fi
                 rm -rf -- "$profile_dir/mnemosyne"
             fi
             run ln -sfn "$TEAM_MEMORY_HOME" "$profile_dir/mnemosyne"
+            pin_mnemosyne_data_dir "$profile_dir" "$TEAM_MEMORY_HOME/data"
         fi
+    else
+        pin_mnemosyne_data_dir "$profile_dir" "$profile_dir/mnemosyne/data"
     fi
 
     # Team state (forge project records, team clones): same gap as
