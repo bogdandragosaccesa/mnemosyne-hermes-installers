@@ -739,7 +739,9 @@ unset _preflight_role _preflight_name _preflight_profile_dir _team_home_subject 
 #   * Hermes env_loader post-processing at hermes-agent bf0203a
 #     (hermes_cli/env_loader.py:295-499: sanitiser rewrite, ${} expansion,
 #     credential strip; hermes_cli/config.py:2556-2566);
-#   * Mnemosyne 4.0.0b6 mnemosyne/mcp_server.py:_load_dotenv :793-842
+#   * Mnemosyne 4.0.0b6 (as named by the PR #9 review; verified against
+#     the installed dist-info mnemosyne_memory-4.0.0, __version__ "4.0.0")
+#     mnemosyne/mcp_server.py:_load_dotenv :793-842
 #     (`splitlines()`, `v.strip().strip("'\"")`, :823-834).
 # The guarantee is therefore only as good as those transcriptions:
 # dev-team/scripts/tests/test_env_pin_check.py diffs them against the real

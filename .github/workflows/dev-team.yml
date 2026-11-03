@@ -33,6 +33,16 @@ jobs:
       - name: deciders unit tests
         run: python3 -m unittest discover -s dev-team/deciders/tests
 
+      - name: scripts unit tests (stdlib-only venv)
+        # The checker's own suite (env_pin_check.py, kanban-budget.py) must
+        # pass with the standard library alone: no python-dotenv, no pwsh,
+        # no Mnemosyne venv. Any test that needs one of those skips cleanly
+        # with a reason instead of failing. python3 -I additionally ignores
+        # user site-packages and PYTHON* env vars.
+        run: |
+          python3 -m venv --without-pip /tmp/dev-team-scripts-stdlib-venv
+          /tmp/dev-team-scripts-stdlib-venv/bin/python3 -I -m unittest discover -s dev-team/scripts/tests -v
+
   install-linux:
     runs-on: ubuntu-latest
     steps:

@@ -421,8 +421,9 @@ def hermes_read(content, rewrite_newline):
 
 # =============================================================================
 # Mnemosyne reader.
-# TRANSCRIPTION of mnemosyne 4.0.0b6 mnemosyne/mcp_server.py:793-842
-#   _load_dotenv, line handling :820-841.
+# TRANSCRIPTION of mnemosyne 4.0.0b6 (as named by the PR #9 review; verified
+# against the installed dist-info mnemosyne_memory-4.0.0, __version__ "4.0.0")
+#   mnemosyne/mcp_server.py:793-842, _load_dotenv, line handling :820-841.
 # =============================================================================
 def mnemosyne_read(content):
     """Returns the {key: value} the reader puts in os.environ (keys not
