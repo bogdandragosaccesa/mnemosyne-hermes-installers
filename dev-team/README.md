@@ -154,13 +154,18 @@ PowerShell 5.1 that cmdlet follows the junction and deletes the shared bank's co
 
 Each repository gets its own board and its own forge project record — the hard isolation
 boundary workers cannot see past. `pm`'s `running-the-pipeline` skill sequences a `devops`
-onboarding card *before* the first `implement` card ever runs, so the team's own clone, the
-project record, and the board's `default_workdir` exist first:
+onboarding card *before* the first `implement` card ever runs, so the team's own clone and the
+project record exist first. The pm sets the board's `default_workdir` at creation time —
+deterministic, pointing at the clone path devops will create — so onboarding never has a
+step that sets or changes it:
 
 ```bash
-hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline"
-hermes kanban boards switch <repo-slug>
+hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir ~/.hermes/dev-team/repos/<repo-slug>
 ```
+
+Every later `hermes kanban` command that targets this board must name it explicitly with
+`--board <repo-slug>`. Nothing in the team runs `hermes kanban boards switch` — it mutates the
+machine-wide current board, shared across every repository and the operator's own session.
 
 Then devops runs `forge detect`, pointed at the team's own clone — never the operator's own
 checkout:
@@ -177,7 +182,9 @@ clone's `git remote get-url origin` (credentials in the URL stripped), and `defa
 from `git symbolic-ref refs/remotes/origin/HEAD` (run `git remote set-head origin --auto` first
 if that ref is missing). Never hand-edit the record. `detect` refuses to overwrite an existing
 record unless the operator passes `--force`. Exit 2 with `"ambiguous: pass --pr-adapter"`
-means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly.
+means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly. If the board's
+`default_workdir` is missing or doesn't match this clone, devops blocks with a clear reason
+instead of changing the board.
 
 **The terminal guard is a seatbelt against mistakes, not a security boundary.** It reads
 shell commands as text — tokenised, not matched by substring, so it catches shell nesting,

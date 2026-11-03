@@ -39,9 +39,14 @@ intake card recorded — see `dev-team-stage-intake`). If it does not:
    repository moved, or its default branch changed), block with `forge: record-stale` and let
    the operator decide whether to re-run with `--force`. A slug containing `/`, `\`, or equal
    to `.` or `..` is refused. Credentials never go in the record.
-5. Set the board's `default_workdir` to that team-owned clone
-   (`hermes kanban boards set-default-workdir`), so every later card on this board works there
-   instead of in the operator's checkout.
+5. Check the board's `default_workdir` (`hermes kanban boards list --json`, find the entry
+   whose `slug` is `<repo-slug>`, read its `default_workdir` field) against the clone path
+   above. The pm sets `default_workdir` at board-creation time (`running-the-pipeline`'s
+   `--default-workdir`) — this step never sets or changes it. If it is missing or points
+   somewhere other than this team-owned clone, block with a clear reason (e.g. `onboarding:
+   default_workdir missing/mismatched — expected $HERMES_HOME/dev-team/repos/<repo-slug>/`)
+   and let the operator fix the board; never mutate it yourself, and never fall back to the
+   operator's own checkout.
 
 This record is what the guard itself reads later (`_record_default_branch`) to know which
 branch `git push` must never target on this project, and what `forge ci-status` resolves
