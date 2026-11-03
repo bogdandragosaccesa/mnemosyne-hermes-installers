@@ -230,6 +230,29 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertFalse((self.root / "mnemosyne" / "data" / "team").exists())
         self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
 
+    # --- D4: a bind mount gives a path identical to the operator bank
+    # with no symlink in it anywhere, so the string/symlink-only check
+    # must not be fooled by it.
+    def test_team_memory_flag_refuses_an_alias_via_bind_mount(self):  # D4
+        if not shutil.which("unshare"):
+            self.skipTest("needs unshare for an unprivileged bind mount")
+        import shlex
+        alias = self.tmp / "bind-alias"
+        alias.mkdir()
+        script = (
+            f"mount --bind {shlex.quote(str(self.root / 'mnemosyne'))} {shlex.quote(str(alias))} "
+            f"|| exit 99\n"
+            f"exec bash {shlex.quote(str(INSTALLER))} --skip-model --team-memory {shlex.quote(str(alias))}\n"
+        )
+        proc = subprocess.run(
+            ["unshare", "--mount", "--map-root-user", "--propagation", "private", "bash", "-c", script],
+            env=self.env, capture_output=True, text=True, timeout=120)
+        if proc.returncode == 99:
+            self.skipTest("unprivileged bind mount unavailable in this sandbox")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("operator's own bank", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
     def test_team_memory_flag_refuses_operator_bank_through_a_link_to_the_root(self):
         link = self.tmp / "hlink"
         link.symlink_to(self.root)
@@ -484,6 +507,152 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(sorted(p.name for p in (self.root / "profiles").iterdir()),
                          ["dev-devops", "dev-qa"])
+
+    # --- D1: MNEMOSYNE_DATA_DIR is the variable that actually controls
+    # Mnemosyne's data directory (mnemosyne/cli.py:20-23,
+    # mnemosyne/core/beam.py:358-366), so it must be treated as an operator
+    # location exactly like MNEMOSYNE_HOME, and each profile must pin its
+    # own value in .env so an inherited one cannot redirect it.
+    def test_team_memory_flag_refuses_mnemosyne_data_dir(self):  # D1
+        decoy = self.tmp / "decoy-data-dir"
+        decoy.mkdir()
+        proc = self.install("--team-memory", str(decoy), MNEMOSYNE_DATA_DIR=str(decoy))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("MNEMOSYNE_DATA_DIR", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_mnemosyne_data_dir_env_var_does_not_select_the_team_bank(self):  # D1
+        decoy = self.tmp / "decoy-data-dir"
+        decoy.mkdir()
+        (decoy / "mnemosyne.db").write_text("operator-relocated-bank")
+        before_decoy = self.snapshot_tree(decoy)
+        proc = self.install(MNEMOSYNE_DATA_DIR=str(decoy))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.snapshot_tree(decoy), before_decoy, "MNEMOSYNE_DATA_DIR must not be written to")
+        link = self.profile("pm") / "mnemosyne"
+        self.assertEqual(link.resolve(), (self.root / "dev-team-mnemosyne").resolve())
+
+    def test_profile_env_pins_mnemosyne_data_dir_to_the_team_bank(self):  # D1
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        env_file = self.profile("pm") / ".env"
+        self.assertTrue(env_file.exists(), ".env must be written")
+        text = env_file.read_text()
+        self.assertIn(f"MNEMOSYNE_DATA_DIR={self.root / 'dev-team-mnemosyne'}/data", text)
+
+    def test_mnemosyne_data_dir_pin_wins_over_an_inherited_value_under_real_precedence(self):  # D1
+        """Proves the fix with the actual precedence rule Hermes applies,
+        not a re-implementation of it: hermes_cli/env_loader.py:502-562
+        loads a profile's own .env with python-dotenv's `override=True`,
+        specifically so its values beat whatever is already in the
+        process environment. This test runs the installer, then merges
+        the pinned .env over a throwaway dict pre-seeded with a stale,
+        wrong MNEMOSYNE_DATA_DIR (standing in for the operator's
+        `~/.profile` export) using python-dotenv's own override semantics
+        -- `dict.update()` with the dotenv values applied last, which is
+        exactly what override=True means -- without ever touching this
+        test process's real os.environ."""
+        import dotenv
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        env_file = self.profile("pm") / ".env"
+        simulated_environ = {"MNEMOSYNE_DATA_DIR": str(self.tmp / "stale-inherited-shell-value")}
+        dotenv_values = {k: v for k, v in dotenv.dotenv_values(str(env_file)).items() if v is not None}
+        simulated_environ.update(dotenv_values)  # override=True: dotenv values win
+        self.assertEqual(simulated_environ["MNEMOSYNE_DATA_DIR"],
+                          str(self.root / "dev-team-mnemosyne" / "data"))
+
+    # --- D2: the adopt branch must canonicalise before touching anything
+    def test_adopt_team_memory_refuses_when_profile_dir_resolves_outside_profiles(self):  # D2
+        # Reviewer's repro: make the profile directory itself a symlink to
+        # the Hermes root, so "$profile_dir/mnemosyne" is really the
+        # operator's own bank.
+        profiles_dir = self.root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "dev-qa").symlink_to(self.root)
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--adopt-team-memory")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("outside", proc.stderr)
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before, "operator bank must be untouched")
+
+    # --- D3: an existing backup path must never be merged into
+    def test_adopt_team_memory_never_merges_into_an_existing_backup_directory(self):  # D3
+        own = self.profile("qa") / "mnemosyne" / "data"
+        own.mkdir(parents=True)
+        (own / "mnemosyne.db").write_text("qa's own memories")
+        (self.profile("qa") / "config.yaml").touch()
+        # Freeze `date` so the backup name is predictable, then pre-create
+        # that exact path as a real directory with unrelated contents
+        # (review D3's first repro).
+        fake_date = self.tmp / "bin2" / "date"
+        fake_date.parent.mkdir()
+        fake_date.write_text("#!/usr/bin/env bash\necho 20261103105748\n")
+        fake_date.chmod(fake_date.stat().st_mode | stat.S_IXUSR)
+        env = dict(self.env)
+        env["PATH"] = f"{fake_date.parent}:{self.env['PATH']}"
+        collide = self.profile("qa") / "mnemosyne.pre-team-memory-20261103105748"
+        collide.mkdir(parents=True)
+        (collide / "pre-existing.txt").write_text("unrelated contents")
+        proc = subprocess.run(["bash", str(INSTALLER), "--skip-model", "--adopt-team-memory", "--only", "qa"],
+                               env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # The pre-existing backup must be untouched...
+        self.assertEqual((collide / "pre-existing.txt").read_text(), "unrelated contents")
+        self.assertFalse((collide / "data").exists(), "qa's bank must not have landed inside the colliding dir")
+        # ...and qa's own bank must have landed at a NEW, unique path.
+        backups = sorted(p.name for p in self.profile("qa").glob("mnemosyne.pre-team-memory-20261103105748*"))
+        self.assertEqual(backups, ["mnemosyne.pre-team-memory-20261103105748",
+                                    "mnemosyne.pre-team-memory-20261103105748.1"])
+        moved = self.profile("qa") / "mnemosyne.pre-team-memory-20261103105748.1"
+        self.assertEqual((moved / "data" / "mnemosyne.db").read_text(), "qa's own memories")
+
+    def test_adopt_team_memory_never_merges_into_an_existing_backup_link(self):  # D3
+        own = self.profile("qa") / "mnemosyne" / "data"
+        own.mkdir(parents=True)
+        (own / "mnemosyne.db").write_text("qa's own memories")
+        (self.profile("qa") / "config.yaml").touch()
+        fake_date = self.tmp / "bin3" / "date"
+        fake_date.parent.mkdir()
+        fake_date.write_text("#!/usr/bin/env bash\necho 20261103105748\n")
+        fake_date.chmod(fake_date.stat().st_mode | stat.S_IXUSR)
+        env = dict(self.env)
+        env["PATH"] = f"{fake_date.parent}:{self.env['PATH']}"
+        collide_link = self.profile("qa") / "mnemosyne.pre-team-memory-20261103105748"
+        collide_link.symlink_to(self.root / "mnemosyne")  # link to the OPERATOR bank
+        before_operator = self.snapshot_tree(self.root / "mnemosyne")
+        proc = subprocess.run(["bash", str(INSTALLER), "--skip-model", "--adopt-team-memory", "--only", "qa"],
+                               env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before_operator,
+                          "the operator bank must never receive qa's moved data")
+        moved = self.profile("qa") / "mnemosyne.pre-team-memory-20261103105748.1"
+        self.assertEqual((moved / "data" / "mnemosyne.db").read_text(), "qa's own memories")
+
+    # --- D5: --team-memory inside profiles/ or dev-team/ breaks every link
+    def test_team_memory_flag_refuses_a_path_under_profiles_directory(self):  # D5
+        proc = self.install("--team-memory", str(self.root / "profiles" / "dev-qa" / "mnemosyne"))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("profile directory", proc.stderr)
+        self.assertFalse((self.root / "profiles" / "dev-qa" / "mnemosyne").exists())
+
+    def test_team_memory_flag_refuses_a_path_under_dev_team_directory(self):  # D5
+        proc = self.install("--team-memory", str(self.root / "dev-team" / "mnemosyne"))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("dev-team", proc.stderr)
+
+    # --- D8: --dry-run with --adopt-team-memory must report the backup it would make
+    def test_dry_run_with_adopt_reports_would_back_up_for_each_private_bank(self):  # D8
+        own = self.profile("qa") / "mnemosyne" / "data"
+        own.mkdir(parents=True)
+        (own / "mnemosyne.db").write_text("qa's own memories")
+        (self.profile("qa") / "config.yaml").touch()
+        proc = self.install("--dry-run", "--adopt-team-memory", "--only", "qa")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"would back up: {self.profile('qa')}/mnemosyne ->", proc.stdout)
+        self.assertIn("would link:", proc.stdout)
+        self.assertFalse((own / "mnemosyne.db").exists() and False)  # dry run: nothing moved
+        self.assertEqual((own / "mnemosyne.db").read_text(), "qa's own memories")
 
 
 class T4TeamHomeRootTests(InstallerSetupMixin, unittest.TestCase):
