@@ -552,12 +552,24 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         -- `dict.update()` with the dotenv values applied last, which is
         exactly what override=True means -- without ever touching this
         test process's real os.environ."""
-        import dotenv
         proc = self.install()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         env_file = self.profile("pm") / ".env"
         simulated_environ = {"MNEMOSYNE_DATA_DIR": str(self.tmp / "stale-inherited-shell-value")}
-        dotenv_values = {k: v for k, v in dotenv.dotenv_values(str(env_file)).items() if v is not None}
+        # Stdlib only (the suites must run with no third-party packages, as
+        # CI does): the installer writes plain KEY=VALUE lines, optionally
+        # quoted, which is all this reader needs to understand.
+        dotenv_values = {}
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip().removeprefix("export ").strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            dotenv_values[key] = value
         simulated_environ.update(dotenv_values)  # override=True: dotenv values win
         self.assertEqual(simulated_environ["MNEMOSYNE_DATA_DIR"],
                           str(self.root / "dev-team-mnemosyne" / "data"))
