@@ -515,9 +515,11 @@ fi
 # core/media.py); it does NOT steer the MCP shared-surface DB or
 # federation, which both read MNEMOSYNE_HOME directly
 # (mnemosyne/mcp_tools.py:167-173, core/fleet_census.py:149-155,
-# core/federation_handshake.py:263-267, mcp_server.py:799). An inherited
-# MNEMOSYNE_HOME therefore still leaked the operator's shared-surface DB
-# path into a dev-team profile even after MNEMOSYNE_DATA_DIR was pinned.
+# core/federation_handshake.py:262-267; mcp_server.py:811 also reads
+# MNEMOSYNE_HOME, but only to locate a .env file to auto-load, not to
+# build a DB path). An inherited MNEMOSYNE_HOME therefore still leaked the
+# operator's shared-surface DB path into a dev-team profile even after
+# MNEMOSYNE_DATA_DIR was pinned.
 # D1: pin this profile's own Mnemosyne data directory into its own .env so
 # an inherited MNEMOSYNE_DATA_DIR from the launching shell or gateway
 # cannot redirect it away from the bank this installer just linked.
@@ -528,11 +530,11 @@ fi
 # MNEMOSYNE_DATA_DIR before $HERMES_HOME/mnemosyne/data (the path this
 # installer's symlink otherwise relies on). Together these mean a
 # profile-level .env entry is the one thing Hermes applies with priority
-# over an inherited shell/gateway environment variable, so pinning it here
-# closes the gap the operator saw live with MNEMOSYNE_HOME (same class of
-# bug, actually caused by MNEMOSYNE_DATA_DIR per the operator's own
-# correction, and -- per F1 above -- by MNEMOSYNE_HOME too, for the
-# shared-surface DB) without having to refuse the install outright.
+# over an inherited shell/gateway environment variable, so pinning both
+# vars here closes the gap the operator saw live: MNEMOSYNE_DATA_DIR
+# leaking the CLI/core data root, and -- per F1 above -- MNEMOSYNE_HOME
+# leaking the shared-surface DB -- without having to refuse the install
+# outright.
 #
 # F4 (review r2 nit): a bank path can legitimately contain sed-special
 # bytes (`&` means "the whole match" in a sed replacement; `|` collides
@@ -540,13 +542,29 @@ fi
 # sed *pattern* silently corrupts the written value or makes sed error
 # out. Rewrite a single VAR=value line with plain bash string comparison
 # instead, so sed never sees the path at all.
+#
+# Item 4a (review r3): python-dotenv's unquoted-value grammar truncates at
+# ` #` (dotenv/parser.py: _unquoted_value then strips `\s+#.*`), so an
+# unquoted bank path containing " #" silently loses everything from the
+# `#` onward on the next load. Every pinned value is therefore written
+# single-quoted, using exactly python-dotenv's single-quote escapes:
+# `\` -> `\\`, `'` -> `\'` (dotenv/parser.py:25,32 -- _single_quoted_value
+# and _single_quote_escapes; nothing else is special inside single
+# quotes). This is the one format decided for both platforms; do not
+# change it without re-checking the round-trip in the completion metadata.
+quote_env_value() {  # value -> KEY='value' with python-dotenv's escapes
+    local v=$1
+    v=${v//\\/\\\\}
+    v=${v//\'/\\\'}
+    printf "'%s'" "$v"
+}
 set_env_var() {  # env_file var_name value
     local env_file="$1" var_name="$2" value="$3" line found=0 tmp
     local -a out_lines=()
     if [[ -f $env_file ]]; then
         while IFS= read -r line || [[ -n $line ]]; do
             if [[ $line == "$var_name="* ]]; then
-                out_lines+=("$var_name=$value")
+                out_lines+=("$var_name=$(quote_env_value "$value")")
                 found=1
             else
                 out_lines+=("$line")
@@ -554,7 +572,7 @@ set_env_var() {  # env_file var_name value
         done < "$env_file"
     fi
     if (( ! found )); then
-        out_lines+=("$var_name=$value")
+        out_lines+=("$var_name=$(quote_env_value "$value")")
     fi
     tmp="$(mktemp "${env_file}.XXXXXX")"
     printf '%s\n' "${out_lines[@]}" > "$tmp"
@@ -970,9 +988,22 @@ for i in "${!NAMES[@]}"; do
         echo "Cannot resolve $name's profile directory: $profile_dir" >&2
         exit 1
     }
+    # F2 (review r3, item 4b): a profile dir that resolves to EXACTLY
+    # $HERMES_ROOT/profiles (not merely nested under it) must also be
+    # refused -- path_is_or_under() and identity_overlap() both treat
+    # "is" and "is under" as the same acceptable case, but profiles/
+    # itself is never a valid profile directory: writing SOUL.md, the
+    # prefix file or the plugin link there would land on the shared
+    # profiles/ tree, not on a single profile.
+    if [[ "$_profile_dir_real" == "$HERMES_ROOT_PROFILES_REAL" ]] \
+            || { [[ -e "$HERMES_ROOT_PROFILES_REAL" ]] \
+                 && [[ "$_profile_dir_real" -ef "$HERMES_ROOT_PROFILES_REAL" ]]; }; then
+        echo "$name's profile directory ($profile_dir) resolves to \$HERMES_ROOT/profiles itself; refusing to touch its profile." >&2
+        exit 1
+    fi
     if ! path_is_or_under "$HERMES_ROOT_PROFILES_REAL" "$_profile_dir_real" \
             && ! identity_overlap "$_profile_dir_real" "$HERMES_ROOT_PROFILES_REAL"; then
-        echo "$name's profile directory ($profile_dir) resolves outside \$HERMES_ROOT/profiles; refusing to touch its mnemosyne/." >&2
+        echo "$name's profile directory ($profile_dir) resolves outside \$HERMES_ROOT/profiles; refusing to touch its profile." >&2
         exit 1
     fi
 
@@ -1028,6 +1059,19 @@ for i in "${!NAMES[@]}"; do
     # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
     # dedicated bank, unless --separate-memory asked for isolation. The
     # operator's own bank ($HERMES_ROOT/mnemosyne) is never a candidate here.
+    #
+    # Why pinning MNEMOSYNE_DATA_DIR/MNEMOSYNE_HOME into the profile's own
+    # .env (above) is enough to beat an inherited shell/gateway value, and
+    # when it is NOT: hermes_cli/env_loader.py:560 loads that .env with
+    # override=True, so a directly-launched, non-routed profile always
+    # wins over its inherited environment. But while a routed profile-home
+    # override is active (a multiplex gateway turn, or a routed cron fire
+    # in the desktop backend), env_loader.py:535-547 skips that .env load
+    # entirely to avoid leaking one profile's credentials to another; and a
+    # managed worker never reaches load_hermes_dotenv's .env read at all --
+    # it returns before opening any file once worker_config_snapshot() is
+    # bound (env_loader.py:513-515), because the worker inherits its
+    # owner process's already-resolved environment instead.
     if [[ -n $SHARED_DATA ]]; then
         if (( DRY_RUN )); then
             if [[ -d "$profile_dir/mnemosyne" && ! -L "$profile_dir/mnemosyne" ]] && (( existed )); then

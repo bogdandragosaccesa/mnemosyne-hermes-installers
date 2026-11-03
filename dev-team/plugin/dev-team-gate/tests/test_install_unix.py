@@ -33,6 +33,13 @@ DEV_TEAM = Path(__file__).resolve().parents[3]
 INSTALLER = DEV_TEAM / "install-dev-team-unix.sh"
 ROLES = ("pm", "architect", "uiux", "backend-db", "frontend", "qa", "reviewer", "devops")
 
+
+def _quote_env(value):
+    """Mirror install-dev-team-unix.sh's quote_env_value(): python-dotenv's
+    single-quote escapes (\\ -> \\\\, ' -> \\'), wrapped in single quotes.
+    Item 4a (review r3)."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
 # A stand-in for the parts of the hermes CLI the installer calls. A fresh
 # `profile create --clone` makes a real mnemosyne/ directory, as Hermes does.
 # `plugins list --enabled` lags LAG calls behind `plugins enable`, like the
@@ -416,9 +423,9 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
             with self.subTest(role=role):
                 lines = (self.profile(role) / ".env").read_text().splitlines()
                 self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")],
-                                 [f"MNEMOSYNE_DATA_DIR={own / 'data'}"])
+                                 [f"MNEMOSYNE_DATA_DIR={_quote_env(str(own / 'data'))}"])
                 self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_HOME=")],
-                                 [f"MNEMOSYNE_HOME={own}"])
+                                 [f"MNEMOSYNE_HOME={_quote_env(str(own))}"])
 
     def test_team_bank_path_with_ampersand_and_pipe_is_pinned_literally(self):  # R3-2 / F4
         """F4: the .env rewrite used to be `sed` with the path in the
@@ -435,11 +442,59 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
             lines = (self.profile("qa") / ".env").read_text().splitlines()
             with self.subTest(run=run):
                 self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")],
-                                 [f"MNEMOSYNE_DATA_DIR={bank / 'data'}"])
+                                 [f"MNEMOSYNE_DATA_DIR={_quote_env(str(bank / 'data'))}"])
                 self.assertEqual([l for l in lines if l.startswith("MNEMOSYNE_HOME=")],
-                                 [f"MNEMOSYNE_HOME={bank}"])
+                                 [f"MNEMOSYNE_HOME={_quote_env(str(bank))}"])
                 self.assertIn("FOO=bar", lines)
                 self.assertIn("LAST=no-newline", lines)
+
+    def test_team_bank_path_with_hash_is_quoted_and_round_trips(self):  # item 4a (review r3)
+        """python-dotenv truncates an UNQUOTED value at ' #' (its
+        _unquoted_value then strips r'\\s+#.*'), so a bank path containing
+        ' #' used to come back silently shortened on the next load. The
+        installer now writes every pin single-quoted with python-dotenv's
+        own single-quote escapes (dotenv/parser.py:25,32): '\\\\' -> '\\\\\\\\',
+        "'" -> "\\\\'". Decoded here two ways: a stdlib-only reimplementation
+        of that exact rule (meaningful even in a dotenv-less venv), and, if
+        importable, the real python-dotenv parser."""
+        bank = self.tmp / "team # tricky bank"
+        proc = self.install("--team-memory", str(bank), "--only", "qa")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = (self.profile("qa") / ".env").read_text().splitlines()
+        data_lines = [l for l in lines if l.startswith("MNEMOSYNE_DATA_DIR=")]
+        home_lines = [l for l in lines if l.startswith("MNEMOSYNE_HOME=")]
+        self.assertEqual(len(data_lines), 1)
+        self.assertEqual(len(home_lines), 1)
+        expected_data = str(bank / "data")
+        expected_home = str(bank)
+        # The raw on-disk line must actually be quoted (this is the RED
+        # case against the unfixed installer: an unquoted line here means
+        # python-dotenv would truncate expected_data/_home at ' #').
+        self.assertTrue(data_lines[0][len("MNEMOSYNE_DATA_DIR="):].startswith("'"),
+                         f"pin not quoted: {data_lines[0]!r}")
+
+        def stdlib_single_quote_decode(raw_value):
+            """Reimplements dotenv/parser.py's _single_quoted_value +
+            _single_quote_escapes using only stdlib re/codecs -- no
+            python-dotenv import required."""
+            import re
+            assert raw_value[0] == "'" and raw_value[-1] == "'", raw_value
+            inner = raw_value[1:-1]
+            return re.sub(r"\\[\\']", lambda m: m.group(0)[1], inner)
+
+        self.assertEqual(stdlib_single_quote_decode(data_lines[0][len("MNEMOSYNE_DATA_DIR="):]),
+                          expected_data)
+        self.assertEqual(stdlib_single_quote_decode(home_lines[0][len("MNEMOSYNE_HOME="):]),
+                          expected_home)
+
+        try:
+            from dotenv import dotenv_values  # noqa: PLC0415
+        except ImportError:
+            self.skipTest("python-dotenv not importable here; stdlib-only decode above already passed")
+            return
+        values = dotenv_values(str(self.profile("qa") / ".env"))
+        self.assertEqual(values.get("MNEMOSYNE_DATA_DIR"), expected_data)
+        self.assertEqual(values.get("MNEMOSYNE_HOME"), expected_home)
 
     def test_first_run_exits_0_when_the_plugin_list_lags(self):  # item 11
         proc = self.install(FAKE_PLUGIN_LIST_LAG="2")
@@ -596,20 +651,22 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         env_file = self.profile("pm") / ".env"
         self.assertTrue(env_file.exists(), ".env must be written")
         text = env_file.read_text()
-        self.assertIn(f"MNEMOSYNE_DATA_DIR={self.root / 'dev-team-mnemosyne'}/data", text)
+        self.assertIn(f"MNEMOSYNE_DATA_DIR={_quote_env(str(self.root / 'dev-team-mnemosyne' / 'data'))}", text)
 
     def test_profile_env_pins_mnemosyne_home_to_the_team_bank(self):  # F1 (review r3)
         """mnemosyne/mcp_tools.py:167-173 (shared-surface DB), plus
-        core/fleet_census.py, core/federation_handshake.py and
-        mcp_server.py, all read MNEMOSYNE_HOME directly -- not
-        MNEMOSYNE_DATA_DIR. Pinning only the latter (the original D1 fix)
-        left MNEMOSYNE_HOME free to leak the operator's shared-surface DB
-        path into a dev-team profile."""
+        core/fleet_census.py and core/federation_handshake.py, read
+        MNEMOSYNE_HOME directly to build a DB path -- not MNEMOSYNE_DATA_DIR.
+        (mcp_server.py also reads MNEMOSYNE_HOME, but only to locate a .env
+        file to auto-load for the standalone MCP server binary, not to build
+        a DB path -- see README item 2 / review r3.) Pinning only
+        MNEMOSYNE_DATA_DIR (the original D1 fix) left MNEMOSYNE_HOME free to
+        leak the operator's shared-surface DB path into a dev-team profile."""
         proc = self.install()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         env_file = self.profile("pm") / ".env"
         text = env_file.read_text()
-        self.assertIn(f"MNEMOSYNE_HOME={self.root / 'dev-team-mnemosyne'}", text)
+        self.assertIn(f"MNEMOSYNE_HOME={_quote_env(str(self.root / 'dev-team-mnemosyne'))}", text)
         # The team bank's /data suffix must not bleed into MNEMOSYNE_HOME.
         self.assertNotIn(f"MNEMOSYNE_HOME={self.root / 'dev-team-mnemosyne'}/data", text)
 
@@ -667,7 +724,15 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
             self.skipTest(f"real Hermes install not found at {hermes_agent_dir}; "
                            "cannot load the real env loader here")
         import sys
-        sys.path.insert(0, str(hermes_agent_dir))
+        path_entry = str(hermes_agent_dir)
+        pre_existing_modules = set(sys.modules)
+        sys.path.insert(0, path_entry)
+        self.addCleanup(lambda: path_entry in sys.path and sys.path.remove(path_entry))
+
+        def _unimport_newly_loaded_modules():
+            for name in set(sys.modules) - pre_existing_modules:
+                del sys.modules[name]
+        self.addCleanup(_unimport_newly_loaded_modules)
         try:
             import hermes_cli.env_loader as real_env_loader  # noqa: PLC0415
         except ImportError as exc:
@@ -722,6 +787,23 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
                           "operator plugins/ must be byte-identical")
         self.assertFalse((self.root / "dev-team-prefix").exists(),
                           "dev-team-prefix must not have been written to the operator root")
+
+    # --- F2 equality (review r3, item 4b): a profile dir that resolves to
+    # EXACTLY $HERMES_ROOT/profiles (not merely nested under it) must also
+    # be refused. path_is_or_under() treats "is" and "is under" the same,
+    # so profiles/ itself used to be accepted as a valid profile directory.
+    def test_profile_dir_equal_to_profiles_itself_is_refused(self):  # F2 equality
+        profiles_dir = self.root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "dev-qa").symlink_to(profiles_dir)
+        proc = self.install("--only", "qa")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse((profiles_dir / "SOUL.md").exists(),
+                          "SOUL.md must not be written into profiles/ itself")
+        self.assertFalse((profiles_dir / "dev-team-prefix").exists(),
+                          "dev-team-prefix must not be written into profiles/ itself")
+        self.assertFalse((profiles_dir / "plugins" / "mnemosyne").exists(),
+                          "the plugin link must not be created under profiles/ itself")
 
     # --- D2: the adopt branch must canonicalise before touching anything
     def test_adopt_team_memory_refuses_when_profile_dir_resolves_outside_profiles(self):  # D2

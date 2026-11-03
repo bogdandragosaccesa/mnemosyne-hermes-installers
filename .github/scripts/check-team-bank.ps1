@@ -100,6 +100,34 @@ function Test-IsDirLink([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     return [bool]($item -and (@('Junction', 'SymbolicLink') -contains [string]$item.LinkType))
 }
+function Unquote-EnvPin([string] $Value) {
+    # Item 4a (review r3): install-dev-team-unix.sh and
+    # install-dev-team-windows.ps1 now write every pin single-quoted with
+    # python-dotenv's single-quote escapes (dotenv/parser.py:25,32):
+    # '\' -> '\\', "'" -> "\'". Undo exactly that here, so this naive CI
+    # reader still sees the real path. A legacy unquoted value (no
+    # surrounding single quotes) passes through unchanged.
+    if ($Value.Length -ge 2 -and $Value.StartsWith("'") -and $Value.EndsWith("'")) {
+        $inner = $Value.Substring(1, $Value.Length - 2)
+        $sb = New-Object System.Text.StringBuilder
+        $i = 0
+        while ($i -lt $inner.Length) {
+            $ch = $inner[$i]
+            if ($ch -eq [char]92 -and ($i + 1) -lt $inner.Length) {
+                $nxt = $inner[$i + 1]
+                if ($nxt -eq "'" -or $nxt -eq [char]92) {
+                    [void]$sb.Append($nxt)
+                    $i += 2
+                    continue
+                }
+            }
+            [void]$sb.Append($ch)
+            $i += 1
+        }
+        return $sb.ToString()
+    }
+    return $Value
+}
 function Get-EnvPin([string] $Dir, [string] $Name) {
     $envFile = Join-Path $Dir '.env'
     if (-not (Test-Path -LiteralPath $envFile)) { return '' }
@@ -107,7 +135,7 @@ function Get-EnvPin([string] $Dir, [string] $Name) {
     foreach ($line in @(Get-Content -LiteralPath $envFile)) {
         if ($line.StartsWith("$Name=")) { $val = $line.Substring($Name.Length + 1) }
     }
-    return $val
+    return Unquote-EnvPin $val
 }
 
 # 1. The team bank is a directory of its own.
