@@ -555,22 +555,39 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         text = env_file.read_text()
         self.assertIn(f"MNEMOSYNE_DATA_DIR={self.root / 'dev-team-mnemosyne'}/data", text)
 
-    def test_mnemosyne_data_dir_pin_wins_over_an_inherited_value_under_real_precedence(self):  # D1
-        """Proves the fix with the actual precedence rule Hermes applies,
-        not a re-implementation of it: hermes_cli/env_loader.py:502-562
-        loads a profile's own .env with python-dotenv's `override=True`,
-        specifically so its values beat whatever is already in the
-        process environment. This test runs the installer, then merges
-        the pinned .env over a throwaway dict pre-seeded with a stale,
-        wrong MNEMOSYNE_DATA_DIR (standing in for the operator's
-        `~/.profile` export) using python-dotenv's own override semantics
-        -- `dict.update()` with the dotenv values applied last, which is
-        exactly what override=True means -- without ever touching this
-        test process's real os.environ."""
+    def test_profile_env_pins_mnemosyne_home_to_the_team_bank(self):  # F1 (review r3)
+        """mnemosyne/mcp_tools.py:167-173 (shared-surface DB), plus
+        core/fleet_census.py, core/federation_handshake.py and
+        mcp_server.py, all read MNEMOSYNE_HOME directly -- not
+        MNEMOSYNE_DATA_DIR. Pinning only the latter (the original D1 fix)
+        left MNEMOSYNE_HOME free to leak the operator's shared-surface DB
+        path into a dev-team profile."""
         proc = self.install()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         env_file = self.profile("pm") / ".env"
-        simulated_environ = {"MNEMOSYNE_DATA_DIR": str(self.tmp / "stale-inherited-shell-value")}
+        text = env_file.read_text()
+        self.assertIn(f"MNEMOSYNE_HOME={self.root / 'dev-team-mnemosyne'}", text)
+        # The team bank's /data suffix must not bleed into MNEMOSYNE_HOME.
+        self.assertNotIn(f"MNEMOSYNE_HOME={self.root / 'dev-team-mnemosyne'}/data", text)
+
+    def test_mnemosyne_data_dir_pin_wins_over_an_inherited_value_under_real_precedence(self):  # D1
+        """This is a stdlib-only, in-process MODEL of the precedence rule
+        Hermes applies (hermes_cli/env_loader.py:502-562 loads a profile's
+        own .env with python-dotenv's override=True, so its values beat
+        whatever is already in the process environment): it re-implements
+        that merge with `dict.update()` against a throwaway dict seeded
+        with a stale, wrong MNEMOSYNE_DATA_DIR (standing in for the
+        operator's `~/.profile` export), using the installer's actual
+        written .env content, without ever touching this test process's
+        real os.environ. It proves the .env line is correct and would win
+        under that rule; it does not invoke Hermes' own loader code --
+        see test_mnemosyne_pins_win_over_inherited_values_under_the_real_hermes_loader
+        below for that, where the real loader is reachable."""
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        env_file = self.profile("pm") / ".env"
+        simulated_environ = {"MNEMOSYNE_DATA_DIR": str(self.tmp / "stale-inherited-shell-value"),
+                              "MNEMOSYNE_HOME": str(self.tmp / "stale-inherited-shell-home")}
         # Stdlib only (the suites must run with no third-party packages, as
         # CI does): the installer writes plain KEY=VALUE lines, optionally
         # quoted, which is all this reader needs to understand.
@@ -588,6 +605,76 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         simulated_environ.update(dotenv_values)  # override=True: dotenv values win
         self.assertEqual(simulated_environ["MNEMOSYNE_DATA_DIR"],
                           str(self.root / "dev-team-mnemosyne" / "data"))
+        self.assertEqual(simulated_environ["MNEMOSYNE_HOME"],
+                          str(self.root / "dev-team-mnemosyne"))
+
+    def test_mnemosyne_pins_win_over_inherited_values_under_the_real_hermes_loader(self):  # F1/D1
+        """Runs the installer, then loads the pinned .env with Hermes' own
+        ``load_hermes_dotenv`` (hermes_cli/env_loader.py) against a stale,
+        inherited MNEMOSYNE_DATA_DIR/MNEMOSYNE_HOME pre-seeded in a saved
+        and restored os.environ -- the real precedence rule, not a
+        re-implementation of it. ``load_hermes_dotenv`` imports
+        python-dotenv and this repo's bundled ``agent``/``hermes_constants``
+        modules at module scope (env_loader.py:17-18), none of which exist
+        in the stdlib-only CI-equivalence venv, so this test skips there
+        with an explicit reason instead of failing or silently doing
+        nothing."""
+        hermes_agent_dir = Path.home() / ".hermes" / "hermes-agent"
+        if not (hermes_agent_dir / "hermes_cli" / "env_loader.py").exists():
+            self.skipTest(f"real Hermes install not found at {hermes_agent_dir}; "
+                           "cannot load the real env loader here")
+        import sys
+        sys.path.insert(0, str(hermes_agent_dir))
+        try:
+            import hermes_cli.env_loader as real_env_loader  # noqa: PLC0415
+        except ImportError as exc:
+            self.skipTest(f"real env_loader is not importable here ({exc!r}); "
+                           "this is expected in the stdlib-only venv, which has "
+                           "neither python-dotenv nor this repo's bundled 'agent' "
+                           "package -- both imported at env_loader.py module scope")
+            return
+
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        profile_home = self.profile("pm")
+        saved_environ = dict(os.environ)
+        os.environ["MNEMOSYNE_DATA_DIR"] = str(self.tmp / "stale-inherited-shell-value")
+        os.environ["MNEMOSYNE_HOME"] = str(self.tmp / "stale-inherited-shell-home")
+        try:
+            real_env_loader.load_hermes_dotenv(hermes_home=profile_home, load_external_secrets=False)
+            self.assertEqual(os.environ.get("MNEMOSYNE_DATA_DIR"),
+                              str(self.root / "dev-team-mnemosyne" / "data"))
+            self.assertEqual(os.environ.get("MNEMOSYNE_HOME"),
+                              str(self.root / "dev-team-mnemosyne"))
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_environ)
+
+    # --- F2 (review r3): the profile-dir canonicalisation check must run
+    # BEFORE SOUL, the prefix file, or the plugins/mnemosyne link -- not
+    # just before the mnemosyne/ data link as D2 originally had it.
+    def test_profile_dir_outside_profiles_leaves_operator_root_untouched_without_adopt(self):  # F2
+        """Reviewer's repro: profiles/dev-qa -> $root, a default run (no
+        --adopt-team-memory). Before this fix the canonicalisation check
+        ran only right before the mnemosyne/ link, so SOUL.md was
+        overwritten, dev-team-prefix was written, and plugins/mnemosyne
+        was (re)linked onto the operator's own plugin directory before the
+        check ever fired."""
+        profiles_dir = self.root / "profiles"
+        profiles_dir.mkdir(parents=True)
+        (profiles_dir / "dev-qa").symlink_to(self.root)
+        (self.root / "SOUL.md").write_text("operator soul\n")
+        before_soul = (self.root / "SOUL.md").read_bytes()
+        before_plugins = self.snapshot_tree(self.root / "plugins")
+        proc = self.install("--only", "qa")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("outside", proc.stderr)
+        self.assertEqual((self.root / "SOUL.md").read_bytes(), before_soul,
+                          "operator SOUL.md must be byte-identical")
+        self.assertEqual(self.snapshot_tree(self.root / "plugins"), before_plugins,
+                          "operator plugins/ must be byte-identical")
+        self.assertFalse((self.root / "dev-team-prefix").exists(),
+                          "dev-team-prefix must not have been written to the operator root")
 
     # --- D2: the adopt branch must canonicalise before touching anything
     def test_adopt_team_memory_refuses_when_profile_dir_resolves_outside_profiles(self):  # D2

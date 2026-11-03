@@ -509,6 +509,15 @@ if [[ -n "$_team_memory_refusal" ]]; then
     exit 2
 fi
 
+# F1 (review r3): also pin MNEMOSYNE_HOME alongside MNEMOSYNE_DATA_DIR.
+# MNEMOSYNE_DATA_DIR only steers the CLI (mnemosyne/cli.py:20-23) and
+# call-time modules (core/banks.py, core/triples.py, core/canonical.py,
+# core/media.py); it does NOT steer the MCP shared-surface DB or
+# federation, which both read MNEMOSYNE_HOME directly
+# (mnemosyne/mcp_tools.py:167-173, core/fleet_census.py:149-155,
+# core/federation_handshake.py:263-267, mcp_server.py:799). An inherited
+# MNEMOSYNE_HOME therefore still leaked the operator's shared-surface DB
+# path into a dev-team profile even after MNEMOSYNE_DATA_DIR was pinned.
 # D1: pin this profile's own Mnemosyne data directory into its own .env so
 # an inherited MNEMOSYNE_DATA_DIR from the launching shell or gateway
 # cannot redirect it away from the bank this installer just linked.
@@ -522,23 +531,49 @@ fi
 # over an inherited shell/gateway environment variable, so pinning it here
 # closes the gap the operator saw live with MNEMOSYNE_HOME (same class of
 # bug, actually caused by MNEMOSYNE_DATA_DIR per the operator's own
-# correction) without having to refuse the install outright.
+# correction, and -- per F1 above -- by MNEMOSYNE_HOME too, for the
+# shared-surface DB) without having to refuse the install outright.
+#
+# F4 (review r2 nit): a bank path can legitimately contain sed-special
+# bytes (`&` means "the whole match" in a sed replacement; `|` collides
+# with the `s|...|...|` delimiter chosen here). Piping the path through a
+# sed *pattern* silently corrupts the written value or makes sed error
+# out. Rewrite a single VAR=value line with plain bash string comparison
+# instead, so sed never sees the path at all.
+set_env_var() {  # env_file var_name value
+    local env_file="$1" var_name="$2" value="$3" line found=0 tmp
+    local -a out_lines=()
+    if [[ -f $env_file ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line == "$var_name="* ]]; then
+                out_lines+=("$var_name=$value")
+                found=1
+            else
+                out_lines+=("$line")
+            fi
+        done < "$env_file"
+    fi
+    if (( ! found )); then
+        out_lines+=("$var_name=$value")
+    fi
+    tmp="$(mktemp "${env_file}.XXXXXX")"
+    printf '%s\n' "${out_lines[@]}" > "$tmp"
+    mv -- "$tmp" "$env_file"
+}
 pin_mnemosyne_data_dir() {
-    local profile_dir="$1" data_dir="$2" env_file
+    local profile_dir="$1" data_dir="$2" env_file home_dir
     env_file="$profile_dir/.env"
+    # F1: data_dir is always "<bank>/data" at every call site below, so
+    # its dirname is exactly the bank root MNEMOSYNE_HOME must name.
+    home_dir="$(dirname -- "$data_dir")"
     if (( DRY_RUN )); then
         say "  would pin in .env: MNEMOSYNE_DATA_DIR=$data_dir"
+        say "  would pin in .env: MNEMOSYNE_HOME=$home_dir"
         return
     fi
     mkdir -p "$profile_dir"
-    if [[ -f $env_file ]] && grep -q '^MNEMOSYNE_DATA_DIR=' "$env_file"; then
-        local tmp
-        tmp="$(mktemp "${env_file}.XXXXXX")"
-        sed "s|^MNEMOSYNE_DATA_DIR=.*|MNEMOSYNE_DATA_DIR=$data_dir|" "$env_file" > "$tmp"
-        mv -- "$tmp" "$env_file"
-    else
-        printf 'MNEMOSYNE_DATA_DIR=%s\n' "$data_dir" >> "$env_file"
-    fi
+    set_env_var "$env_file" MNEMOSYNE_DATA_DIR "$data_dir"
+    set_env_var "$env_file" MNEMOSYNE_HOME "$home_dir"
 }
 # Team state (forge project records, team clones) must be visible to every
 # role: devops writes the project record at onboarding, pr-ci reads it to
@@ -924,6 +959,23 @@ for i in "${!NAMES[@]}"; do
         profile_dir="$(dirname "$(hermes -p "$name" config path)")"
     fi
 
+    # F2 (review r2): canonicalise $profile_dir itself FIRST, before SOUL,
+    # the prefix file, or any link -- not just before the mnemosyne/ link
+    # as D2 originally had it. Refuse if it resolves outside
+    # $HERMES_ROOT/profiles (review repro: profiles/dev-qa -> $HERMES_ROOT
+    # turns SOUL.md/dev-team-prefix writes and the plugin-link mkdir below
+    # into writes onto the Hermes root itself, before the mnemosyne-only
+    # check further down ever ran).
+    _profile_dir_real="$(resolve_abs_nearest "$profile_dir")" || {
+        echo "Cannot resolve $name's profile directory: $profile_dir" >&2
+        exit 1
+    }
+    if ! path_is_or_under "$HERMES_ROOT_PROFILES_REAL" "$_profile_dir_real" \
+            && ! identity_overlap "$_profile_dir_real" "$HERMES_ROOT_PROFILES_REAL"; then
+        echo "$name's profile directory ($profile_dir) resolves outside \$HERMES_ROOT/profiles; refusing to touch its mnemosyne/." >&2
+        exit 1
+    fi
+
     # 2. SOUL
     if (( KEEP_SOUL )) && [[ -f "$profile_dir/SOUL.md" ]]; then
         say "  SOUL.md kept (--keep-soul)"
@@ -964,19 +1016,10 @@ for i in "${!NAMES[@]}"; do
     run mkdir -p "$profile_dir/plugins"
     run ln -sfn "$PLUGIN_SRC_MNEMO" "$profile_dir/plugins/mnemosyne"
 
-    # D2: canonicalise $profile_dir itself BEFORE acting on its mnemosyne/.
-    # Refuse if it resolves outside $HERMES_ROOT/profiles (review repro: a
-    # profile directory that is itself a symlink to the Hermes root turns
-    # "$profile_dir/mnemosyne" into the operator's own bank).
-    _profile_dir_real="$(resolve_abs_nearest "$profile_dir")" || {
-        echo "Cannot resolve $name's profile directory: $profile_dir" >&2
-        exit 1
-    }
-    if ! path_is_or_under "$HERMES_ROOT_PROFILES_REAL" "$_profile_dir_real" \
-            && ! identity_overlap "$_profile_dir_real" "$HERMES_ROOT_PROFILES_REAL"; then
-        echo "$name's profile directory ($profile_dir) resolves outside \$HERMES_ROOT/profiles; refusing to touch its mnemosyne/." >&2
-        exit 1
-    fi
+    # F2: the profile-dir canonicalisation check now runs at the very top
+    # of this loop iteration (see above), before this plugin link and
+    # before SOUL/the prefix file, so it no longer needs repeating here.
+    # $_profile_dir_real from that earlier check is still valid below.
 
     # The plugin link above shares Mnemosyne's *code*. It does not share its
     # *data*: the database path resolves from MNEMOSYNE_DATA_DIR if set,
