@@ -860,7 +860,13 @@ function Get-EnvUnsafeValueReason {
            not unless the whole value is quoted, so the two disagree;
          - whitespace immediately followed by '#' -- python-dotenv's
            parser truncates there (`/t/x #y` becomes `/t/x`); Mnemosyne's
-           naive reader does not.
+           naive reader does not;
+         - a literal '${' -- python-dotenv (via env_loader's
+           _resolve_dotenv_assignments) expands `${VAR}` in an unquoted
+           value (review r3 round-2 coverage finding: `'C:\a\${HOME}\b'`
+           comes back as `'C:\a\/home/<user>\b'` there), while
+           Mnemosyne's reader does not expand it at all and returns the
+           value verbatim; the two readers would disagree.
        Returns $null when $Value is safe, otherwise a human-readable
        reason. #>
     param([string] $Value)
@@ -874,6 +880,7 @@ function Get-EnvUnsafeValueReason {
         }
     }
     if ($Value -match '\s#') { return "contains whitespace immediately followed by '#'" }
+    if ($Value.Contains('${')) { return 'contains a literal ${' }
     return $null
 }
 $OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
@@ -912,6 +919,28 @@ try {
     $HermesRootDevTeamReal  = Resolve-TeamMemoryRealPath (Join-Path $HermesRoot 'dev-team')
 } catch {
     [Console]::Error.WriteLine("-TeamMemory: cannot resolve the path: $($_.Exception.Message)")
+    exit 2
+}
+# F4a round-3 (reviewer repro): the refusal above (line 888) only checked
+# the RAW -TeamMemory argument. A symlink/junction whose target contains
+# an unsafe shape, or a relative argument resolved under a cwd/
+# $HermesRoot that contains one, passed that check untouched and was
+# pinned anyway -- Set-EnvVarPin writes the RESOLVED $TeamMemoryHome
+# (used below at the Set-MnemosyneDataDirPin call sites), not the raw
+# string. Check the resolved value too, right after the resolve block
+# and before any side effect (New-Item, Set-EnvVarPin, etc. all happen
+# later). Also check $HermesRootProfilesReal: every profile-local pin
+# (Set-MnemosyneDataDirPin -ProfileDir $profileDir/-DataDir ...) derives
+# its path from $HermesRoot\profiles, so an unsafe $HermesRoot pins an
+# unsafe value even when -TeamMemory itself is perfectly safe.
+$_teamMemoryHomeUnsafeReason = Get-EnvUnsafeValueReason $TeamMemoryHome
+if ($_teamMemoryHomeUnsafeReason) {
+    [Console]::Error.WriteLine("-TeamMemory resolves to a path that $_teamMemoryHomeUnsafeReason; it would not read back identically from .env. Pick a path (or, if it's a link, a link target) without that.")
+    exit 2
+}
+$_hermesRootProfilesUnsafeReason = Get-EnvUnsafeValueReason $HermesRootProfilesReal
+if ($_hermesRootProfilesUnsafeReason) {
+    [Console]::Error.WriteLine("`$HermesRoot\profiles ($HermesRootProfilesReal) $_hermesRootProfilesUnsafeReason; profile-local Mnemosyne pins derived from it would not read back identically from .env.")
     exit 2
 }
 $_teamHomeReal = $TeamMemoryHome
@@ -1000,8 +1029,30 @@ function Set-EnvVarPin {
        itself writes. [IO.File]::ReadAllLines auto-detects a BOM already
        on disk and otherwise falls back to the UTF-8 encoding passed in,
        so a pre-existing BOM-less UTF-8 file (what this function always
-       writes) decodes correctly either way. #>
+       writes) decodes correctly either way.
+
+       Accepted lossy case (round-1 review coverage #4): ReadAllLines /
+       WriteAllLines normalise line terminators to Environment.NewLine
+       and drop an EOF trailing-newline difference, and any byte that is
+       not valid UTF-8 in a pre-existing .env (e.g. an ANSI file left by
+       an older install run under PS 5.1) decodes as U+FFFD and is
+       rewritten lossy. Line *content* stays byte-exact for valid UTF-8,
+       which is all item 1 (above) required; a non-UTF-8 existing file is
+       an already-broken precondition this function does not try to
+       repair. #>
     param([string] $ProfileDir, [string] $VarName, [string] $Value)
+    # F4a defense-in-depth (round-3 reviewer finding): the early refusals
+    # above only check -TeamMemory's raw and resolved forms, and
+    # $HermesRootProfilesReal. Re-check the exact value actually being
+    # written here too, so no call site -- present or future -- can pin
+    # an unsafe value by constructing it some other way. This must never
+    # fire in the normal run (the callers already refused first); it is
+    # a backstop, not the primary check.
+    $_pinUnsafeReason = Get-EnvUnsafeValueReason $Value
+    if ($_pinUnsafeReason) {
+        [Console]::Error.WriteLine("Refusing to pin $VarName into $ProfileDir\.env: the value $_pinUnsafeReason; it would not read back identically from .env.")
+        exit 2
+    }
     New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
     $envFile = Join-Path $ProfileDir '.env'
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
