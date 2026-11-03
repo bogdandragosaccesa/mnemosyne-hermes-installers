@@ -840,8 +840,56 @@ function Test-PathIsOrUnder {
     $sep = [System.IO.Path]::DirectorySeparatorChar
     return $Desc.StartsWith("$Anc$sep", [System.StringComparison]::OrdinalIgnoreCase)
 }
+function Get-EnvUnsafeValueReason {
+    <# review r3 minor #4 (round 2): the pin format decided for the .env
+       writer is unquoted KEY=value (Set-EnvVarPin, below) -- NOT
+       python-dotenv's single-quote-escaped format, which does not round-
+       trip through Mnemosyne's own .env reader (mcp_server.py
+       :_load_dotenv, ~823-833: `v.strip().strip("'\"")`, which strips a
+       bounding quote character but never unescapes `\\` or `\'`, so an
+       escaped value comes back corrupted there). Unquoted values read
+       back byte-exact through BOTH readers except for the shapes below,
+       so refuse those up front instead of silently writing a value
+       either reader would misread:
+         - a newline (CR or LF) -- would split into more than one .env line;
+         - leading/trailing whitespace -- Mnemosyne's reader strips it,
+           python-dotenv's parser does not, so the two readers would
+           disagree on the stored value;
+         - a leading/trailing quote character (' or ") -- Mnemosyne's
+           reader strips exactly one bounding pair, python-dotenv's does
+           not unless the whole value is quoted, so the two disagree;
+         - whitespace immediately followed by '#' -- python-dotenv's
+           parser truncates there (`/t/x #y` becomes `/t/x`); Mnemosyne's
+           naive reader does not.
+       Returns $null when $Value is safe, otherwise a human-readable
+       reason. #>
+    param([string] $Value)
+    if ($Value -match "`r|`n") { return 'contains a newline' }
+    if ($Value -match '^\s' -or $Value -match '\s$') { return 'starts or ends with whitespace' }
+    if ($Value.Length -gt 0) {
+        $first = $Value.Substring(0, 1)
+        $last = $Value.Substring($Value.Length - 1, 1)
+        if ($first -eq "'" -or $first -eq '"' -or $last -eq "'" -or $last -eq '"') {
+            return 'starts or ends with a quote character'
+        }
+    }
+    if ($Value -match '\s#') { return "contains whitespace immediately followed by '#'" }
+    return $null
+}
 $OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
 $rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
+# F4a (review r3 minor #4, round 2 operator decision): refuse, rather than
+# silently mis-pin, a -TeamMemory value that python-dotenv's real parser and
+# Mnemosyne's own naive .env reader would not both read back identically.
+# Same rule as the Unix installer (quote_env_value was reverted there to
+# this same unquoted-with-refusal rule per the same decision). Checked on
+# the raw argument, before path resolution, so this fires even when the
+# value can't be resolved to a real path at all.
+$_teamMemoryUnsafeReason = Get-EnvUnsafeValueReason $rawTeamMemoryHome
+if ($_teamMemoryUnsafeReason) {
+    [Console]::Error.WriteLine("-TeamMemory $_teamMemoryUnsafeReason; it would not read back identically from .env. Pick a path without that.")
+    exit 2
+}
 # Every path below is canonical (no '.', '..', repeated separator, link or
 # junction anywhere on it): the value checked is the value later passed to
 # New-Item / New-DirLink.
