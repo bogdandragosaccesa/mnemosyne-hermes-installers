@@ -181,22 +181,37 @@ with a warning when even a junction can't be created. On a re-run an existing ju
 removed with `[System.IO.Directory]::Delete` and never with `Remove-Item -Recurse`. On Windows
 PowerShell 5.1 that cmdlet follows the junction and deletes the team bank's contents.
 
-**`MNEMOSYNE_DATA_DIR` is the variable that actually decides every Mnemosyne-reading process's
-data directory** — the installed Mnemosyne package checks it before anything else, including
-before the per-profile link this installer sets up (`mnemosyne/cli.py:20-23`,
-`mnemosyne/core/beam.py:358-366`). If it is set in the shell or gateway environment a `hermes -p
-dev-*` process launches from, it silently overrides this installer's link, the same way a live
-operator session was found to leak the operator's own bank into a `dev-pm` chat despite
-`profiles/dev-pm/mnemosyne` pointing at the team bank. This installer closes that gap by pinning
-`MNEMOSYNE_DATA_DIR` into each profile's own `.env` file: Hermes loads a profile's `.env` with
-`override=True` specifically so it beats a value already in the process environment
-(`hermes_cli/env_loader.py:502-562`), so the pinned value wins regardless of what the launching
-shell exported. **The gateway and every `hermes -p dev-*` launch should still run with
-`MNEMOSYNE_HOME` and `MNEMOSYNE_DATA_DIR` unset** — `MNEMOSYNE_HOME` is only used by this
-installer (and `install-mnemosyne-hermes-*`) to locate the operator's bank for the refusal check
-above, never by the installed Mnemosyne package itself, but an operator session that has either
-exported should not assume a plain `hermes -p dev-pm chat` picks up team-bank values it never
-asked to override.
+**`MNEMOSYNE_DATA_DIR` is the variable that actually decides the CLI's and the call-time modules'
+data directory** — `mnemosyne/cli.py:20-23`, and `core/banks.py`, `core/triples.py`,
+`core/canonical.py` and `core/media.py` all check it before anything else. It does **not**,
+however, decide the Hermes provider's own main database: Hermes always injects `hermes_home`
+(`agent/memory_manager.py:920-923`), the provider builds that DB's path explicitly as
+`$HERMES_HOME/mnemosyne/data/…` (`mnemosyne_hermes/__init__.py:2690-2721`), and `BeamMemory`
+itself resolves an explicit path ahead of either env var (`mnemosyne/core/beam.py:5960`) — so the
+provider's main DB always follows the per-profile `mnemosyne/` link this installer sets up,
+regardless of `MNEMOSYNE_DATA_DIR`.
+
+**`MNEMOSYNE_HOME` is read by the installed Mnemosyne package itself** — contrary to an earlier
+version of this document — for the MCP shared-surface DB and federation:
+`mnemosyne/mcp_tools.py:167-173` builds the shared-surface DB path from it, and so do
+`core/fleet_census.py:149-155`, `core/federation_handshake.py:263-267` and `mcp_server.py:799`. If
+either `MNEMOSYNE_HOME` or `MNEMOSYNE_DATA_DIR` is set in the shell or gateway environment a
+`hermes -p dev-*` process launches from, it silently overrides this installer's links, the same
+way a live operator session was found to leak the operator's own bank into a `dev-pm` chat
+despite `profiles/dev-pm/mnemosyne` pointing at the team bank. This installer closes that gap by
+pinning **both** `MNEMOSYNE_DATA_DIR` and `MNEMOSYNE_HOME` into each profile's own `.env` file:
+Hermes loads a profile's `.env` with `override=True` specifically so it beats a value already in
+the process environment (`hermes_cli/env_loader.py:502-562`).
+
+**The pinned `.env` values do not win regardless, though: they do nothing in a multiplex
+gateway.** While a routed profile-home override is active, the gateway deliberately skips loading
+that profile's own `.env` into the shared process environment, to avoid exposing one profile's
+credentials to sibling turns (`env_loader.py:530-545`). A dev-team profile run through a
+multiplex gateway therefore still inherits whatever `MNEMOSYNE_HOME`/`MNEMOSYNE_DATA_DIR` the
+gateway process itself was launched with — the `.env` pin only protects a profile launched
+directly (`hermes -p dev-pm chat`, a cron fire, a worker spawn). **The gateway process, and every
+non-routed `hermes -p dev-*` launch, should still run with `MNEMOSYNE_HOME` and
+`MNEMOSYNE_DATA_DIR` unset.**
 
 ## Onboarding a project
 

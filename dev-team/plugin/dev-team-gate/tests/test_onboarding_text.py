@@ -71,6 +71,31 @@ RAW_PROFILE_RELATIVE_TEAM_HOME = re.compile(
 LEDGER_COMMAND = re.compile(r"hermes kanban (ls|show)\b")
 
 
+def find_forbidden_offenders(text):
+    """D7/F4 (PR #8 review r2/r3): the one real scan, shared by the
+    production check below and its split-line-probe test, so the probe
+    exercises exactly this logic rather than a parallel reimplementation
+    of it. Matches across line breaks (``flat``) and honours the explicit
+    prohibition allowlist. Returns a list of (lineno, line, match).
+
+    F4 (review r3 nit): a shell line continuation (``boards \\`` then a
+    newline, then ``switch``) leaves a literal backslash between the two
+    halves once newlines are flattened to spaces, which a plain
+    ``\\s+`` gap does not match. Collapse a backslash-newline pair to two
+    spaces FIRST (same length, so lineno offsets below stay aligned),
+    before flattening any remaining newlines."""
+    offenders = []
+    flat = re.sub(r"\\\n", "  ", text)  # shell continuation -> two spaces, same length
+    flat = flat.replace("\n", " ")  # remaining newlines -> one space, same length as text
+    for m in FORBIDDEN.finditer(flat):
+        lineno = text.count("\n", 0, m.start()) + 1
+        line = text.splitlines()[lineno - 1].strip()
+        if line in ALLOWED_PROHIBITION_LINES:
+            continue
+        offenders.append((lineno, line, m))
+    return offenders
+
+
 class NoGlobalBoardSwitchTest(unittest.TestCase):
     def test_text_files_exist(self):
         # Guard against a glob/path typo silently matching nothing.
@@ -86,12 +111,7 @@ class NoGlobalBoardSwitchTest(unittest.TestCase):
         offenders = []
         for path in TEXT_FILES:
             text = path.read_text(encoding="utf-8")
-            flat = text.replace("\n", " ")  # same length/offsets as text
-            for m in FORBIDDEN.finditer(flat):
-                lineno = text.count("\n", 0, m.start()) + 1
-                line = text.splitlines()[lineno - 1].strip()
-                if line in ALLOWED_PROHIBITION_LINES:
-                    continue
+            for lineno, line, m in find_forbidden_offenders(text):
                 offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line} [matched: {m.group(0)!r}]")
         self.assertEqual(
             offenders,
@@ -102,24 +122,29 @@ class NoGlobalBoardSwitchTest(unittest.TestCase):
 
     def test_forbidden_regex_matches_a_command_split_across_two_lines(self):
         """Red-before/green-after proof for D7's cross-line-break claim,
-        exercised against the real FORBIDDEN regex and the real scanning
-        logic above (not a reimplementation): a `boards switch` split by a
-        line-wrap, a bare `boards use`, and a `boards create` ... `--switch`
-        pair split across lines must all be caught."""
+        exercised against find_forbidden_offenders -- the actual
+        production scan above, not a reimplementation of it -- reading
+        the match back from a real file on disk (F4 review r3 nit: an
+        earlier version of this test wrote to a tempfile but matched
+        against the in-memory `text` string instead, so the tempfile did
+        nothing)."""
         import tempfile
         cases = [
             "Run `hermes kanban boards\nswitch team-a` first.\n",
             "Then `hermes kanban boards use team-a`.\n",
             "`hermes kanban boards create repo-x --default-workdir /x\n  --switch`\n",
+            # F4 (review r3): a shell continuation, e.g. a wrapped command
+            # in a code block: `hermes kanban boards \` then a newline,
+            # then `switch team-a`.
+            "```\nhermes kanban boards \\\nswitch team-a\n```\n",
         ]
         for text in cases:
             with self.subTest(text=text):
                 with tempfile.TemporaryDirectory() as tmp:
                     path = Path(tmp) / "probe.md"
                     path.write_text(text, encoding="utf-8")
-                    flat = text.replace("\n", " ")
-                    matches = list(FORBIDDEN.finditer(flat))
-                    self.assertTrue(matches, f"FORBIDDEN did not match: {text!r}")
+                    offenders = find_forbidden_offenders(path.read_text(encoding="utf-8"))
+                    self.assertTrue(offenders, f"FORBIDDEN did not match: {text!r}")
 
     def test_pipeline_skill_board_creation_includes_default_workdir(self):
         text = PIPELINE_SKILL.read_text(encoding="utf-8")
