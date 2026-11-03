@@ -1,33 +1,5 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-shopt -s extglob
-
-# PR #9 review fix (item 1): exact Unicode code-point classes used by
-# env_value_unsafe_reason() below, built once here so the check never
-# depends on LC_COLLATE/LC_CTYPE. Each array element is a single literal
-# (possibly multi-byte) character; `_join_extglob_alt` turns the array into
-# an extglob `@(a|b|c)` alternation of LITERAL strings. Bash's glob engine
-# matches each alternative byte-for-byte, with no collation or character-
-# class range involved, so this is locale-independent where bash's own
-# `[[:space:]]` is not (it follows LC_CTYPE, which under a non-UTF-8 locale
-# does not even recognize these as single characters).
-#
-# `_ws_chars`: every code point for which Python's `str.isspace()` is true
-# -- confirmed by enumerating chr(cp).isspace() for cp in range(0x110000)
-# against CPython 3.14: 29 code points total (\t \n \v \f \r \x1c-\x1f
-# space \x85 \xa0 \u1680 \u2000-\u200a \u2028 \u2029 \u202f \u205f \u3000).
-_ws_chars=($'\t' $'\n' $'\v' $'\f' $'\r' $'\x1c' $'\x1d' $'\x1e' $'\x1f' ' ' \
-    $'\x85' $'\xc2\xa0' $'\u1680' $'\u2000' $'\u2001' $'\u2002' $'\u2003' \
-    $'\u2004' $'\u2005' $'\u2006' $'\u2007' $'\u2008' $'\u2009' $'\u200a' \
-    $'\u2028' $'\u2029' $'\u202f' $'\u205f' $'\u3000')
-# `_nl_chars`: every code point for which Python's `str.splitlines()` would
-# split a string into more than one line -- confirmed the same way: 10 code
-# points (\n \r \v \f \x1c \x1d \x1e \x85 \u2028 \u2029). A value containing
-# any of these would not round-trip as a single physical .env line.
-_nl_chars=($'\n' $'\r' $'\v' $'\f' $'\x1c' $'\x1d' $'\x1e' $'\x85' $'\u2028' $'\u2029')
-_join_extglob_alt() { local IFS='|' a=("$@"); printf '@(%s)' "${a[*]}"; }
-_WS_PAT="$(_join_extglob_alt "${_ws_chars[@]}")"
-_NL_PAT="$(_join_extglob_alt "${_nl_chars[@]}")"
 
 # Creates the eight dev-team profiles on an existing Hermes install, points
 # each one at Mnemosyne, wires the dev-team-gate plugin and the pipeline
@@ -399,20 +371,17 @@ PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 resolve_abs_nearest() {
     local p="$1" resolved="" c target hops=0 i=0
     local -a parts tparts
-    # fix round 3 (safety finding 2) / PR #9 review item 2: `IFS='/' read -r
-    # -a ... <<< "$target"` below relies on bash `read`, which stops at the
-    # first newline -- silently shortening a path that contains one,
-    # instead of failing. Refuse up front, before any splitting. This check
-    # runs AFTER the `$PWD` join immediately below (review §3 repro: a
-    # newline in `$PWD` itself -- reachable only via a crafted cwd, not via
-    # `$1` -- used to slip past this guard when it ran before the join,
-    # silently truncating the joined path at the newline and resolving an
-    # unrelated, pre-existing prefix instead of refusing).
-    [[ "$p" == /* ]] || p="$PWD/$p"
+    # fix round 3 (safety finding 2): `IFS='/' read -r -a ... <<< "$target"`
+    # below relies on bash `read`, which stops at the first newline --
+    # silently shortening a path or symlink target that contains one,
+    # instead of failing. Refuse up front, before any splitting, rather
+    # than resolve a truncated (and possibly real, pre-existing) prefix
+    # as if it were the whole path.
     if [[ "$p" == *$'\n'* || "$p" == *$'\r'* ]]; then
         echo "Path contains a newline or carriage return, refusing to resolve: $1" >&2
         return 1
     fi
+    [[ "$p" == /* ]] || p="$PWD/$p"
     IFS='/' read -r -a parts <<< "$p"
     while (( i < ${#parts[@]} )); do
         c="${parts[i]}"
@@ -427,21 +396,7 @@ resolve_abs_nearest() {
                 echo "Too many levels of symbolic links resolving: $1" >&2
                 return 1
             fi
-            # PR #9 review item 2: plain `target="$(readlink -- ...)"`
-            # command substitution strips EVERY trailing newline from the
-            # captured output, including one that is part of the symlink's
-            # actual target (readlink itself still appends its own line
-            # terminator, so a target ending in "\n" comes back from
-            # readlink as "target\n\n" on the wire -- $(...) strips all of
-            # it, silently losing the information the newline check below
-            # exists to catch). Capture with a sentinel byte so $(...) has
-            # nothing trailing to strip, peel the sentinel off by suffix
-            # removal, then strip exactly ONE trailing newline -- the
-            # terminator readlink itself always appends, never part of the
-            # target -- the same way, so any newline that was genuinely
-            # part of the target (embedded, or a second trailing one)
-            # survives into the check right below.
-            target="$(readlink -- "$resolved/$c"; printf x)"; target="${target%x}"; target="${target%$'\n'}"
+            target="$(readlink -- "$resolved/$c")"
             # Same newline/CR guard as above, for a target read back off
             # disk rather than passed in as an argument -- a symlink
             # target is exactly as attacker- or mistake-controlled as the
@@ -514,25 +469,14 @@ identity_overlap_either() {
 # same place install-dev-team-windows.ps1 checks its -TeamMemory argument
 # (Get-EnvUnsafeValueReason).
 env_value_unsafe_reason() {  # value -> prints a reason if unsafe, else nothing
-    # PR #9 review (item 1, §2(b)): the previous version of this check used
-    # `[[:space:]]`, a bash character CLASS that follows LC_CTYPE -- under a
-    # non-UTF-8 locale (e.g. C/POSIX) it does not recognize NBSP or
-    # \x1c-\x1f as whitespace at all, and it never covered \v \f \x1c-\x1e
-    # \x85 \u2028 \u2029 as LINE separators either. Mnemosyne's own .env
-    # reader (mcp_server.py _load_dotenv) reads the file through Python's
-    # line iteration, which splits on the exact set Python's
-    # `str.splitlines()` splits on; so does Hermes's `.strip()`-based
-    # edge-whitespace handling, via `str.isspace()`. `_WS_PAT`/`_NL_PAT`
-    # (top of file) encode those two exact sets as byte-literal alternations,
-    # so this check matches code points, never a locale-dependent range.
     local v="$1"
-    if [[ $v == *${_NL_PAT}* ]]; then
+    if [[ $v == *$'\n'* || $v == *$'\r'* ]]; then
         printf 'contains a newline'
     elif [[ $v == \'* || $v == \"* || $v == *\' || $v == *\" ]]; then
         printf 'starts or ends with a quote character'
-    elif [[ $v == ${_WS_PAT}* || $v == *${_WS_PAT} ]]; then
+    elif [[ $v == [[:space:]]* || $v == *[[:space:]] ]]; then
         printf 'starts or ends with whitespace'
-    elif [[ $v == *${_WS_PAT}'#'* ]]; then
+    elif [[ $v == *[[:space:]]'#'* ]]; then
         printf "contains whitespace immediately followed by '#'"
     elif [[ $v == *'${'* ]]; then
         # fix round 3 (safety finding 1): Hermes's own .env loader
@@ -711,16 +655,15 @@ unset _preflight_role _preflight_name _preflight_profile_dir _team_home_subject 
 # `v.strip().strip("'\"")`) only strips a bounding whitespace/quote
 # character and never unescapes `\\` or `\'`, so it would read "it's"
 # pinned as `'it\'s'` back as the literal `it\'s` -- a corrupted bank
-# path. Every value env_value_unsafe_reason() does NOT refuse now round-
-# trips byte-exact through BOTH readers (PR #9 review fix, item 1): that
-# check refuses, by exact Unicode code point rather than a locale-
-# dependent bash character class, every shape the two readers would
-# disagree on -- any code point `str.splitlines()` treats as a line break
-# anywhere in the value, any code point `str.isspace()` is true for at
-# either end or immediately before '#', a leading/trailing quote
-# character, and a literal '${'. Do not re-quote; re-check the round-trip
-# table in test_install_unix.py and the completion metadata before
-# changing this format again.
+# path. Unquoted values round-trip byte-exact through BOTH readers for
+# every value this installer can produce, because
+# env_value_unsafe_reason() above already refuses, before any value
+# reaches this function, every shape the two readers would disagree on:
+# an embedded newline, leading/trailing whitespace, a leading/trailing
+# quote character, and whitespace immediately followed by '#' (the one
+# case python-dotenv's unquoted-value grammar truncates at). Do not
+# re-quote; re-check the round-trip table in test_install_unix.py and the
+# completion metadata before changing this format again.
 set_env_var() {  # env_file var_name value
     local env_file="$1" var_name="$2" value="$3" line found=0 tmp
     local -a out_lines=()
