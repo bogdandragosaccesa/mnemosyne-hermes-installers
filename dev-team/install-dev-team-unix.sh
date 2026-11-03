@@ -371,6 +371,16 @@ PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 resolve_abs_nearest() {
     local p="$1" resolved="" c target hops=0 i=0
     local -a parts tparts
+    # fix round 3 (safety finding 2): `IFS='/' read -r -a ... <<< "$target"`
+    # below relies on bash `read`, which stops at the first newline --
+    # silently shortening a path or symlink target that contains one,
+    # instead of failing. Refuse up front, before any splitting, rather
+    # than resolve a truncated (and possibly real, pre-existing) prefix
+    # as if it were the whole path.
+    if [[ "$p" == *$'\n'* || "$p" == *$'\r'* ]]; then
+        echo "Path contains a newline or carriage return, refusing to resolve: $1" >&2
+        return 1
+    fi
     [[ "$p" == /* ]] || p="$PWD/$p"
     IFS='/' read -r -a parts <<< "$p"
     while (( i < ${#parts[@]} )); do
@@ -387,6 +397,15 @@ resolve_abs_nearest() {
                 return 1
             fi
             target="$(readlink -- "$resolved/$c")"
+            # Same newline/CR guard as above, for a target read back off
+            # disk rather than passed in as an argument -- a symlink
+            # target is exactly as attacker- or mistake-controlled as the
+            # raw path (repro: a symlink whose target is truncated at a
+            # newline to a shorter, unrelated, pre-existing directory).
+            if [[ "$target" == *$'\n'* || "$target" == *$'\r'* ]]; then
+                echo "Symlink target contains a newline or carriage return, refusing to resolve: $resolved/$c -> $target" >&2
+                return 1
+            fi
             # An absolute target restarts from `/`; a relative one is
             # relative to the directory holding the link ($resolved).
             [[ "$target" == /* ]] && resolved=""
@@ -459,6 +478,14 @@ env_value_unsafe_reason() {  # value -> prints a reason if unsafe, else nothing
         printf 'starts or ends with whitespace'
     elif [[ $v == *[[:space:]]'#'* ]]; then
         printf "contains whitespace immediately followed by '#'"
+    elif [[ $v == *'${'* ]]; then
+        # fix round 3 (safety finding 1): Hermes's own .env loader
+        # (hermes_cli/env_loader.py _resolve_dotenv_assignments) expands a
+        # literal '${VAR}' sequence found in a pinned value; Mnemosyne's
+        # own reader does not. The two readers would disagree on the bank
+        # path -- same rule, same wording, as install-dev-team-windows.ps1's
+        # Get-EnvUnsafeValueReason (a82da09: "contains a literal ${").
+        printf 'contains a literal ${'
     fi
 }
 OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"

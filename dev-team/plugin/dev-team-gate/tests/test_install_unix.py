@@ -586,6 +586,55 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertIn("--team-memory contains a newline", proc.stderr)
         self.assertFalse((self.root / "profiles").exists())
 
+    def test_team_memory_refuses_a_value_with_a_literal_dollar_brace(self):  # fix round 3, finding 1 (raw path)
+        """Hermes's own .env loader (hermes_cli/env_loader.py
+        _resolve_dotenv_assignments) expands a literal '${VAR}' sequence
+        found in a pinned value; Mnemosyne's own reader does not -- the
+        two readers would disagree on the bank path. Windows already
+        refuses this (install-dev-team-windows.ps1's
+        Get-EnvUnsafeValueReason, a82da09); the Unix guard must match."""
+        value = str(self.tmp / "a${HOME}b")
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", value, "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--team-memory contains a literal ${", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
+    def test_team_memory_symlink_target_with_dollar_brace_is_refused(self):  # fix round 3, finding 1 (symlink target)
+        """Mirrors test_team_memory_symlink_target_with_hash_is_refused:
+        the raw --team-memory argument (the symlink path) looks safe, but
+        its resolved TARGET contains a literal '${', which must be
+        refused the same as the raw-path case above."""
+        real_bank = self.tmp / "x${USER}y"
+        real_bank.mkdir()
+        safe_link = self.tmp / "safe-link-dollar"
+        safe_link.symlink_to(real_bank)
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", str(safe_link), "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("contains a literal ${", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
+    def test_team_memory_symlink_target_with_embedded_newline_is_refused(self):  # fix round 3, finding 2
+        """resolve_abs_nearest used `IFS='/' read -r -a tparts <<<
+        "$target"` to split a symlink target into path components;
+        bash's `read` silently stops at the first newline, so a target
+        containing one used to resolve (wrongly) to the truncated prefix
+        instead of being refused. Reproduce with an unrelated,
+        pre-existing sibling path at exactly that truncated prefix, so a
+        silent truncation would link into the WRONG, real directory
+        instead of failing loudly."""
+        (self.tmp / "ba").mkdir()
+        link = self.tmp / "nlink"
+        link.symlink_to(self.tmp / "ba\nnk")
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", str(link), "--only", "qa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
     def test_team_memory_symlink_target_with_hash_is_refused(self):  # review round 2 of fix round 1, finding 1(a)
         """env_value_unsafe_reason() used to run only on the RAW
         --team-memory string, before path resolution. A symlink whose
@@ -623,16 +672,19 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertFalse((self.root / "profiles").exists())
         self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
 
-    def test_team_memory_accepts_safe_special_characters_and_round_trips(self):  # item 4a, operator round-2 decision
+    def _install_bank_with_special_characters_and_check_pins(self):  # fix round 3, finding 3 (shared setup)
         """'&', '|', a non-edge quote, a non-edge backslash and non-ASCII
         are all safe under the unquoted-no-escaping format (F4's original
-        concern) and must NOT be refused by the new guard. This is the
-        round-trip table the operator's decision asked for: the written
-        value is checked against BOTH readers -- python-dotenv's real
-        parser (if importable anywhere on this host; skip with a reason
-        if not) and Mnemosyne's own real _load_dotenv() (imported from its
-        installed venv; a reimplementation would only be used, and stated
-        as such, if that import failed)."""
+        concern) and must NOT be refused by the new guard. Shared by the
+        two round-trip tests below -- split apart (fix round 3) because
+        this install + pin-format assertion used to be followed, in a
+        single test, by a skipTest() for the Mnemosyne-venv-reader check
+        that ran BEFORE the python-dotenv assertion, so on any host
+        without ~/.mnemosyne-venv (typical CI) the dotenv check was
+        silently skipped too, even though it ran unconditionally before
+        that round. Each reader now gets its own independent test method,
+        run via its own install, so a skip in one can never suppress the
+        other."""
         bank = (self.tmp / "it's a bank" / "a&b|c d" / "a\\b" / "ăș" / "bank#nofail")
         proc = self.install("--team-memory", str(bank), "--only", "qa")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -649,9 +701,16 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         # would start with a single quote instead).
         self.assertEqual(data_lines[0], f"MNEMOSYNE_DATA_DIR={expected_data}")
         self.assertEqual(home_lines[0], f"MNEMOSYNE_HOME={expected_home}")
+        return env_file, expected_data, expected_home
 
-        # Reader 1: Mnemosyne's own standalone MCP-server bootstrap
-        # (mcp_server.py:_load_dotenv), via the REAL installed module.
+    def test_team_memory_special_characters_round_trip_via_mnemosyne_reader(self):  # item 4a, operator round-2 decision
+        """Reader 1: Mnemosyne's own standalone MCP-server bootstrap
+        (mcp_server.py:_load_dotenv), via the REAL installed module
+        (imported from its installed venv; a reimplementation would only
+        be used, and stated as such, if that import failed). Independent
+        of the python-dotenv test below (fix round 3, finding 3): this
+        one alone skips when ~/.mnemosyne-venv is absent."""
+        env_file, expected_data, expected_home = self._install_bank_with_special_characters_and_check_pins()
         mnemosyne_data, mnemosyne_data_reason = _read_env_value_via_mnemosyne_reader(
             env_file, "MNEMOSYNE_DATA_DIR")
         mnemosyne_home, mnemosyne_home_reason = _read_env_value_via_mnemosyne_reader(
@@ -660,9 +719,8 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
             # Finding 2 (review round 2 of fix round 1): a print() here
             # let this branch pass invisibly in CI -- the WARNING scrolled
             # past with no trace in the result summary. skipTest instead,
-            # same as the python-dotenv branch below, so a CI run that
-            # cannot reach the real reader reports it as a skip, not a
-            # silent pass under a reimplementation.
+            # so a CI run that cannot reach the real reader reports it as
+            # a skip, not a silent pass under a reimplementation.
             self.skipTest(
                 "mnemosyne.mcp_server not importable "
                 f"({mnemosyne_data_reason or mnemosyne_home_reason}); "
@@ -671,12 +729,17 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertEqual(mnemosyne_data, expected_data)
         self.assertEqual(mnemosyne_home, expected_home)
 
-        # Reader 2: the real python-dotenv parser, if importable anywhere
-        # on this host (this interpreter, or a Hermes install venv).
+    def test_team_memory_special_characters_round_trip_via_python_dotenv(self):  # item 4a, operator round-2 decision
+        """Reader 2: the real python-dotenv parser, if importable
+        anywhere on this host (this interpreter, or a Hermes install
+        venv). Fix round 3, finding 3: this assertion must run
+        unconditionally (it is its own test method now), independent of
+        whether the Mnemosyne-venv-reader test above skips."""
+        env_file, expected_data, expected_home = self._install_bank_with_special_characters_and_check_pins()
         dotenv_python = _find_dotenv_python()
         if not dotenv_python:
             self.skipTest("python-dotenv not importable under this interpreter or any "
-                           "installed Hermes venv; Mnemosyne-reader round-trip above already passed")
+                           "installed Hermes venv")
             return
         with tempfile.TemporaryDirectory() as probe_tmp:
             probe = Path(probe_tmp) / "probe_dotenv_values.py"
