@@ -243,6 +243,27 @@ class PwshTeamBankCheckTests(_CheckContract, unittest.TestCase):
         return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
                               capture_output=True, text=True, timeout=120, env=env)
 
+    def test_passes_with_a_non_ascii_bank_path_in_the_env_pin(self):  # PR #9 review item 3
+        """check-team-bank.ps1's Get-EnvPin used to call `Get-Content`
+        with no -Encoding, so it decoded the installer's BOM-less UTF-8
+        .env file using whatever the default is -- 'Default' (the
+        system ANSI code page) under Windows PowerShell 5.1, the job
+        this script actually runs in. A non-ASCII bank path would then
+        be misread, and the overlap/link-target comparisons that key off
+        Get-EnvPin's return value would silently compare the wrong
+        string. Explicit -Encoding UTF8 fixes it on every PS host,
+        including this one (pwsh 7 already defaults to UTF-8, so this
+        is a regression guard for the PS 5.1 CI job, not a local repro
+        of the ANSI bug itself)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = Path(tmp) / "pr\u0103oj-\u0219ect"
+            outer.mkdir()
+            lay = Layout(str(outer), private=("dev-pm",))
+            proc = self.check(lay, private=("dev-pm",))
+            self.assertPasses(proc)
+            self.assertTrue(lay.team_db.is_file())
+            self.assertEqual(lay.operator_db.read_bytes(), b"operator-bank")
+
 
 class PwshScriptStaysPs51Compatible(unittest.TestCase):
     """The ps51 job runs check-team-bank.ps1 under Windows PowerShell 5.1,
@@ -257,6 +278,21 @@ class PwshScriptStaysPs51Compatible(unittest.TestCase):
                           (r"-AsHashtable", "ConvertFrom-Json -AsHashtable"),
                           (r"\$IsWindows", "$IsWindows (undefined on 5.1)")):
             self.assertIsNone(re.search(pat, code), f"check-team-bank.ps1 uses {what}")
+
+    def test_env_pin_read_specifies_utf8_encoding(self):  # PR #9 review item 3
+        """Windows PowerShell 5.1's Get-Content defaults to the system
+        ANSI code page, not UTF-8, when -Encoding is omitted. The
+        installer writes .env as BOM-less UTF-8 (install-dev-team-
+        windows.ps1's own Set-EnvVarPin), so reading it back without
+        -Encoding UTF8 would misdecode any non-ASCII bank path under the
+        real ps51 CI job."""
+        code = PS1.read_text(encoding="utf-8")
+        start = code.index("function Get-EnvPin")
+        end = code.index("\n}\n", start)
+        body = code[start:end]
+        self.assertIn("Get-Content", body)
+        self.assertIn("-Encoding UTF8", body, "Get-EnvPin's Get-Content call lacks -Encoding UTF8")
+
 
 
 class WorkflowUsesTheTestedChecks(unittest.TestCase):

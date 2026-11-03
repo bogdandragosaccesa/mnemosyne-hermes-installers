@@ -140,7 +140,7 @@ function Get-EnvPin([string] $Dir, [string] $Name) {
     $envFile = Join-Path $Dir '.env'
     if (-not (Test-Path -LiteralPath $envFile)) { return '' }
     $val = ''
-    foreach ($line in @(Get-Content -LiteralPath $envFile)) {
+    foreach ($line in @(Get-Content -LiteralPath $envFile -Encoding UTF8)) {
         if ($line.StartsWith("$Name=")) { $val = $line.Substring($Name.Length + 1) }
     }
     return Unquote-EnvPin $val
