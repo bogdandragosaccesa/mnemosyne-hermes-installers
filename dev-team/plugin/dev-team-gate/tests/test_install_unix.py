@@ -14,6 +14,21 @@ import textwrap
 import unittest
 from pathlib import Path
 
+
+def _unprivileged_bind_mount_works():
+    """True only if `unshare --mount --map-root-user` actually runs here.
+    GitHub's ubuntu runners have the binary but forbid unprivileged user
+    namespaces ("write failed /proc/self/uid_map: Operation not permitted"),
+    so checking for the binary alone is not enough."""
+    import shutil, subprocess
+    if not shutil.which("unshare"):
+        return False
+    try:
+        return subprocess.run(["unshare", "--mount", "--map-root-user", "true"],
+                              capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
 DEV_TEAM = Path(__file__).resolve().parents[3]
 INSTALLER = DEV_TEAM / "install-dev-team-unix.sh"
 ROLES = ("pm", "architect", "uiux", "backend-db", "frontend", "qa", "reviewer", "devops")
@@ -234,8 +249,8 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
     # with no symlink in it anywhere, so the string/symlink-only check
     # must not be fooled by it.
     def test_team_memory_flag_refuses_an_alias_via_bind_mount(self):  # D4
-        if not shutil.which("unshare"):
-            self.skipTest("needs unshare for an unprivileged bind mount")
+        if not _unprivileged_bind_mount_works():
+            self.skipTest("needs an unprivileged bind mount (unshare --mount --map-root-user); not permitted here")
         import shlex
         alias = self.tmp / "bind-alias"
         alias.mkdir()

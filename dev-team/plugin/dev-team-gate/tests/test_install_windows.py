@@ -13,6 +13,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
+
+def _unprivileged_bind_mount_works():
+    """True only if `unshare --mount --map-root-user` actually runs here.
+    GitHub's ubuntu runners have the binary but forbid unprivileged user
+    namespaces ("write failed /proc/self/uid_map: Operation not permitted"),
+    so checking for the binary alone is not enough."""
+    import shutil, subprocess
+    if not shutil.which("unshare"):
+        return False
+    try:
+        return subprocess.run(["unshare", "--mount", "--map-root-user", "true"],
+                              capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
 DEV_TEAM = Path(__file__).resolve().parents[3]
 PS1 = DEV_TEAM / "install-dev-team-windows.ps1"
 WORKFLOW = DEV_TEAM.parent / ".github" / "workflows" / "dev-team.yml"
@@ -1069,7 +1084,8 @@ class WindowsTeamMemoryTests(unittest.TestCase):
     # --- D4: a bind mount (device+inode identity, read via `stat` on the
     # non-Windows pwsh this suite runs under) gives a path identical to the
     # operator bank with no symlink in it anywhere.
-    @unittest.skipUnless(shutil.which("pwsh") and shutil.which("unshare"), "needs pwsh and unshare")
+    @unittest.skipUnless(shutil.which("pwsh") and _unprivileged_bind_mount_works(),
+                         "needs pwsh and an unprivileged bind mount (not permitted on CI runners)")
     def test_team_memory_refuses_an_alias_via_bind_mount(self):  # D4
         import shlex
         with tempfile.TemporaryDirectory() as tmp:
