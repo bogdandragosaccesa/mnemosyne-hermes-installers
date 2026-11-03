@@ -190,6 +190,115 @@ class UnixInstallerTests(InstallerSetupMixin, unittest.TestCase):
         self.assertEqual(Path(target).resolve(), (cwd / "relbank").resolve())
         self.assertTrue((cwd / "relbank").is_dir())
 
+    # --- r3 review finding #1: '..' / '.' / '//' in a not-yet-existing suffix
+    def assert_refused_untouched(self, proc, needle="operator's own bank"):
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn(needle, proc.stderr)
+        self.assertFalse((self.root / "profiles").exists(), "no profile may be created")
+
+    def test_team_memory_flag_refuses_dotdot_after_a_missing_component(self):  # r3 #1 (B3)
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        proc = self.install("--team-memory", f"{self.root}/nonexist/../mnemosyne")
+        self.assert_refused_untouched(proc)
+        self.assertFalse((self.root / "nonexist").exists(), "no stray directory may be created")
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
+    def test_team_memory_flag_refuses_dot_and_repeated_slashes(self):  # r3 #1
+        proc = self.install("--team-memory", f"{self.root}//a/./b/../..//./mnemosyne/./")
+        self.assert_refused_untouched(proc)
+        self.assertFalse((self.root / "a").exists())
+
+    def test_team_memory_flag_is_lexically_normalised_before_mkdir_and_ln(self):  # r3 #1
+        proc = self.install("--team-memory", f"{self.tmp}/x/../y//./bank/")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        target = os.readlink(self.profile("pm") / "mnemosyne")
+        self.assertEqual(target, str((self.tmp / "y" / "bank").resolve()))
+        self.assertFalse((self.tmp / "x").exists(), "the '..'-cancelled component must not be created")
+        self.assertTrue((self.tmp / "y" / "bank").is_dir())
+
+    # --- links anywhere on the path (parity with Windows r3 findings #2/#3)
+    def test_team_memory_flag_refuses_a_link_to_the_operator_bank(self):
+        link = self.tmp / "oplink"
+        link.symlink_to(self.root / "mnemosyne")
+        self.assert_refused_untouched(self.install("--team-memory", str(link)))
+
+    def test_team_memory_flag_refuses_a_path_below_a_link_to_the_operator_bank(self):
+        link = self.tmp / "oplink"
+        link.symlink_to(self.root / "mnemosyne")
+        before = self.snapshot_tree(self.root / "mnemosyne")
+        self.assert_refused_untouched(self.install("--team-memory", str(link / "data" / "team")))
+        self.assertFalse((self.root / "mnemosyne" / "data" / "team").exists())
+        self.assertEqual(self.snapshot_tree(self.root / "mnemosyne"), before)
+
+    def test_team_memory_flag_refuses_operator_bank_through_a_link_to_the_root(self):
+        link = self.tmp / "hlink"
+        link.symlink_to(self.root)
+        self.assert_refused_untouched(self.install("--team-memory", str(link / "mnemosyne")))
+
+    def test_team_memory_flag_refuses_a_dangling_link_into_the_operator_bank(self):
+        link = self.tmp / "dangling"
+        link.symlink_to(self.root / "mnemosyne" / "not-yet")
+        self.assert_refused_untouched(self.install("--team-memory", str(link)))
+        self.assertFalse((self.root / "mnemosyne" / "not-yet").exists())
+
+    def test_team_memory_flag_refuses_mnemosyne_home_given_as_a_link(self):
+        real = self.tmp / "relocated-bank"
+        real.mkdir()
+        link = self.tmp / "mhlink"
+        link.symlink_to(real)
+        proc = self.install("--team-memory", str(real), MNEMOSYNE_HOME=str(link))
+        self.assert_refused_untouched(proc, needle="MNEMOSYNE_HOME")
+        self.assertFalse(any(real.iterdir()))
+
+    def test_team_memory_flag_refuses_a_link_cycle_without_spinning(self):  # r3 #1: bounded
+        (self.tmp / "loop1").symlink_to(self.tmp / "loop2")
+        (self.tmp / "loop2").symlink_to(self.tmp / "loop1")
+        proc = self.install("--team-memory", str(self.tmp / "loop1" / "bank"))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Too many levels of symbolic links", proc.stderr)
+        self.assertFalse((self.root / "profiles").exists())
+
+    def test_team_memory_flag_with_spaces_and_a_link_resolves_to_the_real_path(self):  # r3 #1
+        real = self.tmp / "dir with space"
+        real.mkdir()
+        (self.tmp / "sp link").symlink_to(real)
+        proc = self.install("--team-memory", str(self.tmp / "sp link" / "bank"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(os.readlink(self.profile("pm") / "mnemosyne"),
+                         os.path.realpath(real / "bank"))
+
+    # --- r3 review finding #4: the relink NOTE covers every operator location
+    def _prelinked_profile(self, role, target):
+        pdir = self.profile(role)
+        pdir.mkdir(parents=True)
+        (pdir / "config.yaml").touch()
+        (pdir / "mnemosyne").symlink_to(target)
+        return pdir
+
+    def test_relink_note_fires_for_a_link_under_the_operator_bank(self):  # r3 #4
+        self._prelinked_profile("qa", self.root / "mnemosyne" / "data")
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"{self.profile('qa')}/mnemosyne was linked to the operator's own bank", proc.stdout)
+        self.assertEqual((self.profile("qa") / "mnemosyne").resolve(),
+                         (self.root / "dev-team-mnemosyne").resolve())
+
+    def test_relink_note_fires_for_a_link_to_mnemosyne_home(self):  # r3 #4
+        relocated = self.tmp / "relocated-bank"
+        relocated.mkdir()
+        self._prelinked_profile("qa", relocated)
+        proc = self.install(MNEMOSYNE_HOME=str(relocated))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"{self.profile('qa')}/mnemosyne was linked to the operator's own bank", proc.stdout)
+
+    def test_relink_note_is_silent_for_an_unrelated_previous_target(self):  # r3 #4
+        other = self.tmp / "other-team-bank"
+        other.mkdir()
+        self._prelinked_profile("qa", other)
+        proc = self.install()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("was linked to the operator's own bank", proc.stdout)
+
     def test_team_memory_flag_overrides_the_default_location(self):  # Task 2, acc #1
         custom = self.tmp / "custom-team-bank"
         proc = self.install("--team-memory", str(custom))

@@ -649,37 +649,81 @@ $PluginSrcMnemo = Join-Path $HermesRoot 'plugins\mnemosyne'
 # operator's own bank ($HermesRoot\mnemosyne, or whatever MNEMOSYNE_HOME
 # points at -- that store is never linked into, read from, or written to by
 # this installer). -TeamMemory overrides the location.
+function Get-TeamMemoryLinkTarget {
+    <#
+      For one path component: $null if it does not exist or is not a
+      link; otherwise the link's immediate target (a symlink OR a junction,
+      live or dangling). Uses the reparse-point attribute so a dangling link
+      is still seen as a link, then .NET 6+'s FileSystemInfo.LinkTarget
+      (PowerShell 7) with Get-Item's .Target as the Windows PowerShell 5.1
+      fallback.
+    #>
+    param([string] $Path)
+    $fi = New-Object System.IO.DirectoryInfo $Path
+    $attr = [int]$fi.Attributes          # -1 when nothing is there at all
+    if ($attr -eq -1) { return $null }
+    if (($attr -band [int][System.IO.FileAttributes]::ReparsePoint) -eq 0) { return $null }
+    $t = $null
+    if ($fi.PSObject.Properties['LinkTarget']) { $t = $fi.LinkTarget }
+    if (-not $t) {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.Target) { $t = $item.Target }
+    }
+    if ($t -is [System.Array]) { $t = $t[0] }
+    if (-not $t) { return $null }
+    $ntPrefix = [string]::Concat([char]92, '?', '?', [char]92)
+    if ($t.StartsWith($ntPrefix)) { $t = $t.Substring($ntPrefix.Length) }
+    return $t
+}
 function Resolve-TeamMemoryRealPath {
     <#
-      Resolves $Path to an absolute path (realpath -m semantics: GetFullPath
-      always applies, even to a not-yet-created path -- review finding #3).
-      For whatever portion already exists, also follows the nearest existing
-      ancestor's symlink/junction target (bounded, to survive a cycle), so a
-      -TeamMemory that IS a junction to the operator bank, or that sits
-      through one, resolves to where it really lands (review findings #2
-      and #4) rather than to the junction's own literal path.
+      Resolves $Path to a canonical absolute path (realpath -m semantics).
+      GetFullPath first (Windows' own lexical '.'/'..'/separator rules, and
+      a relative value becomes absolute -- r2 finding #3). Then every
+      component is walked from the root: wherever an existing prefix is a
+      symlink or junction -- at ANY depth, not just the nearest existing
+      ancestor (r3 review finding #2), and even when dangling -- its target
+      replaces that prefix and the walk restarts on target + remaining
+      components. Bounded to 40 hops: a link cycle throws (the caller
+      refuses with exit 2) instead of spinning or returning a half-resolved
+      path that could dodge the containment check.
     #>
     param([string] $Path)
     if (-not $Path) { return $Path }
-    $sep = [System.IO.Path]::DirectorySeparatorChar
-    $cur = Get-NormalizedPath $Path
-    $suffix = ''
-    while ($cur -and -not (Test-Path -LiteralPath $cur)) {
-        $suffix = "$sep$(Split-Path -Leaf $cur)$suffix"
-        $parent = Split-Path -Parent $cur
-        if (-not $parent -or $parent -eq $cur) { break }
-        $cur = $parent
+    # Get-NormalizedPath trims a trailing backslash, which turns a bare
+    # drive root 'C:\' into the drive-RELATIVE 'C:'; put it back.
+    $fixRoot = { param($p) if ($p -match '^[A-Za-z]:$') { "$p\" } else { $p } }
+    $full = & $fixRoot (Get-NormalizedPath $Path)
+    $seps = [char[]]@([char]92, [char]47)
+    $hops = 0
+    while ($true) {
+        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $root) { return $full }
+        $parts = @($full.Substring($root.Length).Split($seps, [System.StringSplitOptions]::RemoveEmptyEntries))
+        $cur = $root
+        $restart = $null
+        for ($i = 0; $i -lt $parts.Count; $i++) {
+            $next = [System.IO.Path]::Combine($cur, $parts[$i])
+            $target = Get-TeamMemoryLinkTarget $next
+            if ($target) {
+                $hops++
+                if ($hops -gt 40) {
+                    throw "Too many levels of symbolic links resolving: $Path"
+                }
+                if (-not [System.IO.Path]::IsPathRooted($target)) {
+                    $target = [System.IO.Path]::Combine($cur, $target)
+                }
+                $rest = @($target) + @($parts | Select-Object -Skip ($i + 1))
+                $restart = & $fixRoot (Get-NormalizedPath ([System.IO.Path]::Combine([string[]]$rest)))
+                break
+            }
+            $cur = $next
+        }
+        if ($null -eq $restart) { break }
+        $full = $restart
     }
-    for ($i = 0; $i -lt 10; $i++) {
-        $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
-        if (-not ($item -and $item.LinkType -and $item.Target)) { break }
-        $target = $item.Target
-        if ($target -is [System.Array]) { $target = $target[0] }
-        $next = Get-NormalizedPath $target
-        if (-not $next -or $next -ieq $cur) { break }
-        $cur = $next
-    }
-    return (Get-NormalizedPath "$cur$suffix")
+    if ($cur -eq [System.IO.Path]::GetPathRoot($cur)) { return $cur }
+    return (Get-NormalizedPath $cur)
 }
 function Test-PathIsOrUnder {
     <# True if $Desc (normalized) equals $Anc or is nested inside it. #>
@@ -691,15 +735,23 @@ function Test-PathIsOrUnder {
 }
 $OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
 $rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
-$TeamMemoryHome = Resolve-TeamMemoryRealPath $rawTeamMemoryHome
-$_operatorHomeReal = Resolve-TeamMemoryRealPath $OperatorMnemoHome
+# Every path below is canonical (no '.', '..', repeated separator, link or
+# junction anywhere on it): the value checked is the value later passed to
+# New-Item / New-DirLink.
+try {
+    $TeamMemoryHome = Resolve-TeamMemoryRealPath $rawTeamMemoryHome
+    $_operatorHomeReal = Resolve-TeamMemoryRealPath $OperatorMnemoHome
+    $_mnemosyneHomeReal = if ($env:MNEMOSYNE_HOME) { Resolve-TeamMemoryRealPath $env:MNEMOSYNE_HOME } else { $null }
+} catch {
+    [Console]::Error.WriteLine("-TeamMemory: cannot resolve the path: $($_.Exception.Message)")
+    exit 2
+}
 $_teamHomeReal = $TeamMemoryHome
 $_teamMemoryRefusal = $null
 if ((Test-PathIsOrUnder -Anc $_operatorHomeReal -Desc $_teamHomeReal) -or
     (Test-PathIsOrUnder -Anc $_teamHomeReal -Desc $_operatorHomeReal)) {
     $_teamMemoryRefusal = "the operator's own bank ($OperatorMnemoHome)"
-} elseif ($env:MNEMOSYNE_HOME) {
-    $_mnemosyneHomeReal = Resolve-TeamMemoryRealPath $env:MNEMOSYNE_HOME
+} elseif ($_mnemosyneHomeReal) {
     if ((Test-PathIsOrUnder -Anc $_mnemosyneHomeReal -Desc $_teamHomeReal) -or
         (Test-PathIsOrUnder -Anc $_teamHomeReal -Desc $_mnemosyneHomeReal)) {
         $_teamMemoryRefusal = "MNEMOSYNE_HOME ($($env:MNEMOSYNE_HOME))"
@@ -1050,13 +1102,19 @@ foreach ($role in $Profiles.Keys) {
             # New-Item replaces it safely.
             #
             # Re-run, already a junction: if an older installer pointed it
-            # at the operator's own bank, say so -- the operator loses this
-            # profile's access to those memories by repointing, even though
-            # the operator bank itself is untouched (review finding #6).
-            if ($isLink -and $existing.Target) {
-                $prevTarget = $existing.Target
-                if ($prevTarget -is [System.Array]) { $prevTarget = $prevTarget[0] }
-                if ((Get-NormalizedPath $prevTarget) -ieq $_operatorHomeReal) {
+            # at the operator's own bank -- $HermesRoot\mnemosyne or
+            # MNEMOSYNE_HOME, the bank itself, a path inside it, or a
+            # directory containing it (r3 review finding #4) -- say so: the
+            # operator loses this profile's access to those memories by
+            # repointing, even though the operator bank itself is untouched.
+            if ($isLink) {
+                $prevTarget = $null
+                try { $prevTarget = Resolve-TeamMemoryRealPath $dataLink } catch { }
+                if ($prevTarget -and
+                    ((Test-PathIsOrUnder -Anc $_operatorHomeReal -Desc $prevTarget) -or
+                     (Test-PathIsOrUnder -Anc $prevTarget -Desc $_operatorHomeReal) -or
+                     (Test-PathIsOrUnder -Anc $_mnemosyneHomeReal -Desc $prevTarget) -or
+                     (Test-PathIsOrUnder -Anc $prevTarget -Desc $_mnemosyneHomeReal))) {
                     Write-Host "  NOTE: $dataLink was linked to the operator's own bank;"
                     Write-Host '        repointing to the team bank. The operator''s bank is'
                     Write-Host '        untouched, but this profile loses access to memories'

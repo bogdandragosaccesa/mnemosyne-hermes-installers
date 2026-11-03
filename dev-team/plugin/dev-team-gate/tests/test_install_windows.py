@@ -792,6 +792,155 @@ class WindowsTeamMemoryTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(f"TEAM_HOME={Path(tmp) / 'relbank'}", proc.stdout)
 
+    # --- r3 review findings #2/#3: a link ANYWHERE on the path is followed.
+    # Real symlinks under Linux pwsh exercise the same link-resolution code
+    # (LinkTarget / .Target) a junction takes on Windows.
+    def _run_harness(self, tmp, root, team_memory_arg, env_extra=None):
+        harness = self._team_memory_harness(tmp, root, team_memory_arg=str(team_memory_arg))
+        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                              capture_output=True, text=True, timeout=60,
+                              env={**os.environ, **(env_extra or {})})
+
+    def _root_with_operator_bank(self, tmp):
+        root = Path(tmp) / "hermes"
+        (root / "mnemosyne" / "data").mkdir(parents=True)
+        return root
+
+    def _assert_refused(self, proc, needle="operator's own bank"):
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn(needle, proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_link_to_the_operator_bank(self):  # r3 #3 (W1)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            link = Path(tmp) / "oplink"
+            link.symlink_to(root / "mnemosyne")
+            self._assert_refused(self._run_harness(tmp, root, link))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_subdir_of_a_link_to_the_operator_bank(self):  # r3 #3 (W2)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            link = Path(tmp) / "oplink"
+            link.symlink_to(root / "mnemosyne")
+            self._assert_refused(self._run_harness(tmp, root, link / "sub"))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_the_operator_bank_through_a_link_to_the_root(self):  # r3 #2 (W9)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            link = Path(tmp) / "hlink"
+            link.symlink_to(root)
+            self._assert_refused(self._run_harness(tmp, root, link / "mnemosyne"))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_deep_path_through_a_link_to_the_operator_bank(self):  # r3 #2 (W3)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            link = Path(tmp) / "oplink"
+            link.symlink_to(root / "mnemosyne")
+            self._assert_refused(self._run_harness(tmp, root, link / "data" / "team"))
+            self.assertFalse((root / "mnemosyne" / "data" / "team").exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_chain_of_links_with_a_relative_hop(self):  # r3 #2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            (Path(tmp) / "rel").symlink_to("hermes")          # relative target
+            (Path(tmp) / "outer").symlink_to(Path(tmp) / "rel")
+            self._assert_refused(self._run_harness(tmp, root, Path(tmp) / "outer" / "mnemosyne" / "x"))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_dangling_link_into_the_operator_bank(self):  # r3 #2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            link = Path(tmp) / "dangling"
+            link.symlink_to(root / "mnemosyne" / "not-yet")
+            self._assert_refused(self._run_harness(tmp, root, link))
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_survives_a_link_cycle(self):  # r3 #2: bounded loop
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            (Path(tmp) / "a").symlink_to(Path(tmp) / "b")
+            (Path(tmp) / "b").symlink_to(Path(tmp) / "a")
+            proc = self._run_harness(tmp, root, Path(tmp) / "a" / "bank")
+        # Must terminate (timeout above) and refuse, never hand back a
+        # half-resolved path that could dodge the containment check.
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Too many levels of symbolic links", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_mnemosyne_home_given_as_a_link(self):  # r3 #3
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            real = Path(tmp) / "relocated-bank"
+            real.mkdir()
+            link = Path(tmp) / "mhlink"
+            link.symlink_to(real)
+            proc = self._run_harness(tmp, root, real, env_extra={"MNEMOSYNE_HOME": str(link)})
+            self._assert_refused(proc, needle="MNEMOSYNE_HOME")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_dotdot_after_a_missing_component(self):  # r3 #1 parity
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            self._assert_refused(self._run_harness(tmp, root, f"{root}/nonexist/../mnemosyne"))
+            self.assertFalse((root / "nonexist").exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_through_an_unrelated_link_resolves_to_the_real_path(self):  # r3 #2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            real = Path(tmp) / "elsewhere"
+            real.mkdir()
+            (Path(tmp) / "elink").symlink_to(real)
+            proc = self._run_harness(tmp, root, Path(tmp) / "elink" / "bank")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"TEAM_HOME={Path(os.path.realpath(real)) / 'bank'}", proc.stdout)
+
+    def test_relink_note_checks_both_operator_locations_by_containment(self):  # r3 #4
+        start = self.text.index("Re-run, already a junction")
+        block = self.text[start:self.text.index("$kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome", start)]
+        self.assertIn("Test-PathIsOrUnder -Anc $_operatorHomeReal", block)
+        self.assertIn("Test-PathIsOrUnder -Anc $_mnemosyneHomeReal", block)
+        self.assertIn("Resolve-TeamMemoryRealPath", block)
+
+    def _note_harness(self, tmp, root, data_link):
+        """The setup snippet plus the real relink-NOTE block, run live."""
+        harness = self._team_memory_harness(tmp, root)
+        start = self.text.index("            if ($isLink) {", self.text.index("Re-run, already a junction"))
+        end = self.text.index("$kind = New-DirLink -LinkPath $dataLink -Target $TeamMemoryHome", start)
+        harness.write_text(harness.read_text() +
+                           f"$dataLink = '{data_link}'\n$isLink = $true\n" + self.text[start:end] + "\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_relink_note_fires_live_for_under_bank_and_mnemosyne_home_links(self):  # r3 #4
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            relocated = Path(tmp) / "relocated-bank"
+            relocated.mkdir()
+            other = Path(tmp) / "other"
+            other.mkdir()
+            cases = [(root / "mnemosyne" / "data", {}, True),
+                     (relocated, {"MNEMOSYNE_HOME": str(relocated)}, True),
+                     (other, {}, False)]
+            for i, (target, env_extra, expect) in enumerate(cases):
+                link = Path(tmp) / f"plink{i}"
+                link.symlink_to(target)
+                harness = self._note_harness(tmp, root, link)
+                proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                      capture_output=True, text=True, timeout=60,
+                                      env={**os.environ, **env_extra})
+                with self.subTest(target=str(target)):
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    note = f"NOTE: {link} was linked to the operator's own bank"
+                    (self.assertIn if expect else self.assertNotIn)(note, proc.stdout)
+
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):

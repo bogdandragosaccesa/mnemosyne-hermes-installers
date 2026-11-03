@@ -353,26 +353,58 @@ PLUGIN_SRC_MNEMO="$HERMES_ROOT/plugins/mnemosyne"
 # points at -- that store is never linked into, read from, or written to by
 # this installer). --team-memory overrides the location.
 
-# Resolves $1 to an absolute path (realpath -m semantics): walks up from
-# $1 to the nearest existing ancestor, resolves THAT via `cd ... && pwd -P`
-# (so a symlink hop in the existing part of the path is followed), then
-# re-appends whatever does not exist yet literally. Used both to make
-# --team-memory absolute before it is ever used (review finding #3: a
-# relative value must not become a dangling relative symlink or a bank
-# created under the cwd) and to resolve the operator bank / MNEMOSYNE_HOME
-# for the containment check below.
+# Resolves $1 to a canonical absolute path with `realpath -m` semantics,
+# in portable bash (macOS has no `realpath -m`). Walks the path one
+# component at a time from `/`:
+#   - empty components (`//`) and `.` are dropped;
+#   - `..` pops the last component of the already-resolved prefix -- which
+#     is always physical, so this is correct both before and after the
+#     first not-yet-existing component (review r3 finding #1: `..` in the
+#     missing suffix used to be appended literally, so
+#     `$HERMES_ROOT/nonexist/../mnemosyne` slipped past the check);
+#   - a component that is a symlink -- live OR dangling, at ANY depth -- is
+#     replaced by its target and the walk continues from there (bounded to
+#     40 hops, so a link cycle fails instead of spinning).
+# The result has no `.`, `..`, `//` or symlink in it. It is used both for the
+# containment check below AND as the literal mkdir/ln target, so the check
+# and the action can never disagree. Returns 1 on a link loop.
 resolve_abs_nearest() {
-    local p="$1" suffix="" cur
-    case "$p" in
-        /*) cur="$p" ;;
-        *)  cur="$PWD/$p" ;;
-    esac
-    while [[ ! -d "$cur" ]]; do
-        suffix="/${cur##*/}$suffix"
-        cur="${cur%/*}"
-        [[ -n "$cur" ]] || cur="/"
+    local p="$1" resolved="" c target hops=0 i=0
+    local -a parts tparts
+    [[ "$p" == /* ]] || p="$PWD/$p"
+    IFS='/' read -r -a parts <<< "$p"
+    while (( i < ${#parts[@]} )); do
+        c="${parts[i]}"
+        i=$((i + 1))
+        case "$c" in
+            ''|.) continue ;;
+            ..)   resolved="${resolved%/*}"; continue ;;
+        esac
+        if [[ -L "$resolved/$c" ]]; then
+            hops=$((hops + 1))
+            if (( hops > 40 )); then
+                echo "Too many levels of symbolic links resolving: $1" >&2
+                return 1
+            fi
+            target="$(readlink -- "$resolved/$c")"
+            # An absolute target restarts from `/`; a relative one is
+            # relative to the directory holding the link ($resolved).
+            [[ "$target" == /* ]] && resolved=""
+            IFS='/' read -r -a tparts <<< "$target"
+            # Splice: the link's target components, then whatever of the
+            # original path is still unprocessed. Built with a loop so an
+            # empty tail is safe under `set -u` on bash 3.2 (macOS).
+            while (( i < ${#parts[@]} )); do
+                tparts[${#tparts[@]}]="${parts[i]}"
+                i=$((i + 1))
+            done
+            parts=("${tparts[@]}")
+            i=0
+        else
+            resolved="$resolved/$c"
+        fi
     done
-    printf '%s' "$(cd "$cur" && pwd -P)$suffix"
+    printf '%s' "${resolved:-/}"
 }
 
 # True if $2 (already resolved) is exactly $1 or nested under it. Called
@@ -384,14 +416,29 @@ path_is_or_under() {
 }
 
 OPERATOR_MNEMO_HOME="$HERMES_ROOT/mnemosyne"
-TEAM_MEMORY_HOME="$(resolve_abs_nearest "${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}")"
-_operator_home_real="$(resolve_abs_nearest "$OPERATOR_MNEMO_HOME")"
+# Every path below is canonical (no `.`, `..`, `//`, symlink): the value
+# checked is byte-for-byte the value later passed to mkdir/ln.
+_resolve_or_die() {
+    resolve_abs_nearest "$1" || { echo "Cannot resolve $2: $1" >&2; exit 2; }
+}
+TEAM_MEMORY_HOME="$(_resolve_or_die "${TEAM_MEMORY:-$HERMES_ROOT/dev-team-mnemosyne}" "--team-memory")" || exit 2
+_operator_home_real="$(_resolve_or_die "$OPERATOR_MNEMO_HOME" "the operator bank")" || exit 2
+_mnemosyne_home_real=""
+if [[ -n "${MNEMOSYNE_HOME:-}" ]]; then
+    _mnemosyne_home_real="$(_resolve_or_die "$MNEMOSYNE_HOME" "MNEMOSYNE_HOME")" || exit 2
+fi
 _team_home_real="$TEAM_MEMORY_HOME"
+# True if $1 (canonical) is, sits inside, or contains either operator
+# location (the operator bank, or MNEMOSYNE_HOME when set).
+touches_operator_bank() {
+    path_is_or_under "$_operator_home_real" "$1" || path_is_or_under "$1" "$_operator_home_real" ||
+        { [[ -n "$_mnemosyne_home_real" ]] &&
+          { path_is_or_under "$_mnemosyne_home_real" "$1" || path_is_or_under "$1" "$_mnemosyne_home_real"; }; }
+}
 _team_memory_refusal=""
 if path_is_or_under "$_operator_home_real" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_operator_home_real"; then
     _team_memory_refusal="the operator's own bank ($OPERATOR_MNEMO_HOME)"
-elif [[ -n "${MNEMOSYNE_HOME:-}" ]]; then
-    _mnemosyne_home_real="$(resolve_abs_nearest "$MNEMOSYNE_HOME")"
+elif [[ -n "$_mnemosyne_home_real" ]]; then
     if path_is_or_under "$_mnemosyne_home_real" "$_team_home_real" || path_is_or_under "$_team_home_real" "$_mnemosyne_home_real"; then
         _team_memory_refusal="MNEMOSYNE_HOME ($MNEMOSYNE_HOME)"
     fi
@@ -836,11 +883,13 @@ for i in "${!NAMES[@]}"; do
             say "  would link: $profile_dir/mnemosyne -> $TEAM_MEMORY_HOME"
         elif [[ -L "$profile_dir/mnemosyne" ]]; then
             # Re-run, already a link. If an older installer pointed it at
-            # the operator's own bank, say so: the operator loses this
-            # profile's access to those memories by repointing, even though
-            # the operator bank itself is untouched (review finding #6).
-            _prev_link_target="$(readlink -f -- "$profile_dir/mnemosyne" 2>/dev/null || true)"
-            if [[ -n "$_prev_link_target" && "$_prev_link_target" == "$_operator_home_real" ]]; then
+            # the operator's own bank -- $HERMES_ROOT/mnemosyne or
+            # MNEMOSYNE_HOME, the bank itself, a path inside it, or a
+            # directory containing it (r3 review finding #4) -- say so: the
+            # operator loses this profile's access to those memories by
+            # repointing, even though the operator bank itself is untouched.
+            _prev_link_target="$(resolve_abs_nearest "$profile_dir/mnemosyne" 2>/dev/null || true)"
+            if [[ -n "$_prev_link_target" ]] && touches_operator_bank "$_prev_link_target"; then
                 say "  NOTE: $profile_dir/mnemosyne was linked to the operator's own bank;"
                 say "        repointing to the team bank. The operator's bank is untouched,"
                 say "        but this profile loses access to memories only there."
