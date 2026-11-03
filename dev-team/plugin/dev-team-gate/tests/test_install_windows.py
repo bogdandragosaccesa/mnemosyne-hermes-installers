@@ -668,25 +668,37 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_N3_profile_dirs_scan_refuses_a_non_team_profile_directory(self):
-        # N3 (review): $ProfileDirs (as passed to Get-UnsafeOldHomeReason)
-        # must include every directory under $HermesRoot\profiles, not only
-        # the $Prefix$role ones the installer's own role loop scans for
-        # live dev-team junctions -- so a candidate equal to an unrelated,
-        # non-team profile directory (e.g. profiles/t14-other) is refused
-        # too, matching the Unix installer's behaviour.
+        # N3 (review r2): the earlier name check in Get-UnsafeOldHomeReason
+        # already refuses any candidate not literally named "dev-team", so
+        # a candidate like profiles/t14-other is refused by THAT check
+        # before the ProfileDirs loop ever runs -- it does not actually
+        # exercise acceptance criterion 2. The only candidate that can
+        # reach the ProfileDirs loop is one literally named "dev-team":
+        # here, a decoy *profile* directory at profiles/dev-team (not the
+        # real new team home, which lives at $HermesRoot\dev-team),
+        # reached through another profile's dev-team junction -- exactly
+        # the "migrating it would move a whole profile" case N3 exists to
+        # stop. Only Get-AllProfileDirs feeding the ProfileDirs loop can
+        # refuse this: the earlier name check passes (its name IS
+        # "dev-team") and the DevTeamHome-equality check passes too (it is
+        # not that path). Reviewer probe: fixed code -> OUTCOME=invalid
+        # with "equals or contains profile directory"; mutant A
+        # (`foreach ($pd in @())`, i.e. the loop disabled) -> OUTCOME=move.
         with tempfile.TemporaryDirectory() as tmp:
             hermes_root = Path(tmp) / "hermes"
-            new = hermes_root / "dev-team"
-            other_profile = hermes_root / "profiles" / "t14-other"
-            other_profile.mkdir(parents=True)
+            new = hermes_root / "dev-team"  # the real, correct new team home
+            decoy = hermes_root / "profiles" / "dev-team"  # a DIFFERENT path, same leaf name
+            decoy.mkdir(parents=True)
+            (decoy / "deciders-ledger.jsonl").write_text("decoy-ledger")
             (hermes_root / "profiles" / "dev-pm").mkdir(parents=True)
             harness = self._profile_dirs_harness(tmp)
             with harness.open("a") as f:
                 f.write(
-                    # dev-pm's dev-team junction happens to point at the
-                    # unrelated t14-other profile directory -- a
-                    # misconfiguration, not a real old team home.
-                    "$candidates = @{ 'dev-pm' = '" + str(other_profile) + "' }\n"
+                    # dev-pm's dev-team junction happens to point at a
+                    # *profile* directory that is itself literally named
+                    # "dev-team" -- a misconfiguration, not the real team
+                    # home, and not something the name check alone catches.
+                    "$candidates = @{ 'dev-pm' = '" + str(decoy) + "' }\n"
                     f"$allDirs = Get-AllProfileDirs -HermesRoot '{hermes_root}'\n"
                     f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' "
                     "-CandidateTargets $candidates "
@@ -697,8 +709,30 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("OUTCOME=invalid", proc.stdout)
-            self.assertIn(str(other_profile), proc.stdout)
+            self.assertIn("equals or contains profile directory", proc.stdout)
+            self.assertIn(str(decoy), proc.stdout)
             self.assertFalse(new.exists())
+
+    def test_N3_call_site_sets_profile_dirs_from_get_all_profile_dirs_and_never_appends(self):
+        # N3 (review r2): acceptance criterion 1 -- the main body's call
+        # site (~line 871) must set $ProfileDirs from Get-AllProfileDirs,
+        # not only the role loop's $Prefix$role scan -- had no test at
+        # all, so mutant B ($ProfileDirs = @() at the call site) survived
+        # every other test. This script has no harness for a full run, so
+        # a source check is used instead (matching this file's existing
+        # static-check tests, e.g. test_team_bank_is_a_dedicated_directory...).
+        self.assertRegex(
+            self.text, r"\$ProfileDirs\s*=\s*Get-AllProfileDirs\s+-HermesRoot\s+\$HermesRoot",
+            "main body does not set $ProfileDirs from Get-AllProfileDirs -HermesRoot $HermesRoot")
+        self.assertNotIn("$ProfileDirs = @()", self.text,
+                         "main body still resets $ProfileDirs to an empty array (mutant B)")
+        self.assertNotIn("$ProfileDirs +=", self.text,
+                         "main body appends to $ProfileDirs instead of relying on the full scan")
+        # Exactly one assignment to $ProfileDirs in the whole file (the
+        # call site itself) -- anything else is either the mutant or a
+        # second, conflicting assignment.
+        self.assertEqual(len(re.findall(r"^\$ProfileDirs\s*=", self.text, re.MULTILINE)), 1,
+                         "expected exactly one top-level $ProfileDirs assignment")
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_D4_root_link_target_is_treated_as_an_old_home_candidate(self):
