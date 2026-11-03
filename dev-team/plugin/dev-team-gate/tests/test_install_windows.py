@@ -98,6 +98,65 @@ class WindowsInstallerTests(unittest.TestCase):
                  "adopted directory is not moved aside as a backup")
         self.has("out of scope", self.text, "no out-of-scope note for merging old memories")
 
+    def _profile_dir_guard_harness(self, tmp, hermes_root, profile_dir, plugin_src_mnemo):
+        """F2 (review r3): the real per-profile-loop prefix, from
+        $profileDir's assignment through the plugins\\mnemosyne link --
+        the same slice of the real script, not a reimplementation of its
+        logic -- so this proves the canonicalisation check now runs
+        before SOUL, the prefix file, AND the plugin link (which used to
+        run New-DirLink -- a Remove-Item -Recurse branch for a real
+        directory target -- before the check ever fired)."""
+        helpers_start = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        helpers_end = self.text.index("# Team state (forge project records")
+        helpers = self.text[helpers_start:helpers_end]
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        dirlink_fn = _function(self.text, "New-DirLink")
+        loop_start = self.text.index("    # F2 (review r3): canonicalise $profileDir")
+        loop_end = self.text.index("# The plugin link above shares Mnemosyne's")
+        loop_body = self.text[loop_start:loop_end]
+        harness = Path(tmp) / "profile_dir_guard.ps1"
+        harness.write_text(
+            f"$HermesRoot = '{hermes_root}'\n$TeamMemory = $null\n"
+            + norm_fn + "\n" + dirlink_fn + "\n" + helpers +
+            f"\n$name = 'dev-qa'\n$profileDir = '{profile_dir}'\n"
+            f"$KeepSoul = $false\n$DryRun = $false\n$soul = '{hermes_root}\\SOUL.md'\n"
+            f"$Prefix = 'dev-'\n$PluginSrcMnemo = '{plugin_src_mnemo}'\n"
+            + loop_body + "\nWrite-Output 'REACHED_PLUGIN_LINK'\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_profile_dir_guard_runs_before_soul_prefix_and_plugin_link(self):  # F2
+        """Reviewer's repro: profiles\\dev-qa -> $HermesRoot, no
+        -AdoptTeamMemory. Before this fix the canonicalisation check only
+        ran inside Invoke-MnemosyneDataLink -- called AFTER the SOUL
+        copy, the prefix write, and the plugins\\mnemosyne New-DirLink
+        (whose Remove-Item -Recurse branch deleted the operator's real
+        plugin directory in this exact layout under PS 5.1)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            (root / "SOUL.md").write_text("operator soul\n")
+            before_soul = (root / "SOUL.md").read_bytes()
+            plugin_src = Path(tmp) / "mnemosyne-plugin-src"
+            plugin_src.mkdir()
+            (plugin_src / "marker.txt").write_text("plugin code\n")
+            profiles_dir = root / "profiles"
+            profiles_dir.mkdir()
+            evil_profile = profiles_dir / "dev-qa"
+            evil_profile.symlink_to(root)
+            harness = self._profile_dir_guard_harness(tmp, root, evil_profile, plugin_src)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("outside", proc.stderr)
+            self.assertNotIn("REACHED_PLUGIN_LINK", proc.stdout)
+            self.assertEqual((root / "SOUL.md").read_bytes(), before_soul,
+                              "operator SOUL.md must be byte-identical")
+            self.assertFalse((root / "dev-team-prefix").exists(),
+                              "dev-team-prefix must not have been written to the operator root")
+            self.assertFalse((root / "plugins").exists(),
+                              "plugins\\mnemosyne link must never have been attempted")
+
     def test_I5_never_tells_the_operator_to_use_a_plaintext_env_file(self):
         # Both the dry-run and real-run key notes used to say "add
         # OPENROUTER_DECIDERS_KEY to each profile's .env". Checks the
@@ -1050,21 +1109,64 @@ class WindowsTeamMemoryTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_team_memory_refuses_mnemosyne_data_dir_user_scope_value(self):  # D1
-        # The Windows Mnemosyne installer persists a relocated bank as a
-        # User-scope environment variable (no live session variable
-        # needed for a NEW process to see it) -- simulate that by reading
-        # it back with the same [Environment]::GetEnvironmentVariable
-        # call the installer uses, redirected to a throwaway registry-like
-        # store is not practical in a unit test, so this checks the
-        # fallback branch exists and is wired to the refusal, via the
-        # static source check below plus the live env-var path above
-        # (same code path, 'User' is just a different GetEnvironmentVariable
-        # scope argument that cannot be faked without the real registry).
-        body = _function(self.text, "Test-TouchesOperatorBank")
+        """Genuinely behavioural attempt first (review r3 nit: this used
+        to be a pure source-text check): set the decoy path as a real
+        User-scope env var via [Environment]::SetEnvironmentVariable and
+        run the harness unmodified, so the installer's own
+        `[Environment]::GetEnvironmentVariable('MNEMOSYNE_DATA_DIR',
+        'User')` call (install-dev-team-windows.ps1 near
+        `_mnemosyneDataDirRaw`) picks it up for real -- exactly what a
+        relocated Windows Mnemosyne install leaves behind.
+
+        Non-Windows pwsh (what this suite and CI's Linux dev-team.yml
+        jobs run under) does not implement persistent User-scope
+        variables: confirmed by probe --
+        `[Environment]::SetEnvironmentVariable($k, $v, 'User')` followed
+        immediately by `[Environment]::GetEnvironmentVariable($k,
+        'User')` in the same process comes back empty, not $v, with no
+        exception raised. This test detects that round-trip failure and
+        skips with an explicit reason instead of reporting a false pass;
+        it does not silently fall back to a source check, because a
+        source check proves the wiring exists but not that it works --
+        see test_team_memory_data_dir_user_scope_is_wired_to_the_refusal
+        below for that weaker, always-on guarantee."""
+        marker = "MNEMOSYNE_DATA_DIR"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root_with_operator_bank(tmp)
+            decoy = Path(tmp) / "decoy-data-dir"
+            decoy.mkdir()
+            probe = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                 f"[Environment]::SetEnvironmentVariable('{marker}', '{decoy}', 'User'); "
+                 f"Write-Output ([Environment]::GetEnvironmentVariable('{marker}', 'User')); "
+                 f"[Environment]::SetEnvironmentVariable('{marker}', $null, 'User')"],
+                capture_output=True, text=True, timeout=30)
+            if probe.stdout.strip() != str(decoy):
+                self.skipTest(
+                    "this pwsh does not persist User-scope environment variables "
+                    f"(set {decoy!s} then read back {probe.stdout.strip()!r}); a real "
+                    "Windows PowerShell 5.1/7 host is needed to exercise this behaviourally")
+            try:
+                proc = self._run_harness(tmp, root, decoy)
+                self._assert_refused(proc, needle="MNEMOSYNE_DATA_DIR")
+            finally:
+                subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                     f"[Environment]::SetEnvironmentVariable('{marker}', $null, 'User')"],
+                    capture_output=True, text=True, timeout=30)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_data_dir_user_scope_is_wired_to_the_refusal(self):  # D1
+        # The behavioural test above is skipped on every non-Windows pwsh
+        # this suite has access to (confirmed: User-scope env vars are a
+        # no-op there). This static check is the fallback it names: it
+        # proves the User-scope read is wired into the same refusal path
+        # as the live env-var case tested above, even though it cannot
+        # prove the read itself works on a real Windows host.
         source_text = self.text[max(0, self.text.index("_mnemosyneDataDirRaw") - 400):
                                  self.text.index("_mnemosyneDataDirRaw") + 400]
         self.assertIn("GetEnvironmentVariable('MNEMOSYNE_DATA_DIR', 'User')", source_text)
-        self.assertIn("_mnemosyneDataDirReal", body)
+        self.assertIn("_mnemosyneDataDirReal", source_text)
 
     # --- D5: -TeamMemory inside profiles\ or dev-team\ breaks every link
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
@@ -1320,6 +1422,7 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
             self.assertIn("RESULT_UNSHARED=True", proc.stdout)
             env_file = profile_dir / ".env"
             self.assertIn(f"MNEMOSYNE_DATA_DIR={profile_dir / 'mnemosyne' / 'data'}", env_file.read_text())
+            self.assertIn(f"MNEMOSYNE_HOME={profile_dir / 'mnemosyne'}", env_file.read_text())  # F1 (review r3)
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_separate_memory_path_links_and_pins_the_team_bank(self):
@@ -1346,6 +1449,7 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
             # checked below.
             env_file = profile_dir / ".env"
             self.assertIn(f"MNEMOSYNE_DATA_DIR={root / 'dev-team-mnemosyne' / 'data'}", env_file.read_text())
+            self.assertIn(f"MNEMOSYNE_HOME={root / 'dev-team-mnemosyne'}", env_file.read_text())  # F1 (review r3)
 
 
 class WorkflowTests(unittest.TestCase):

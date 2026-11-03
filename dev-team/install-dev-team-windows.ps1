@@ -913,6 +913,15 @@ if ($_teamMemoryRefusal) {
     [Console]::Error.WriteLine("-TeamMemory must not point at, be nested in, or contain $_teamMemoryRefusal.")
     exit 2
 }
+# F1 (review r3): also pin MNEMOSYNE_HOME alongside MNEMOSYNE_DATA_DIR.
+# MNEMOSYNE_DATA_DIR only steers the CLI (mnemosyne/cli.py:20-23) and
+# call-time modules (core/banks.py, core/triples.py, core/canonical.py,
+# core/media.py); it does NOT steer the MCP shared-surface DB or
+# federation, which both read MNEMOSYNE_HOME directly
+# (mnemosyne/mcp_tools.py:167-173, core/fleet_census.py:149-155,
+# core/federation_handshake.py:263-267, mcp_server.py:799). An inherited
+# MNEMOSYNE_HOME therefore still leaked the operator's shared-surface DB
+# path into a dev-team profile even after MNEMOSYNE_DATA_DIR was pinned.
 # D1: pin this profile's own Mnemosyne data directory into its own .env
 # (see Set-MnemosyneDataDirPin below, called once per profile) so an
 # inherited MNEMOSYNE_DATA_DIR from the launching shell, the gateway, or
@@ -920,19 +929,24 @@ if ($_teamMemoryRefusal) {
 # bank this installer just linked. hermes_cli/env_loader.py:502-562
 # (load_hermes_dotenv) loads a profile's own .env with override=True
 # specifically because "a profile's .env overrides stale shell exports".
-function Set-MnemosyneDataDirPin {
-    param([string] $ProfileDir, [string] $DataDir)
-    if ($DryRun) {
-        Write-Host "  would pin in .env: MNEMOSYNE_DATA_DIR=$DataDir"
-        return
-    }
+function Set-EnvVarPin {
+    <# Rewrite a single VAR=value line in a profile's .env, preserving
+       every other line, via Get-Content/Set-Content line comparison
+       (never a regex substitution built from the value itself, so a
+       bank path containing regex-special characters is written
+       verbatim -- same concern F4 raised for the Unix sed version). #>
+    param([string] $ProfileDir, [string] $VarName, [string] $Value)
     New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
     $envFile = Join-Path $ProfileDir '.env'
-    $line = "MNEMOSYNE_DATA_DIR=$DataDir"
+    $line = "$VarName=$Value"
+    $prefix = "$VarName="
     if (Test-Path -LiteralPath $envFile) {
-        $existingLines = Get-Content -LiteralPath $envFile
-        if ($existingLines -match '^MNEMOSYNE_DATA_DIR=') {
-            $newLines = $existingLines | ForEach-Object { if ($_ -match '^MNEMOSYNE_DATA_DIR=') { $line } else { $_ } }
+        $existingLines = @(Get-Content -LiteralPath $envFile)
+        $found = $false
+        $newLines = $existingLines | ForEach-Object {
+            if ($_.StartsWith($prefix)) { $found = $true; $line } else { $_ }
+        }
+        if ($found) {
             Set-Content -LiteralPath $envFile -Value $newLines
         } else {
             Add-Content -LiteralPath $envFile -Value $line
@@ -940,6 +954,19 @@ function Set-MnemosyneDataDirPin {
     } else {
         Set-Content -LiteralPath $envFile -Value $line
     }
+}
+function Set-MnemosyneDataDirPin {
+    param([string] $ProfileDir, [string] $DataDir)
+    # F1: DataDir is always "<bank>\data" at every call site, so its
+    # parent is exactly the bank root MNEMOSYNE_HOME must name.
+    $homeDir = Split-Path -Parent $DataDir
+    if ($DryRun) {
+        Write-Host "  would pin in .env: MNEMOSYNE_DATA_DIR=$DataDir"
+        Write-Host "  would pin in .env: MNEMOSYNE_HOME=$homeDir"
+        return
+    }
+    Set-EnvVarPin -ProfileDir $ProfileDir -VarName 'MNEMOSYNE_DATA_DIR' -Value $DataDir
+    Set-EnvVarPin -ProfileDir $ProfileDir -VarName 'MNEMOSYNE_HOME' -Value $homeDir
 }
 # Team state (forge project records, team clones) must be visible to every
 # role: devops writes the project record at onboarding, pr-ci reads it to
@@ -1294,6 +1321,26 @@ foreach ($role in $Profiles.Keys) {
         $profileDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $name 'config' 'path'))
     }
 
+    # F2 (review r3): canonicalise $profileDir itself FIRST, before SOUL,
+    # the prefix file, or any link -- not just before the mnemosyne\ link
+    # as D2 originally had it (that check lived inside
+    # Invoke-MnemosyneDataLink, called further down). Windows is worse
+    # than Unix here: step 4's New-DirLink on plugins\mnemosyne takes a
+    # Remove-Item -Recurse branch when the target is a real directory,
+    # which deleted the operator's actual plugin directory in the
+    # reviewer's repro (profiles\dev-qa -> $HermesRoot) before the old,
+    # later check ever ran.
+    $profileDirReal = $null
+    try { $profileDirReal = Resolve-TeamMemoryRealPath $profileDir } catch {
+        [Console]::Error.WriteLine("Cannot resolve $name's profile directory: $profileDir")
+        exit 1
+    }
+    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
+            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$name's profile directory ($profileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+        exit 1
+    }
+
     # 2. SOUL
     if ($KeepSoul -and (Test-Path -LiteralPath (Join-Path $profileDir 'SOUL.md'))) {
         Write-Host '  SOUL.md kept (-KeepSoul)'
@@ -1320,6 +1367,13 @@ foreach ($role in $Profiles.Keys) {
             Invoke-MnemosyneDataLink -ProfileDir $profileDir -Name $name -Exists $exists `
                 -TeamMemoryHome $TeamMemoryHome -AdoptTeamMemory:$AdoptTeamMemory -AdoptTimestamp $AdoptTimestamp `
                 -DryRun:$true -HermesRootProfilesReal $HermesRootProfilesReal | Out-Null
+        } else {
+            # F3 (review r3): Unix's -separate-memory pins the private
+            # path in .env too (install-dev-team-unix.sh's final `else`
+            # branch); -SeparateMemory must do the same, or a User-scope
+            # MNEMOSYNE_DATA_DIR/MNEMOSYNE_HOME still reaches a
+            # "separate" profile's CLI and call-time modules.
+            Set-MnemosyneDataDirPin -ProfileDir $profileDir -DataDir (Join-Path $profileDir 'mnemosyne\data')
         }
         Write-Host "  would link: $profileDir\plugins\dev-team-gate -> $PluginSrcGate"
         Write-Host "  would run:  hermes -p $name config set model.default ..."
@@ -1371,6 +1425,9 @@ foreach ($role in $Profiles.Keys) {
                 if ($_.Adopted)  { $adopted  += $name }
                 if ($_.Unshared) { $unshared += $name }
             }
+    } else {
+        # F3 (review r3): see the DryRun branch above for why.
+        Set-MnemosyneDataDirPin -ProfileDir $profileDir -DataDir (Join-Path $profileDir 'mnemosyne\data')
     }
 
     # 4. dev-team-gate link (enabled in step 6, after the model is set).
