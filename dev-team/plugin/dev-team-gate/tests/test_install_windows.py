@@ -1204,6 +1204,11 @@ class WindowsTeamMemoryTests(unittest.TestCase):
                 ["unshare", "--mount", "--map-root-user", "--propagation", "private", "bash", "-c", script],
                 capture_output=True, text=True, timeout=60)
         if proc.returncode == 99 or "cannot create snap home dir" in proc.stderr:
+            # Not the a1f3afb probe's job: the probe proves unprivileged
+            # bind mounts work, but a snap-confined pwsh (this dev box's
+            # /snap/bin/pwsh) still cannot start inside that mount
+            # namespace, and only launching it shows that. On CI runners the
+            # decorator's probe already skips (user namespaces forbidden).
             self.skipTest("unprivileged bind mount + snap-confined pwsh unavailable in this sandbox")
         self._assert_refused(proc)
 
@@ -1470,7 +1475,9 @@ class WorkflowTests(unittest.TestCase):
         self.has("shell: powershell", job, "not run on Windows PowerShell 5.1")
         self.assertFalse("shell: pwsh" in job, "uses pwsh, not 5.1")
         self.assertEqual(job.count("install-dev-team-windows.ps1"), 2, "installer not run twice")
-        self.has("mnemosyne.db", job, "no Mnemosyne DB check")
+        # The DB/link checks moved into a script the unit suite executes
+        # (test_ci_team_bank_checks.py, PR #8 fix round 4 C1-C4).
+        self.has("check-team-bank.ps1", job, "no team-bank / Mnemosyne DB check")
         self.has("dev-team-gate\\guard.py", job, "no guard.py check")
 
     def test_windows_powershell_51_job_tests_junction_based_migration(self):
@@ -1497,7 +1504,9 @@ class WorkflowTests(unittest.TestCase):
     def test_linux_job_asserts_first_run_exit_0_and_team_mnemosyne_links(self):
         job = self.job("install-linux")
         self.has("first run must exit 0", job, "no first-run exit check")
-        self.has("is not a symlink to the team bank", job, "no team-bank link check")
+        self.has("check-team-bank.sh", job, "no team-bank link check")
+        script = (WORKFLOW.parent.parent / "scripts" / "check-team-bank.sh").read_text(encoding="utf-8")
+        self.has("is not a symlink to the team bank", script, "team-bank check lost its link assertion")
 
     def test_linux_job_runs_dry_run_and_only(self):
         job = self.job("install-linux")

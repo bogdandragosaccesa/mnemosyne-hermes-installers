@@ -86,24 +86,21 @@ jobs:
       - name: every dev-* profile links the team-only Mnemosyne bank
         # Brief item 10: profiles this installer creates share one bank --
         # the TEAM bank ($HERMES_ROOT/dev-team-mnemosyne), never the
-        # operator's own ($HERMES_ROOT/mnemosyne). dev-team-next Task 2
-        # moved the default target; this must also fail if the two banks
-        # ever resolve to the same place.
+        # operator's own ($HERMES_ROOT/mnemosyne). The check lives in a
+        # script so the unit suite can run it (test_ci_team_bank_checks.py):
+        # it fails if the banks resolve to each other or any profile's link
+        # resolves anywhere but the team bank, then creates the team DB
+        # through dev-architect's own .env pins (nothing in an install
+        # creates it -- red run 41632104823) and requires it to land in the
+        # team bank with the operator's DB unchanged.
         run: |
           root="$(dirname "$(hermes config path)")"
-          shared="$(cd "$root/dev-team-mnemosyne" && pwd -P)"
-          if [ -e "$root/mnemosyne" ] && [ "$shared" = "$(cd "$root/mnemosyne" && pwd -P)" ]; then
-            echo "::error::the team bank resolves to the operator's own bank ($root/mnemosyne)" >&2
-            exit 1
-          fi
+          profiles=()
           for role in pm architect uiux backend-db frontend qa reviewer devops; do
-            dir="$(dirname "$(hermes -p "dev-$role" config path)")"
-            if [ ! -L "$dir/mnemosyne" ] || [ "$(cd "$dir/mnemosyne" && pwd -P)" != "$shared" ]; then
-              echo "::error::dev-$role: $dir/mnemosyne is not a symlink to the team bank $shared" >&2
-              exit 1
-            fi
+            profiles+=("dev-$role=$(dirname "$(hermes -p "dev-$role" config path)")")
           done
-          test -f "$shared/data/mnemosyne.db" || { echo "::error::team Mnemosyne DB missing" >&2; exit 1; }
+          bash .github/scripts/check-team-bank.sh --root "$root" \
+            --cli "$HOME/.mnemosyne-venv/bin/mnemosyne" --init dev-architect "${profiles[@]}"
 
       - name: every dev-* profile records its team prefix
         run: |
@@ -290,20 +287,27 @@ jobs:
         shell: powershell
         run: |
           $root = Split-Path -Parent (hermes config path | Select-Object -Last 1)
-          # The team-only bank (dev-team-next Task 2), never the operator's own.
-          $db = Join-Path $root 'dev-team-mnemosyne\data\mnemosyne.db'
-          if (-not (Test-Path -LiteralPath $db)) { Write-Error "team Mnemosyne DB is gone: $db"; exit 1 }
-          $operatorDb = Join-Path $root 'mnemosyne\data\mnemosyne.db'
-          if ((Test-Path -LiteralPath $operatorDb) -and ((Resolve-Path -LiteralPath $db).Path -eq (Resolve-Path -LiteralPath $operatorDb).Path)) {
-            Write-Error "the team bank resolves to the operator's own bank: $operatorDb"; exit 1
-          }
           $guard = Join-Path $env:GITHUB_WORKSPACE 'dev-team\plugin\dev-team-gate\guard.py'
           if (-not (Test-Path -LiteralPath $guard)) { Write-Error "plugin source is gone: $guard"; exit 1 }
+          $profileDirs = @()
           foreach ($role in 'pm','architect','uiux','backend-db','frontend','qa','reviewer','devops') {
             $dir = Split-Path -Parent (hermes -p "dev-$role" config path | Select-Object -Last 1)
             $linked = Join-Path $dir 'plugins\dev-team-gate\guard.py'
             if (-not (Test-Path -LiteralPath $linked)) { Write-Error "dev-$role : $linked missing"; exit 1 }
-            if (-not (Test-Path -LiteralPath (Join-Path $dir 'mnemosyne\data\mnemosyne.db'))) {
-              Write-Error "dev-$role : team Mnemosyne DB not reachable through the link"; exit 1
-            }
+            $profileDirs += "dev-$role=$dir"
           }
+          # The team-only bank (dev-team-next Task 2), never the operator's
+          # own. The check lives in a script the unit suite runs under pwsh
+          # (test_ci_team_bank_checks.py). It compares REAL link targets (C2:
+          # Resolve-Path follows no junction), requires every profile's link
+          # to resolve to the team bank (C3), and creates the team DB through
+          # dev-architect's own .env pins before requiring it (C1: nothing in
+          # an install creates it -- red run 41632104823). dev-pm was made by
+          # `hermes profile create --clone` before the installer ran, so it
+          # keeps its own real bank by design (no -AdoptTeamMemory here):
+          # asserted as private, not shared (C4).
+          $cli = Join-Path $env:USERPROFILE '.mnemosyne-venv\Scripts\mnemosyne.exe'
+          & (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\check-team-bank.ps1') `
+            -HermesRoot $root -MnemosyneCli $cli -InitProfile 'dev-architect' `
+            -ProfileDir $profileDirs -PrivateProfile @('dev-pm')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
