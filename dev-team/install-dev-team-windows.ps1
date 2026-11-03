@@ -840,8 +840,63 @@ function Test-PathIsOrUnder {
     $sep = [System.IO.Path]::DirectorySeparatorChar
     return $Desc.StartsWith("$Anc$sep", [System.StringComparison]::OrdinalIgnoreCase)
 }
+function Get-EnvUnsafeValueReason {
+    <# review r3 minor #4 (round 2): the pin format decided for the .env
+       writer is unquoted KEY=value (Set-EnvVarPin, below) -- NOT
+       python-dotenv's single-quote-escaped format, which does not round-
+       trip through Mnemosyne's own .env reader (mcp_server.py
+       :_load_dotenv, ~823-833: `v.strip().strip("'\"")`, which strips a
+       bounding quote character but never unescapes `\\` or `\'`, so an
+       escaped value comes back corrupted there). Unquoted values read
+       back byte-exact through BOTH readers except for the shapes below,
+       so refuse those up front instead of silently writing a value
+       either reader would misread:
+         - a newline (CR or LF) -- would split into more than one .env line;
+         - leading/trailing whitespace -- Mnemosyne's reader strips it,
+           python-dotenv's parser does not, so the two readers would
+           disagree on the stored value;
+         - a leading/trailing quote character (' or ") -- Mnemosyne's
+           reader strips exactly one bounding pair, python-dotenv's does
+           not unless the whole value is quoted, so the two disagree;
+         - whitespace immediately followed by '#' -- python-dotenv's
+           parser truncates there (`/t/x #y` becomes `/t/x`); Mnemosyne's
+           naive reader does not;
+         - a literal '${' -- python-dotenv (via env_loader's
+           _resolve_dotenv_assignments) expands `${VAR}` in an unquoted
+           value (review r3 round-2 coverage finding: `'C:\a\${HOME}\b'`
+           comes back as `'C:\a\/home/<user>\b'` there), while
+           Mnemosyne's reader does not expand it at all and returns the
+           value verbatim; the two readers would disagree.
+       Returns $null when $Value is safe, otherwise a human-readable
+       reason. #>
+    param([string] $Value)
+    if ($Value -match "`r|`n") { return 'contains a newline' }
+    if ($Value -match '^\s' -or $Value -match '\s$') { return 'starts or ends with whitespace' }
+    if ($Value.Length -gt 0) {
+        $first = $Value.Substring(0, 1)
+        $last = $Value.Substring($Value.Length - 1, 1)
+        if ($first -eq "'" -or $first -eq '"' -or $last -eq "'" -or $last -eq '"') {
+            return 'starts or ends with a quote character'
+        }
+    }
+    if ($Value -match '\s#') { return "contains whitespace immediately followed by '#'" }
+    if ($Value.Contains('${')) { return 'contains a literal ${' }
+    return $null
+}
 $OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
 $rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
+# F4a (review r3 minor #4, round 2 operator decision): refuse, rather than
+# silently mis-pin, a -TeamMemory value that python-dotenv's real parser and
+# Mnemosyne's own naive .env reader would not both read back identically.
+# Same rule as the Unix installer (quote_env_value was reverted there to
+# this same unquoted-with-refusal rule per the same decision). Checked on
+# the raw argument, before path resolution, so this fires even when the
+# value can't be resolved to a real path at all.
+$_teamMemoryUnsafeReason = Get-EnvUnsafeValueReason $rawTeamMemoryHome
+if ($_teamMemoryUnsafeReason) {
+    [Console]::Error.WriteLine("-TeamMemory $_teamMemoryUnsafeReason; it would not read back identically from .env. Pick a path without that.")
+    exit 2
+}
 # Every path below is canonical (no '.', '..', repeated separator, link or
 # junction anywhere on it): the value checked is the value later passed to
 # New-Item / New-DirLink.
@@ -864,6 +919,28 @@ try {
     $HermesRootDevTeamReal  = Resolve-TeamMemoryRealPath (Join-Path $HermesRoot 'dev-team')
 } catch {
     [Console]::Error.WriteLine("-TeamMemory: cannot resolve the path: $($_.Exception.Message)")
+    exit 2
+}
+# F4a round-3 (reviewer repro): the refusal above (line 888) only checked
+# the RAW -TeamMemory argument. A symlink/junction whose target contains
+# an unsafe shape, or a relative argument resolved under a cwd/
+# $HermesRoot that contains one, passed that check untouched and was
+# pinned anyway -- Set-EnvVarPin writes the RESOLVED $TeamMemoryHome
+# (used below at the Set-MnemosyneDataDirPin call sites), not the raw
+# string. Check the resolved value too, right after the resolve block
+# and before any side effect (New-Item, Set-EnvVarPin, etc. all happen
+# later). Also check $HermesRootProfilesReal: every profile-local pin
+# (Set-MnemosyneDataDirPin -ProfileDir $profileDir/-DataDir ...) derives
+# its path from $HermesRoot\profiles, so an unsafe $HermesRoot pins an
+# unsafe value even when -TeamMemory itself is perfectly safe.
+$_teamMemoryHomeUnsafeReason = Get-EnvUnsafeValueReason $TeamMemoryHome
+if ($_teamMemoryHomeUnsafeReason) {
+    [Console]::Error.WriteLine("-TeamMemory resolves to a path that $_teamMemoryHomeUnsafeReason; it would not read back identically from .env. Pick a path (or, if it's a link, a link target) without that.")
+    exit 2
+}
+$_hermesRootProfilesUnsafeReason = Get-EnvUnsafeValueReason $HermesRootProfilesReal
+if ($_hermesRootProfilesUnsafeReason) {
+    [Console]::Error.WriteLine("`$HermesRoot\profiles ($HermesRootProfilesReal) $_hermesRootProfilesUnsafeReason; profile-local Mnemosyne pins derived from it would not read back identically from .env.")
     exit 2
 }
 $_teamHomeReal = $TeamMemoryHome
@@ -931,28 +1008,66 @@ if ($_teamMemoryRefusal) {
 # specifically because "a profile's .env overrides stale shell exports".
 function Set-EnvVarPin {
     <# Rewrite a single VAR=value line in a profile's .env, preserving
-       every other line, via Get-Content/Set-Content line comparison
-       (never a regex substitution built from the value itself, so a
-       bank path containing regex-special characters is written
-       verbatim -- same concern F4 raised for the Unix sed version). #>
+       every other line byte-exact, via a read/compare/write that goes
+       through [IO.File]::ReadAllLines/WriteAllLines with an explicit
+       UTF8Encoding($false) -- never Get-Content/Set-Content/Add-Content
+       with no -Encoding, and never a regex substitution built from the
+       value itself (so a bank path containing regex-special characters
+       is written verbatim -- same concern F4 raised for the Unix sed
+       version).
+       On Windows PowerShell 5.1 (the CI target) those cmdlets default to
+       the ANSI code page with no -Encoding: that both garbles a
+       non-ASCII bank path on write (review r3 minor #1 -- a non-ASCII
+       path would turn into '?' bytes, Hermes would then open a fresh,
+       empty DB there) and misreads an already-non-ASCII existing line (a
+       `--clone`d operator .env) back into memory before this function
+       rewrites the file. 5.1 also has no `utf8NoBOM` value for
+       -Encoding, so even an explicit `-Encoding UTF8` there would add a
+       BOM; Hermes' own loader tolerates a UTF-8 BOM
+       (hermes_cli/env_loader.py opens with `encoding="utf-8-sig"`), but
+       writing none is the simpler invariant and matches what Hermes
+       itself writes. [IO.File]::ReadAllLines auto-detects a BOM already
+       on disk and otherwise falls back to the UTF-8 encoding passed in,
+       so a pre-existing BOM-less UTF-8 file (what this function always
+       writes) decodes correctly either way.
+
+       Accepted lossy case (round-1 review coverage #4): ReadAllLines /
+       WriteAllLines normalise line terminators to Environment.NewLine
+       and drop an EOF trailing-newline difference, and any byte that is
+       not valid UTF-8 in a pre-existing .env (e.g. an ANSI file left by
+       an older install run under PS 5.1) decodes as U+FFFD and is
+       rewritten lossy. Line *content* stays byte-exact for valid UTF-8,
+       which is all item 1 (above) required; a non-UTF-8 existing file is
+       an already-broken precondition this function does not try to
+       repair. #>
     param([string] $ProfileDir, [string] $VarName, [string] $Value)
+    # F4a defense-in-depth (round-3 reviewer finding): the early refusals
+    # above only check -TeamMemory's raw and resolved forms, and
+    # $HermesRootProfilesReal. Re-check the exact value actually being
+    # written here too, so no call site -- present or future -- can pin
+    # an unsafe value by constructing it some other way. This must never
+    # fire in the normal run (the callers already refused first); it is
+    # a backstop, not the primary check.
+    $_pinUnsafeReason = Get-EnvUnsafeValueReason $Value
+    if ($_pinUnsafeReason) {
+        [Console]::Error.WriteLine("Refusing to pin $VarName into $ProfileDir\.env: the value $_pinUnsafeReason; it would not read back identically from .env.")
+        exit 2
+    }
     New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
     $envFile = Join-Path $ProfileDir '.env'
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $line = "$VarName=$Value"
     $prefix = "$VarName="
     if (Test-Path -LiteralPath $envFile) {
-        $existingLines = @(Get-Content -LiteralPath $envFile)
+        $existingLines = [System.IO.File]::ReadAllLines($envFile, [System.Text.Encoding]::UTF8)
         $found = $false
-        $newLines = $existingLines | ForEach-Object {
+        $newLines = @($existingLines | ForEach-Object {
             if ($_.StartsWith($prefix)) { $found = $true; $line } else { $_ }
-        }
-        if ($found) {
-            Set-Content -LiteralPath $envFile -Value $newLines
-        } else {
-            Add-Content -LiteralPath $envFile -Value $line
-        }
+        })
+        if (-not $found) { $newLines += $line }
+        [System.IO.File]::WriteAllLines($envFile, $newLines, $utf8NoBom)
     } else {
-        Set-Content -LiteralPath $envFile -Value $line
+        [System.IO.File]::WriteAllLines($envFile, @($line), $utf8NoBom)
     }
 }
 function Set-MnemosyneDataDirPin {
@@ -1201,9 +1316,14 @@ function Invoke-MnemosyneDataLink {
         [Console]::Error.WriteLine("Cannot resolve $Name's profile directory: $ProfileDir")
         exit 1
     }
-    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
-            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
-        [Console]::Error.WriteLine("$Name's profile directory ($ProfileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+    # F2 equality (review r3 minor #4): Test-PathIsOrUnder treats Desc -ieq
+    # Anc as is-or-under, so it alone would accept a profile dir that
+    # resolves to EXACTLY $HermesRoot\profiles (dev-qa -> profiles), not
+    # just one nested under it. Refuse that explicitly too.
+    if (((-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal)) `
+            -and (-not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal))) `
+            -or ($profileDirReal -ieq $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$Name's profile directory ($ProfileDir) resolves outside, or equal to, `$HermesRoot\profiles; refusing to touch its whole profile.")
         exit 1
     }
     $dataLink = Join-Path $ProfileDir 'mnemosyne'
@@ -1335,9 +1455,10 @@ foreach ($role in $Profiles.Keys) {
         [Console]::Error.WriteLine("Cannot resolve $name's profile directory: $profileDir")
         exit 1
     }
-    if (-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal) `
-            -and -not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal)) {
-        [Console]::Error.WriteLine("$name's profile directory ($profileDir) resolves outside `$HermesRoot\profiles; refusing to touch its mnemosyne\.")
+    if (((-not (Test-PathIsOrUnder -Anc $HermesRootProfilesReal -Desc $profileDirReal)) `
+            -and (-not (Test-IdentityOverlap -Candidate $profileDirReal -Outer $HermesRootProfilesReal))) `
+            -or ($profileDirReal -ieq $HermesRootProfilesReal)) {
+        [Console]::Error.WriteLine("$name's profile directory ($profileDir) resolves outside, or equal to, `$HermesRoot\profiles; refusing to touch its whole profile.")
         exit 1
     }
 
@@ -1411,12 +1532,18 @@ foreach ($role in $Profiles.Keys) {
     if ($mnemoLinkKind -eq 'copy') { $copied += "$name (mnemosyne plugin)" }
 
     # The plugin link above shares Mnemosyne's *code*. It does not share its
-    # *data*: the database path resolves from a MNEMOSYNE_HOME the Mnemosyne
-    # plugin itself computes at runtime, which defaults to
-    # $HERMES_HOME\mnemosyne - and a named profile has redirected
-    # HERMES_HOME. Point each profile's Mnemosyne data root at the team's
-    # dedicated bank, unless -SeparateMemory asked for isolation. The
-    # operator's own bank ($HermesRoot\mnemosyne) is never a candidate here.
+    # *data*: the database path is steered by MNEMOSYNE_DATA_DIR / MNEMOSYNE_HOME,
+    # which this installer pins into each profile's own .env (Set-MnemosyneDataDirPin,
+    # above) so a directly-launched profile beats whatever the launching shell, the
+    # gateway, or the Windows User-scope environment already set
+    # (hermes_cli/env_loader.py:502-562 load_hermes_dotenv, override=True at :560).
+    # That pin does nothing for a profile run through a multiplex gateway -- the
+    # routed profile's own .env load is skipped there (env_loader.py:535-547) -- or
+    # for a managed worker, which returns before reading any .env at all
+    # (env_loader.py:513-515; agent/managed_worker.py:139-143). Point each profile's
+    # Mnemosyne data root at the team's dedicated bank, unless -SeparateMemory asked
+    # for isolation. The operator's own bank ($HermesRoot\mnemosyne) is never a
+    # candidate here.
     if (-not $SeparateMemory) {
         Invoke-MnemosyneDataLink -ProfileDir $profileDir -Name $name -Exists $exists `
             -TeamMemoryHome $TeamMemoryHome -AdoptTeamMemory:$AdoptTeamMemory -AdoptTimestamp $AdoptTimestamp `

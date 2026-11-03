@@ -58,7 +58,8 @@ class Layout:
     """A fake Hermes root as the installer leaves it on a CI runner."""
 
     def __init__(self, tmp, *, team_links_to_operator=False, private=(),
-                 profile_links_to=None, pin_to_operator=(), no_team_bank=False):
+                 profile_links_to=None, pin_to_operator=(), no_team_bank=False,
+                 quote_pins=False):
         self.tmp = Path(tmp)
         self.root = self.tmp / "hermes"
         self.operator = self.root / "mnemosyne"
@@ -90,8 +91,14 @@ class Layout:
                 bank = self.team
             if name in pin_to_operator:
                 bank = self.operator
+            data_val = str(bank / "data")
+            home_val = str(bank)
+            if quote_pins:
+                def q(v):  # item 4a (review r3): same escapes as the installer
+                    return "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
+                data_val, home_val = q(data_val), q(home_val)
             (d / ".env").write_text(
-                f"OTHER=1\nMNEMOSYNE_DATA_DIR={bank / 'data'}\nMNEMOSYNE_HOME={bank}\n")
+                f"OTHER=1\nMNEMOSYNE_DATA_DIR={data_val}\nMNEMOSYNE_HOME={home_val}\n")
         self.cli = self.tmp / "bin" / "mnemosyne"
         self.cli.parent.mkdir()
         self.cli.write_text(FAKE_CLI)
@@ -195,6 +202,20 @@ class _CheckContract:
             lay = Layout(tmp, private=("dev-pm",))
             self.assertFails(self.check(lay, init="dev-pm", private=("dev-pm",)), "dev-pm")
 
+    # --- item 4a (review r3) / operator decision (round 2): the installer
+    # no longer writes pins quoted (reverted, see check-team-bank.sh's
+    # Unquote-EnvPin/unquote_env_pin comments); this exercises the
+    # legacy-only unquoting path in case a pin from that brief quoted
+    # window is still on disk.
+    def test_quoted_env_pin_is_still_resolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lay = Layout(tmp, private=("dev-pm",), quote_pins=True)
+            self.assertFalse(lay.team_db.exists(), "precondition: a fresh install has no team DB")
+            proc = self.check(lay, private=("dev-pm",))
+            self.assertPasses(proc)
+            self.assertTrue(lay.team_db.is_file(), "team DB was not created under dev-team-mnemosyne/data")
+            self.assertEqual(lay.operator_db.read_bytes(), b"operator-bank", "operator DB was written")
+
 
 class BashTeamBankCheckTests(_CheckContract, unittest.TestCase):
     def check(self, layout, *, init="dev-architect", private=()):
@@ -272,6 +293,96 @@ class WorkflowUsesTheTestedChecks(unittest.TestCase):
             job = self.job(name)
             last_install = job.rindex("install-dev-team-")
             self.assertLess(last_install, job.index(script), f"{name}: check runs before the last install")
+
+
+class EnvPinUnquotingTests(unittest.TestCase):
+    """Item 4a (review r3) / operator decision (round 2): isolated contract
+    tests for the LEGACY-ONLY escape decoding, run directly against the
+    real function bodies extracted from each script (never a
+    reimplementation), so a future edit to the real unquoting logic still
+    has to pass here. The installer no longer writes pins in this format
+    (reverted to unquoted); these functions only exist to still resolve a
+    pin left over from the brief window where the quoted format shipped.
+    Covers the escape cases the full-check Layout fixture cannot (its
+    temp-dir paths never contain a backslash or an apostrophe)."""
+
+    CASES = [
+        ("plain/no/specials", "plain/no/specials"),
+        ("/t/x #y", "/t/x #y"),
+        ("a&b|c d", "a&b|c d"),
+        ("path with 'quote' and \\backslash\\", "path with 'quote' and \\backslash\\"),
+        ("ăș", "ăș"),
+        ("a\\\\b", "a\\\\b"),  # already-escaped-looking literal backslashes, still round-trip
+    ]
+
+    @staticmethod
+    def _quote(value):
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    def _extract_bash_function(self, name):
+        lines = SH.read_text().splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith(f"{name}()"))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+        return "\n".join(lines[start:end + 1])
+
+    def test_bash_unquote_env_pin_round_trips_every_case(self):
+        func_src = self._extract_bash_function("unquote_env_pin")
+        for raw, expected in self.CASES:
+            quoted = self._quote(raw)
+            script = f'{func_src}\nunquote_env_pin "$1"\n'
+            proc = subprocess.run(["bash", "-c", script, "_", quoted],
+                                  capture_output=True, text=True, timeout=20)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, expected, f"input quoted={quoted!r}")
+
+    def test_bash_unquote_env_pin_passes_through_legacy_unquoted(self):
+        func_src = self._extract_bash_function("unquote_env_pin")
+        legacy = "/legacy/unquoted/path"
+        script = f'{func_src}\nunquote_env_pin "$1"\n'
+        proc = subprocess.run(["bash", "-c", script, "_", legacy],
+                              capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, legacy)
+
+    @staticmethod
+    def _extract_pwsh_function():
+        ps1_text = PS1.read_text()
+        start = ps1_text.index("function Unquote-EnvPin")
+        end = ps1_text.index("\nfunction Get-EnvPin", start)
+        return ps1_text[start:end]
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_pwsh_unquote_env_pin_round_trips_every_case(self):
+        func_src = self._extract_pwsh_function()
+        for raw, expected in self.CASES:
+            quoted = self._quote(raw)
+            with tempfile.TemporaryDirectory() as tmp:
+                driver = Path(tmp) / "driver.ps1"
+                driver.write_text(
+                    func_src + "\n"
+                    "$v = [Console]::In.ReadToEnd()\n"
+                    "[Console]::Out.Write((Unquote-EnvPin $v))\n")
+                proc = subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+                    input=quoted, capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, expected, f"input quoted={quoted!r}")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_pwsh_unquote_env_pin_passes_through_legacy_unquoted(self):
+        func_src = self._extract_pwsh_function()
+        legacy = "/legacy/unquoted/path"
+        with tempfile.TemporaryDirectory() as tmp:
+            driver = Path(tmp) / "driver.ps1"
+            driver.write_text(
+                func_src + "\n"
+                "$v = [Console]::In.ReadToEnd()\n"
+                "[Console]::Out.Write((Unquote-EnvPin $v))\n")
+            proc = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+                input=legacy, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, legacy)
 
 
 if __name__ == "__main__":

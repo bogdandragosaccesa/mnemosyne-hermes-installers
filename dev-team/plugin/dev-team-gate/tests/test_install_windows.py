@@ -117,6 +117,249 @@ class WindowsInstallerTests(unittest.TestCase):
                  "adopted directory is not moved aside as a backup")
         self.has("out of scope", self.text, "no out-of-scope note for merging old memories")
 
+    _PS51_LEGACY_ENCODING_PRELUDE = (
+        "$PSDefaultParameterValues['Set-Content:Encoding'] = 'Latin1'\n"
+        "$PSDefaultParameterValues['Add-Content:Encoding'] = 'Latin1'\n"
+        "$PSDefaultParameterValues['Get-Content:Encoding'] = 'Latin1'\n"
+    )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_env_pin_writes_utf8_even_under_ps51_ansi_defaults(self):  # review r3 minor #1
+        """pwsh 7 on Linux already defaults Get/Set/Add-Content to UTF-8, so a
+        naive version of this test is green before the fix. Model PS 5.1's
+        ANSI-code-page default explicitly via $PSDefaultParameterValues so an
+        unfixed Set-EnvVarPin (relying on those cmdlets' defaults) fails here
+        the same way it would on the real CI target. An explicit encoding or
+        a .NET call is unaffected by these defaults, which is the fix."""
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            bank = Path(tmp) / "Dr\u0103go\u0219" / "bank"
+            harness = Path(tmp) / "env_pin.ps1"
+            harness.write_text(
+                self._PS51_LEGACY_ENCODING_PRELUDE
+                + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _function(self.text, "Set-EnvVarPin") + "\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '{bank}'\n"
+                + "Write-Output 'PIN_DONE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PIN_DONE", proc.stdout)
+            raw = (profile_dir / ".env").read_bytes()
+            decoded = raw.decode("utf-8")  # strict: raises/mismatches on ANSI-mangled bytes
+            self.assertEqual(decoded.strip(), f"MNEMOSYNE_HOME={bank}")
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), ".env must have no UTF-8 BOM")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_env_pin_rewrite_keeps_non_ascii_existing_lines_byte_exact(self):  # review r3 minor #1
+        """--clone copies the operator's root .env, and Set-EnvVarPin rewrites
+        that file in place -- a pre-existing non-ASCII line (comment or an
+        unrelated key) must survive the rewrite byte-exact, under the same
+        PS 5.1 ANSI-default modelling as the write test above."""
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            env_file = profile_dir / ".env"
+            env_file.write_bytes("# Dr\u0103go\u0219\nOTHER=\u0103\u0219\nMNEMOSYNE_HOME=/old\n".encode("utf-8"))
+            harness = Path(tmp) / "env_pin_rewrite.ps1"
+            harness.write_text(
+                self._PS51_LEGACY_ENCODING_PRELUDE
+                + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _function(self.text, "Set-EnvVarPin") + "\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new'\n"
+                + "Write-Output 'PIN_DONE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            raw = env_file.read_bytes()
+            lines = raw.decode("utf-8").splitlines()
+            self.assertIn("# Dr\u0103go\u0219", lines, "non-ASCII comment line not preserved byte-exact")
+            self.assertIn("OTHER=\u0103\u0219", lines, "non-ASCII value line not preserved byte-exact")
+            self.assertIn("MNEMOSYNE_HOME=/new", lines)
+            self.assertNotIn("MNEMOSYNE_HOME=/old", lines)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_env_pin_writes_special_characters_verbatim_and_round_trips(self):
+        """item 2/4a (operator round-2 decision): the pin format is
+        unquoted KEY=value, UTF-8, no escaping -- Set-EnvVarPin never
+        regex-substitutes or quotes the value (same concern F4 raised for
+        the Unix sed version). A bank path containing '&', '|', a
+        backslash, a UNC prefix, a space and non-ASCII characters must
+        come back byte-exact, and -- because there's no escaping -- the
+        stored value IS the raw value, so it round-trips through both
+        python-dotenv's real parser (if importable) and a trivial
+        identity decode standing in for Mnemosyne's naive
+        strip-bounding-quotes reader (a no-op here: there are no
+        bounding quote characters to strip)."""
+        bank = "C:\\Users\\Dr\u0103go\u0219\\team & co |pipe\\\\server\\share"
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            harness = Path(tmp) / "env_pin_special.ps1"
+            harness.write_text(
+                _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _function(self.text, "Set-EnvVarPin") + "\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value \"{bank}\"\n"
+                + "Write-Output 'PIN_DONE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PIN_DONE", proc.stdout)
+            lines = (profile_dir / ".env").read_text(encoding="utf-8").splitlines()
+            matching = [l for l in lines if l.startswith("MNEMOSYNE_HOME=")]
+            self.assertEqual(len(matching), 1)
+            stored_value = matching[0][len("MNEMOSYNE_HOME="):]
+            self.assertEqual(stored_value, bank, "value was not written verbatim")
+            # Mnemosyne's naive reader (mcp_server.py:_load_dotenv) only
+            # strips one bounding quote character off each end; there are
+            # none here, so it is a no-op and the value is unchanged.
+            mnemosyne_naive_decoded = stored_value.strip().strip("'\"")
+            self.assertEqual(mnemosyne_naive_decoded, bank)
+            try:
+                from dotenv.main import DotEnv  # noqa: PLC0415
+            except ImportError:
+                self.skipTest("python-dotenv not importable here; naive-reader decode above already passed")
+                return
+            env_file = profile_dir / ".env"
+            parsed = DotEnv(str(env_file), encoding="utf-8").dict()
+            self.assertEqual(parsed.get("MNEMOSYNE_HOME"), bank,
+                              "real python-dotenv did not round-trip the value byte-exact")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_env_pin_rerun_replaces_the_line_without_duplicating(self):
+        """item 2: a re-run (e.g. the installer run twice, or two vars
+        pinned back to back under the same key due to a relocated bank)
+        must replace the existing pin line, never duplicate it -- whether
+        the first write happened to look quoted or not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "profiles" / "dev-qa"
+            profile_dir.mkdir(parents=True)
+            env_file = profile_dir / ".env"
+            # Seed a pre-existing line that LOOKS quoted (e.g. left over
+            # from a previous, since-reverted quoting scheme) to prove the
+            # prefix match replaces it regardless of its own shape.
+            env_file.write_text("MNEMOSYNE_HOME='/old/quoted'\nOTHER=keep\n", encoding="utf-8")
+            harness = Path(tmp) / "env_pin_rerun.ps1"
+            harness.write_text(
+                _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _function(self.text, "Set-EnvVarPin") + "\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new/bank'\n"
+                + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new/bank2'\n"
+                + "Write-Output 'PIN_DONE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = env_file.read_text(encoding="utf-8").splitlines()
+            matching = [l for l in lines if l.startswith("MNEMOSYNE_HOME=")]
+            self.assertEqual(matching, ["MNEMOSYNE_HOME=/new/bank2"],
+                              "re-run must replace the existing pin, not duplicate it")
+            self.assertIn("OTHER=keep", lines)
+
+    def _team_memory_harness_from_env(self, tmp, hermes_root):
+        """Like _team_memory_harness, but takes -TeamMemory from the
+        TEAM_MEMORY_ARG environment variable instead of interpolating it
+        into a PS single-quoted literal -- needed to pass values
+        containing a literal quote character, trailing whitespace, or a
+        newline without reimplementing PowerShell's string-literal
+        escaping rules in the test itself."""
+        start = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        end = self.text.index("# Team state (forge project records")
+        snippet = self.text[start:end]
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        harness = Path(tmp) / "harness_env.ps1"
+        harness.write_text(
+            f"$HermesRoot = '{hermes_root}'\n"
+            "$TeamMemory = $env:TEAM_MEMORY_ARG\n"
+            + norm_fn + "\n" + snippet +
+            "\nWrite-Output \"TEAM_HOME=$TeamMemoryHome\"\n")
+        return harness
+
+    def _run_team_memory_with_value(self, tmp, root, value):
+        harness = self._team_memory_harness_from_env(tmp, root)
+        return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                              capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "TEAM_MEMORY_ARG": value})
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_value_with_space_then_hash(self):  # item 4a, operator round-2 decision
+        """python-dotenv's real parser truncates an unquoted value at
+        ' #' (confirmed against the real loader elsewhere in this suite);
+        Mnemosyne's naive reader does not. The two readers would disagree,
+        so the installer must refuse this shape up front rather than
+        silently pin a value one of them would misread."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            value = str(Path(tmp) / "team # tricky bank")
+            proc = self._run_team_memory_with_value(tmp, root, value)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace immediately followed by", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_value_with_a_leading_quote(self):  # item 4a, operator round-2 decision
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            value = "'" + str(Path(tmp) / "bank")
+            proc = self._run_team_memory_with_value(tmp, root, value)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("quote character", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_value_with_trailing_whitespace(self):  # item 4a, operator round-2 decision
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            value = str(Path(tmp) / "bank") + " "
+            proc = self._run_team_memory_with_value(tmp, root, value)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_value_with_an_embedded_newline(self):  # item 4a, operator round-2 decision
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            value = str(Path(tmp) / "bank") + "\nEVIL=1"
+            proc = self._run_team_memory_with_value(tmp, root, value)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("newline", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_value_containing_dollar_brace(self):  # round-1 review coverage finding #2
+        """python-dotenv (via env_loader's _resolve_dotenv_assignments)
+        expands `${VAR}` in an unquoted value; Mnemosyne's reader does
+        not expand it at all. Verified elsewhere in this suite:
+        'C:\\a\\${HOME}\\b' comes back expanded under the real Hermes
+        loader and verbatim under Mnemosyne's. The two readers would
+        disagree, so refuse this shape up front like the others."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            value = str(Path(tmp) / "bank-${HOME}-suffix")
+            proc = self._run_team_memory_with_value(tmp, root, value)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("${", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_accepts_a_value_with_safe_special_characters(self):  # item 4a: no false positives
+        """'&', '|', backslashes and non-ASCII are all safe under the
+        unquoted-no-escaping format (F4's concern) and must NOT be
+        refused by the new round-2 guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            value = str(Path(tmp) / "a&b|c d" / "Dr\u0103go\u0219")
+            proc = self._run_team_memory_with_value(tmp, root, value)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"TEAM_HOME={value}", proc.stdout)
+
     def _profile_dir_guard_harness(self, tmp, hermes_root, profile_dir, plugin_src_mnemo):
         """F2 (review r3): the real per-profile-loop prefix, from
         $profileDir's assignment through the plugins\\mnemosyne link --
@@ -180,6 +423,40 @@ class WindowsInstallerTests(unittest.TestCase):
             self.assertEqual(_snapshot_tree(root / "plugins"), before_plugins,
                              "operator plugins\\ must be byte-identical (no delete, no self-link)")
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_profile_dir_guard_refuses_profile_dir_equal_to_profiles_root(self):  # F2 equality, review r3 minor #4
+        """profiles\\dev-qa -> profiles (the profiles root itself, not merely
+        a path nested under it) must also be refused. Test-PathIsOrUnder
+        treats Desc -ieq Anc as is-or-under, so the guard used to ACCEPT a
+        profile dir that resolves to exactly $HermesRoot\\profiles and write
+        SOUL.md / the prefix file / the plugin link straight into it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            (root / "SOUL.md").write_text("operator soul\n")
+            plugin_src = root / "plugins" / "mnemosyne"
+            plugin_src.mkdir(parents=True)
+            (plugin_src / "marker.txt").write_text("plugin code\n")
+            before_plugins = _snapshot_tree(root / "plugins")
+            profiles_dir = root / "profiles"
+            profiles_dir.mkdir()
+            evil_profile = profiles_dir / "dev-qa"
+            evil_profile.symlink_to(profiles_dir)
+            harness = self._profile_dir_guard_harness(tmp, root, evil_profile, plugin_src)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("outside", proc.stderr)
+            self.assertNotIn("REACHED_PLUGIN_LINK", proc.stdout)
+            self.assertFalse((profiles_dir / "SOUL.md").exists(),
+                              "SOUL.md must not have been written into profiles\\ itself")
+            self.assertFalse((profiles_dir / "dev-team-prefix").exists(),
+                              "dev-team-prefix must not have been written into profiles\\ itself")
+            self.assertEqual(_snapshot_tree(root / "plugins"), before_plugins,
+                             "operator's plugins\\ (root\\plugins) must be byte-identical (no plugin link written)")
+            self.assertFalse((profiles_dir / "plugins").exists(),
+                              "no plugins\\ must have been created inside profiles\\ itself")
+
     def _separate_memory_harness(self, tmp, profile_dir, dry_run):
         """R3-1: the REAL per-profile-loop slice that runs right after the
         prefix file -- the DryRun block (with its `continue`) and the real
@@ -195,6 +472,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness = Path(tmp) / "separate_memory.ps1"
         harness.write_text(
             _function(self.text, "New-DirLink") + "\n"
+            + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
             + _function(self.text, "Set-EnvVarPin") + "\n"
             + _function(self.text, "Set-MnemosyneDataDirPin") + "\n"
             + f"$DryRun = ${'true' if dry_run else 'false'}\n$SeparateMemory = $true\n"
@@ -1109,6 +1387,67 @@ class WindowsTeamMemoryTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(f"TEAM_HOME={Path(tmp) / 'relbank'}", proc.stdout)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_symlink_whose_target_is_env_unsafe(self):  # round-1 review safety finding #1
+        """Reviewer repro (a): a safe-looking -TeamMemory argument that is
+        itself a symlink to an unsafe target. The raw argument
+        (str(link)) contains no unsafe shape and used to pass the F4a
+        refusal untouched; Set-EnvVarPin then wrote the RESOLVED
+        $TeamMemoryHome (the symlink's target), which the .env readers
+        would not agree on. Must now be refused before the symlink is
+        ever followed into a pin."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            unsafe_target_parent = Path(tmp) / "x #y"
+            unsafe_target_parent.mkdir()
+            unsafe_target = unsafe_target_parent / "bank"
+            link = Path(tmp) / "safe-link"
+            link.symlink_to(unsafe_target)
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(link))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace immediately followed by", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_a_relative_value_resolved_under_an_unsafe_cwd(self):  # round-1 review safety finding #1
+        """Reviewer repro (b): a safe-looking relative -TeamMemory
+        argument ('bank') resolved, via GetFullPath, against a cwd that
+        itself contains an unsafe shape. The raw argument is safe; only
+        the RESOLVED $TeamMemoryHome (cwd + 'bank') is not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            root.mkdir()
+            unsafe_cwd = Path(tmp) / "cwd #1"
+            unsafe_cwd.mkdir()
+            harness = self._team_memory_harness(tmp, root, team_memory_arg="bank")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60, cwd=str(unsafe_cwd))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace immediately followed by", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_team_memory_refuses_when_hermes_root_itself_is_env_unsafe(self):  # round-1 review safety finding #1
+        """Reviewer note on the same finding: "the same hole applies when
+        $HermesRoot itself contains ' #' and an explicit safe -TeamMemory
+        is given: the profile-local pins are never checked." Every
+        profile-local Set-MnemosyneDataDirPin call derives its DataDir
+        from $HermesRoot\\profiles\\<name>, so an unsafe $HermesRoot must
+        be refused even when -TeamMemory itself is perfectly safe."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "x #y" / "hermes"
+            root.mkdir(parents=True)
+            safe_team_memory = Path(tmp) / "safe-bank"
+            harness = self._team_memory_harness(tmp, root, team_memory_arg=str(safe_team_memory))
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("whitespace immediately followed by", proc.stderr)
+        self.assertNotIn("TEAM_HOME=", proc.stdout)
+
     # --- r3 review findings #2/#3: a link ANYWHERE on the path is followed.
     # Real symlinks under Linux pwsh exercise the same link-resolution code
     # (LinkTarget / .Target) a junction takes on Windows.
@@ -1437,6 +1776,33 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
         self.assertIn("outside", proc.stderr)
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D2_refuses_when_profile_dir_resolves_equal_to_profiles_root(self):  # round-1 review coverage #3
+        """Defense-in-depth companion to test_profile_dir_guard_refuses_
+        profile_dir_equal_to_profiles_root: that test only exercises the
+        main-loop guard site (the equality check right before this
+        function is even called). This function has the SAME equality
+        check (:1272-1274) as its own defense-in-depth, and it had no
+        direct test of its own."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hermes"
+            (root / "mnemosyne" / "data").mkdir(parents=True)
+            profiles_dir = root / "profiles"
+            profiles_dir.mkdir()
+            evil_profile = profiles_dir / "dev-qa"
+            evil_profile.symlink_to(profiles_dir)
+            kwargs = {
+                "ProfileDirArg": f"'{evil_profile}'", "NameArg": "'dev-qa'", "ExistsArg": "$true",
+                "AdoptArg": "$true", "TsArg": "'20261103000000'",
+            }
+            harness = self._datalink_harness(tmp, root, kwargs)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("outside, or equal to", proc.stderr)
+            self.assertFalse((profiles_dir / ".env").exists(),
+                              "nothing must have been pinned into profiles\\ itself")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_D3_backup_collision_gets_a_unique_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "hermes"
@@ -1504,7 +1870,7 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
             self.assertIn(f"MNEMOSYNE_HOME={profile_dir / 'mnemosyne'}", env_file.read_text())  # F1 (review r3)
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
-    def test_separate_memory_path_links_and_pins_the_team_bank(self):
+    def test_new_profile_with_no_existing_mnemosyne_pins_the_team_bank(self):  # review r3 minor #4c, round-1 rename (#5)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "hermes"
             (root / "mnemosyne" / "data").mkdir(parents=True)

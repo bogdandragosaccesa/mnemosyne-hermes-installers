@@ -154,8 +154,12 @@ after a `MNEMOSYNE_HOME`-based relocation) — is never linked into, read from, 
 this installer**; none of those variables select the team bank, and `--team-memory`/`-TeamMemory`
 refuses a value that resolves to, is nested under, or contains the operator's own bank,
 `MNEMOSYNE_HOME`, or `MNEMOSYNE_DATA_DIR` (checked in both directions, and by filesystem identity —
-not just path string — so a bind mount, a Windows 8.3 short name, or a `subst` drive is caught
-too). `--team-memory` is also refused if it resolves under `$HERMES_ROOT/profiles` or
+not just path string — so a bind mount is caught too, exercised by
+`test_team_memory_flag_refuses_an_alias_via_bind_mount` on Unix and
+`test_team_memory_refuses_an_alias_via_bind_mount` under the pwsh harness, both skipped cleanly
+without an unprivileged bind mount (`unshare --mount --map-root-user`). The same device/inode
+identity check should also catch a Windows 8.3 short name or a `subst` drive, but neither has an
+automated test here). `--team-memory` is also refused if it resolves under `$HERMES_ROOT/profiles` or
 `$HERMES_ROOT/dev-team`: either would break every profile's own link. The value is canonicalised
 before the check, and the canonical form is what gets created and linked: made absolute,
 `.`/`..`/repeated separators collapsed (also in the part that does not exist yet, so
@@ -194,7 +198,9 @@ regardless of `MNEMOSYNE_DATA_DIR`.
 **`MNEMOSYNE_HOME` is read by the installed Mnemosyne package itself** — contrary to an earlier
 version of this document — for the MCP shared-surface DB and federation:
 `mnemosyne/mcp_tools.py:167-173` builds the shared-surface DB path from it, and so do
-`core/fleet_census.py:149-155`, `core/federation_handshake.py:263-267` and `mcp_server.py:799`. If
+`core/fleet_census.py:149-155` and `core/federation_handshake.py:262-267`. (`mcp_server.py:811`
+also reads `MNEMOSYNE_HOME`, but only to locate a `.env` file to auto-load for the MCP server
+process — `_load_dotenv`, `:793-812` — not to build a DB path.) If
 either `MNEMOSYNE_HOME` or `MNEMOSYNE_DATA_DIR` is set in the shell or gateway environment a
 `hermes -p dev-*` process launches from, it silently overrides this installer's links, the same
 way a live operator session was found to leak the operator's own bank into a `dev-pm` chat
@@ -204,13 +210,21 @@ Hermes loads a profile's `.env` with `override=True` specifically so it beats a 
 the process environment (`hermes_cli/env_loader.py:502-562`).
 
 **The pinned `.env` values do not win regardless, though: they do nothing in a multiplex
-gateway.** While a routed profile-home override is active, the gateway deliberately skips loading
-that profile's own `.env` into the shared process environment, to avoid exposing one profile's
-credentials to sibling turns (`env_loader.py:530-545`). A dev-team profile run through a
-multiplex gateway therefore still inherits whatever `MNEMOSYNE_HOME`/`MNEMOSYNE_DATA_DIR` the
-gateway process itself was launched with — the `.env` pin only protects a profile launched
-directly (`hermes -p dev-pm chat`, a cron fire, a worker spawn). **The gateway process, and every
-non-routed `hermes -p dev-*` launch, should still run with `MNEMOSYNE_HOME` and
+gateway, a routed cron fire, or a managed worker.** While a routed profile-home override is
+active — which also covers a routed cron fire in the desktop backend
+(`cron/scheduler_provider.py:95-105`, `routed_profile_fire`) — the gateway deliberately skips
+loading that profile's own `.env` into the shared process environment, to avoid exposing one
+profile's credentials to sibling turns (`env_loader.py:530-545`). A managed worker never reaches
+that load at all: Kanban's worker client hands the turn to the profile's **owner** process rather
+than running an agent of its own, and `bind_worker_policy` freezes that owner's assignment
+process-wide before any config import (`agent/managed_worker.py:129-143`); correspondingly,
+`load_hermes_dotenv` returns before opening any `.env` once `worker_config_snapshot()` is set
+(`hermes_cli/env_loader.py:510-515`). So a dev-team profile run through a multiplex gateway, fired
+by a routed cron job, or spawned as a managed worker all still inherit whatever
+`MNEMOSYNE_HOME`/`MNEMOSYNE_DATA_DIR` the parent process itself was launched with — the `.env`
+pin only protects a profile launched directly and un-routed, such as `hermes -p dev-pm chat` run
+from a shell with no multiplex override active. **The gateway process, every cron-firing process,
+and every non-routed `hermes -p dev-*` launch should still run with `MNEMOSYNE_HOME` and
 `MNEMOSYNE_DATA_DIR` unset.**
 
 ## Onboarding a project
