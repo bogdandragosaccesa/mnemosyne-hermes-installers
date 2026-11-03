@@ -157,10 +157,16 @@ boundary workers cannot see past. `pm`'s `running-the-pipeline` skill sequences 
 onboarding card *before* the first `implement` card ever runs, so the team's own clone and the
 project record exist first. The pm sets the board's `default_workdir` at creation time —
 deterministic, pointing at the clone path devops will create — so onboarding never has a
-step that sets or changes it:
+step that sets or changes it.
+
+`$HERMES_HOME` is set per installed profile, but every profile's `dev-team` directory is a
+symlink into the same shared tree, so resolve the canonical team-home path with `pwd -P` before
+using it — a raw `$HERMES_HOME/dev-team/...` string differs across profiles even when it names
+the same real directory:
 
 ```bash
-hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir ~/.hermes/dev-team/repos/<repo-slug>
+TEAM_HOME="$(cd "$HERMES_HOME/dev-team" && pwd -P)"
+hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir "$TEAM_HOME/repos/<repo-slug>"
 ```
 
 Every later `hermes kanban` command that targets this board must name it explicitly with
@@ -171,20 +177,22 @@ Then devops runs `forge detect`, pointed at the team's own clone — never the o
 checkout:
 
 ```bash
-forge detect --repo-dir ~/.hermes/dev-team/repos/<repo-slug>/ --slug <repo-slug>
+forge detect --repo-dir "$TEAM_HOME/repos/<repo-slug>/" --slug <repo-slug>
 ```
 
 `--slug` must be passed explicitly with intake's `repo` string; without it, `detect` falls back
 to the clone directory's name. A slug containing `/` or `\`, or equal to `.` or `..`, is
 refused. `detect` writes the whole project record itself
-(`~/.hermes/dev-team/projects/<repo-slug>.json`): the PR and CI adapters, `repo_url` from the
+(`$TEAM_HOME/projects/<repo-slug>.json`): the PR and CI adapters, `repo_url` from the
 clone's `git remote get-url origin` (credentials in the URL stripped), and `default_branch`
 from `git symbolic-ref refs/remotes/origin/HEAD` (run `git remote set-head origin --auto` first
 if that ref is missing). Never hand-edit the record. `detect` refuses to overwrite an existing
 record unless the operator passes `--force`. Exit 2 with `"ambiguous: pass --pr-adapter"`
-means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly. If the board's
-`default_workdir` is missing or doesn't match this clone, devops blocks with a clear reason
-instead of changing the board.
+means devops decides and re-runs with `--pr-adapter`/`--ci-adapter` explicitly. Devops compares
+the board's `default_workdir` against its own clone path by resolved real path (`realpath` both
+sides, trailing slash ignored), never by raw string — the two values are produced by different
+profiles' shells. If the resolved paths differ, or `default_workdir` is missing, devops blocks
+with a clear reason instead of changing the board.
 
 **The terminal guard is a seatbelt against mistakes, not a security boundary.** It reads
 shell commands as text — tokenised, not matched by substring, so it catches shell nesting,
@@ -271,9 +279,10 @@ guard for them:
 
 ## Running it
 
-- **The board.** `hermes kanban ls`, `hermes kanban show <id>` on the active board (switched
-  per repository, above). A card's guarded stage is whatever `dev-team-stage-<stage>` skill it
-  carries — check that, not the title, when in doubt.
+- **The board.** Every command names its board explicitly: `hermes kanban --board <repo-slug>
+  ls`, `hermes kanban --board <repo-slug> show <id>` (see Onboarding a project, above — nothing
+  in the team switches the machine-wide current board). A card's guarded stage is whatever
+  `dev-team-stage-<stage>` skill it carries — check that, not the title, when in doubt.
 - **Talking to pm.** Give `pm` one sentence, a budget and a repository; its soul's own
   **Intake: Turning One Line Into A Plan** section drives everything else. From intake it
   creates the `plan` card, and from there each stage's own skill creates its required child —
@@ -290,8 +299,8 @@ guard for them:
 ## Attention labels
 
 Every `kanban_block` on this pipeline starts with a failure-class label, so pm's ledger
-(`hermes kanban ls --status blocked`) can count recurring classes instead of treating three
-occurrences as three unrelated incidents:
+(`hermes kanban --board <repo-slug> ls --status blocked`) can count recurring classes instead of
+treating three occurrences as three unrelated incidents:
 
 | Label | Meaning |
 | --- | --- |

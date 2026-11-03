@@ -23,19 +23,25 @@ come out the other end as that card's `kanban_complete` metadata. See
 ## One board per repository
 
 Each repository this team works on gets its own board — the hard isolation boundary workers
-cannot see past:
+cannot see past. `$HERMES_HOME` is set per installed profile (every profile gets its own
+directory, symlinked to the same shared `dev-team` tree), so a raw `$HERMES_HOME/dev-team/...`
+string differs across profiles even though it resolves to the same real directory. Resolve it
+to the canonical team-home path with `pwd -P` *before* creating the board, so every profile that
+later reads `default_workdir` sees the identical string:
 
 ```
-hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir $HERMES_HOME/dev-team/repos/<repo-slug>
+TEAM_HOME="$(cd "$HERMES_HOME/dev-team" && pwd -P)"
+hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir "$TEAM_HOME/repos/<repo-slug>"
 ```
 
 The `--default-workdir` path is deterministic at creation time — it is the clone path devops
-will create during onboarding below, not a path that exists yet. Setting it here means no later
-step ever needs to change it. Use the same `<repo-slug>` you will record as the intake card's
-`repo` field, so every later stage (forge onboarding, the project record, the guard's
-default-branch check) resolves against one consistent name. One repository, one board, one
-slug — never split a repository's work across boards or reuse a slug for a different
-repository.
+will create during onboarding below, not a path that exists yet. Setting it here, as the
+resolved real path rather than the profile-relative `$HERMES_HOME/dev-team`, means no later step
+ever needs to change it and every profile's own `$TEAM_HOME` resolution will match it exactly.
+Use the same `<repo-slug>` you will record as the intake card's `repo` field, so every later
+stage (forge onboarding, the project record, the guard's default-branch check) resolves against
+one consistent name. One repository, one board, one slug — never split a repository's work
+across boards or reuse a slug for a different repository.
 
 Every later `hermes kanban` command that targets this board — yours or any card you
 create — must name it explicitly with `--board <repo-slug>` (or `kanban_create(board=...)`).
@@ -113,8 +119,8 @@ Every `kanban_block` on this pipeline carries a reason starting with a failure-c
 ledger of blocked cards on this board, grouped by that label prefix:
 
 ```
-hermes kanban ls --status blocked
-hermes kanban show <id>     # the labelled reason, verbatim
+hermes kanban --board <repo-slug> ls --status blocked
+hermes kanban --board <repo-slug> show <id>     # the labelled reason, verbatim
 ```
 
 Count blocks per label. A label that keeps recurring is not three unrelated incidents — it is

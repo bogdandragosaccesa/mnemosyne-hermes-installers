@@ -7,6 +7,17 @@ longer has a `set-default-workdir` step — devops only clones, excludes
 machine-wide current board, so no skill, soul or README may instruct an
 agent to run `hermes kanban boards switch` or
 `hermes kanban boards set-default-workdir`.
+
+Round 2 (t_6d27c3af) fixes on top of that:
+
+- `$HERMES_HOME` is per installed profile, but every profile's `dev-team` is
+  a symlink into the same shared tree, so a raw `$HERMES_HOME/dev-team/...`
+  string is not a stable cross-profile identifier. The board-creation
+  command and the README must resolve a canonical team-home path (`pwd -P`)
+  instead of embedding the profile-relative string literally.
+- Every `hermes kanban ls`/`hermes kanban show` the pm or README documents
+  for this pipeline must name its board explicitly with `--board`, and
+  nothing may describe a now-nonexistent "switched per repository" step.
 """
 import re
 import unittest
@@ -16,16 +27,20 @@ DEV_TEAM = Path(__file__).resolve().parents[3]
 
 FORBIDDEN = re.compile(r"boards switch|set-default-workdir")
 
-# A sentence that explicitly *forbids* running the command is tolerated
-# deliberately (acceptance criterion 1 allows it) because it does not tell
-# an agent to run the command — it tells the agent never to. Only lines
-# that pair the forbidden phrase with one of these negation markers count
-# as a prohibition rather than an instruction.
-PROHIBITION_MARKER = re.compile(
-    r"never (run|switch)|nothing in the team (runs|may run)"
-    r"|must not run|may not run|never run",
-    re.IGNORECASE,
-)
+# Lines that pair the forbidden phrase with an explicit prohibition are
+# tolerated deliberately (acceptance criterion 1 allows it) because they
+# tell an agent never to run the command, not to run it. Round 1 tolerated
+# any line containing a negation marker anywhere in it, which a probe showed
+# is too wide (a sentence that both forbids and then instructs still passed,
+# e.g. "Never run that; instead run `hermes kanban boards switch x`.").
+# Round 2 replaces that marker regex with an explicit allowlist of the exact
+# tolerated lines, so only these two specific, hand-reviewed prohibition
+# sentences are exempt — anything else containing the forbidden phrase is an
+# offender, including a line that merely contains a negation word elsewhere.
+ALLOWED_PROHIBITION_LINES = {
+    "Nothing in the team may run `hermes kanban boards switch`: it mutates the machine-wide current",
+    "`--board <repo-slug>`. Nothing in the team runs `hermes kanban boards switch` — it mutates the",
+}
 
 # Text files this test scans: every skill, every soul, and the README.
 TEXT_FILES = sorted(DEV_TEAM.glob("skills/*/SKILL.md")) + sorted(
@@ -33,6 +48,20 @@ TEXT_FILES = sorted(DEV_TEAM.glob("skills/*/SKILL.md")) + sorted(
 ) + [DEV_TEAM / "README.md"]
 
 PIPELINE_SKILL = DEV_TEAM / "skills" / "running-the-pipeline" / "SKILL.md"
+README = DEV_TEAM / "README.md"
+
+# A raw, profile-relative team-home path. Every installed profile's
+# `$HERMES_HOME` points at its own profile directory, so embedding this
+# string literally in a `--default-workdir` value makes the board's stored
+# path diverge across the pm's and devops' profiles even though both
+# `dev-team` directories are symlinks to the same real tree.
+RAW_PROFILE_RELATIVE_TEAM_HOME = re.compile(
+    r"--default-workdir[^\n]*\$HERMES_HOME/dev-team(?!-prefix)"
+)
+
+# A `hermes kanban ls` / `hermes kanban show` invocation that does not name
+# its board explicitly with `--board`.
+LEDGER_COMMAND = re.compile(r"hermes kanban (ls|show)\b")
 
 
 class NoGlobalBoardSwitchTest(unittest.TestCase):
@@ -47,8 +76,11 @@ class NoGlobalBoardSwitchTest(unittest.TestCase):
         for path in TEXT_FILES:
             text = path.read_text(encoding="utf-8")
             for lineno, line in enumerate(text.splitlines(), start=1):
-                if FORBIDDEN.search(line) and not PROHIBITION_MARKER.search(line):
-                    offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line.strip()}")
+                if not FORBIDDEN.search(line):
+                    continue
+                if line.strip() in ALLOWED_PROHIBITION_LINES:
+                    continue
+                offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line.strip()}")
         self.assertEqual(
             offenders,
             [],
@@ -67,6 +99,63 @@ class NoGlobalBoardSwitchTest(unittest.TestCase):
             "the pipeline skill's board-creation command must include "
             f"--default-workdir; found: {create_lines}",
         )
+
+    def test_default_workdir_is_not_raw_profile_relative_path(self):
+        """--default-workdir must use a resolved canonical path, not the raw
+        profile-relative `$HERMES_HOME/dev-team` string (round 2, finding 1):
+        every installed profile's `$HERMES_HOME` is its own directory, so
+        that raw string stores a different path per profile even though all
+        profiles' `dev-team` resolves to the same real tree."""
+        for path in (PIPELINE_SKILL, README):
+            text = path.read_text(encoding="utf-8")
+            offenders = [
+                line.strip()
+                for line in text.splitlines()
+                if RAW_PROFILE_RELATIVE_TEAM_HOME.search(line)
+            ]
+            self.assertEqual(
+                offenders,
+                [],
+                f"{path.relative_to(DEV_TEAM)}: --default-workdir must use a resolved "
+                f"canonical path (e.g. $TEAM_HOME from `pwd -P`), not the raw "
+                f"profile-relative $HERMES_HOME/dev-team; found: {offenders}",
+            )
+            self.assertIn(
+                'pwd -P',
+                text,
+                f"{path.relative_to(DEV_TEAM)} must resolve the canonical team-home "
+                "path with `pwd -P` before using it in --default-workdir",
+            )
+
+    def test_ledger_commands_name_board_explicitly(self):
+        """Every `hermes kanban ls`/`hermes kanban show` the pm or README
+        documents for this pipeline must carry `--board` on the same line
+        (round 2, finding 2): without it the command reads the machine-wide
+        current board instead of this repository's board."""
+        offenders = []
+        for path in (PIPELINE_SKILL, README):
+            text = path.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if LEDGER_COMMAND.search(line) and "--board" not in line:
+                    offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line.strip()}")
+        self.assertEqual(
+            offenders,
+            [],
+            "every `hermes kanban ls`/`hermes kanban show` must name its board "
+            "explicitly with --board; found:\n" + "\n".join(offenders),
+        )
+
+    def test_no_switched_per_repository_wording(self):
+        """The board is never switched (per-repository or otherwise) —
+        every command names it explicitly. No text file may describe a
+        now-removed 'switched per repository' step (round 2, finding 2)."""
+        offenders = []
+        for path in TEXT_FILES:
+            text = path.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if "switched per repository" in line.lower():
+                    offenders.append(f"{path.relative_to(DEV_TEAM)}:{lineno}: {line.strip()}")
+        self.assertEqual(offenders, [], "stale 'switched per repository' wording found:\n" + "\n".join(offenders))
 
 
 if __name__ == "__main__":
