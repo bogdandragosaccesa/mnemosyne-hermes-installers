@@ -393,11 +393,18 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
         # Old (static) assertions this replaces, and their behavioural
         # equivalents below:
         #   1. assertNotIn("# relink ${profileName}: New-DirLink", self.text)
-        #      -> replaced by: every relink line in the real conflict
-        #      message is a '#' comment telling the operator to re-run
-        #      the installer (proves the fixed relink step is what the
+        #      -> replaced by TWO behavioural checks: (a) every relink
+        #      line in the real conflict message is a '#' comment
+        #      telling the operator to re-run the installer, AND
+        #      (b) 'New-DirLink' never appears anywhere in the real
+        #      output at all, so a comment that names the
+        #      installer-internal function as the relink step (e.g.
+        #      "# relink <profile>: New-DirLink" added next to the
+        #      correct re-run line) still fails even though it also
+        #      starts with '#' (proves the fixed relink step is what the
         #      function actually emits, not merely absent from a
-        #      hand-picked source string).
+        #      hand-picked source string, and that no sibling line names
+        #      the internal function either).
         #   2. assertNotIn("linked from: $($entry.Profiles -join ' ')", self.text)
         #      -> replaced by: '__root_link__' never appears anywhere in
         #      the real message, and "the root dev-team link" does
@@ -432,6 +439,8 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
                               "the sentinel key leaked into the operator-facing message")
             self.assertIn("the root dev-team link", proc.stdout,
                            "the root-link candidate was not described in plain language")
+            self.assertNotIn("New-DirLink", proc.stdout,
+                              "conflict text names an installer-internal function as the relink step")
             relink_lines = [ln.strip() for ln in proc.stdout.splitlines()
                              if "re-run this installer" in ln]
             self.assertTrue(relink_lines, "no relink-and-re-run line in the conflict message")
