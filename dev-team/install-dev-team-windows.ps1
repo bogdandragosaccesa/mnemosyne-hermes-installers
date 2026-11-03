@@ -387,6 +387,22 @@ function Test-IsAncestorOrEqualPath {
     return $d.StartsWith("$a$([char]92)", [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-AllProfileDirs {
+    <#
+      N3 (review): the refusal in Get-UnsafeOldHomeReason must cover every
+      directory under $HermesRoot\profiles, not only the dev-team-prefixed
+      ones this installer's own role scan discovers -- otherwise a
+      candidate equal to some other, unrelated profile directory slips
+      through and "migrating" it would move that whole profile. Mirrors
+      the Unix installer's "$HERMES_ROOT"/profiles/*/ glob.
+    #>
+    param([string] $HermesRoot)
+    $profilesRoot = Join-Path $HermesRoot 'profiles'
+    if (-not (Test-Path -LiteralPath $profilesRoot)) { return @() }
+    return @(Get-ChildItem -LiteralPath $profilesRoot -Directory -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName })
+}
+
 function Get-UnsafeOldHomeReason {
     <#
       D1 (review): a candidate old-home target must actually be named
@@ -847,13 +863,17 @@ if (Test-Path -LiteralPath $decidersCmdPath) {
 # finding #3), so a junction that already points at the correct root is
 # never mistaken for an old one.
 $CandidateTargets = @{}
-$ProfileDirs = @()
+# N3 (review): pass every directory under $HermesRoot\profiles to
+# Get-UnsafeOldHomeReason, not only the $Prefix$role ones this loop scans
+# for live dev-team junctions -- matching the Unix installer's
+# profiles/*/ glob so a candidate equal to any other profile directory
+# (dev-team-prefixed or not) is refused.
+$ProfileDirs = Get-AllProfileDirs -HermesRoot $HermesRoot
 foreach ($role in $Profiles.Keys) {
     $candidateName = "$Prefix$role"
     Invoke-Hermes 'profile' 'show' $candidateName | Out-Null
     if ($LASTEXITCODE -ne 0) { continue }
     $candidateDir = Split-Path -Parent (Get-HermesLastLine (Invoke-Hermes '-p' $candidateName 'config' 'path'))
-    $ProfileDirs += $candidateDir
     $candidateLink = Join-Path $candidateDir 'dev-team'
     $linkItem = Get-Item -LiteralPath $candidateLink -Force -ErrorAction SilentlyContinue
     if (-not $linkItem -or -not $linkItem.LinkType) { continue }

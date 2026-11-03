@@ -632,6 +632,74 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             self.assertIn("OUTCOME=invalid", proc.stdout)
             self.assertFalse(new.exists())
 
+    def _profile_dirs_harness(self, tmp):
+        norm_fn = _function(self.text, "Get-NormalizedPath")
+        anc_fn = _function(self.text, "Test-IsAncestorOrEqualPath")
+        all_fn = _function(self.text, "Get-AllProfileDirs")
+        reason_fn = _function(self.text, "Get-UnsafeOldHomeReason")
+        data_fn = _function(self.text, "Test-DirHasData")
+        plan_fn = _function(self.text, "Resolve-TeamHomeMigrationPlan")
+        harness = Path(tmp) / "profile_dirs_harness.ps1"
+        harness.write_text(
+            norm_fn + "\n" + anc_fn + "\n" + all_fn + "\n" + reason_fn + "\n" + data_fn + "\n" + plan_fn + "\n")
+        return harness
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N3_get_all_profile_dirs_scans_every_profile_not_only_team_ones(self):
+        # N3 (review): Get-AllProfileDirs must return every directory under
+        # $HermesRoot\profiles, mirroring the Unix installer's
+        # "$HERMES_ROOT"/profiles/*/ glob -- not only dev-team-prefixed ones.
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            (hermes_root / "profiles" / "dev-pm").mkdir(parents=True)
+            (hermes_root / "profiles" / "t14-other").mkdir(parents=True)
+            harness = self._profile_dirs_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    f"$dirs = Get-AllProfileDirs -HermesRoot '{hermes_root}'\n"
+                    "Write-Output \"COUNT=$($dirs.Count)\"\n"
+                    "Write-Output ($dirs -join ',')\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("COUNT=2", proc.stdout)
+            self.assertIn("t14-other", proc.stdout)
+            self.assertIn("dev-pm", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N3_profile_dirs_scan_refuses_a_non_team_profile_directory(self):
+        # N3 (review): $ProfileDirs (as passed to Get-UnsafeOldHomeReason)
+        # must include every directory under $HermesRoot\profiles, not only
+        # the $Prefix$role ones the installer's own role loop scans for
+        # live dev-team junctions -- so a candidate equal to an unrelated,
+        # non-team profile directory (e.g. profiles/t14-other) is refused
+        # too, matching the Unix installer's behaviour.
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            new = hermes_root / "dev-team"
+            other_profile = hermes_root / "profiles" / "t14-other"
+            other_profile.mkdir(parents=True)
+            (hermes_root / "profiles" / "dev-pm").mkdir(parents=True)
+            harness = self._profile_dirs_harness(tmp)
+            with harness.open("a") as f:
+                f.write(
+                    # dev-pm's dev-team junction happens to point at the
+                    # unrelated t14-other profile directory -- a
+                    # misconfiguration, not a real old team home.
+                    "$candidates = @{ 'dev-pm' = '" + str(other_profile) + "' }\n"
+                    f"$allDirs = Get-AllProfileDirs -HermesRoot '{hermes_root}'\n"
+                    f"$r = Resolve-TeamHomeMigrationPlan -DevTeamHome '{new}' "
+                    "-CandidateTargets $candidates "
+                    f"-HermesRoot '{hermes_root}' -ProfileDirs $allDirs\n"
+                    "Write-Output \"OUTCOME=$($r.Outcome)\"\n"
+                    "Write-Output $r.Message\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("OUTCOME=invalid", proc.stdout)
+            self.assertIn(str(other_profile), proc.stdout)
+            self.assertFalse(new.exists())
+
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_D4_root_link_target_is_treated_as_an_old_home_candidate(self):
         # D4: when $DevTeamHome itself is a link, its target must be fed in
