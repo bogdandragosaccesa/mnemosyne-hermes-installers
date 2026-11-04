@@ -1049,7 +1049,17 @@ function Resolve-CmdEmbeddablePath {
     if ($NoRefuse) { return $null }
     $names = ($Prefixes | ForEach-Object { $_.Name }) -join ', '
     if (-not $names) { $names = '(none available in this environment)' }
-    [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $Label, $(Format-EnvPinForDisplay $Path), is not printable ASCII, and is not under any of the folders whose environment variable cmd.exe can expand ($names). Move the dev-team checkout, and/or the Python that runs it, onto an ASCII-only path (e.g. Python installed under C:\Python312) or under one of those folders, then re-run. If the py launcher is what picked this path, you can instead point it at a different Python 3 with the PY_PYTHON environment variable or a py.ini file (https://docs.python.org/3/using/windows.html#customization).")
+    # F6 (this review): $Path may be an 8.3 SHORT name (printable ASCII by
+    # construction, e.g. "C:\DEV-TE~1\DRGO~1\..."), which is why it never
+    # took the early-return fast path above -- $asciiCheckPath/$longPath,
+    # the canonicalized LONG form, is what actually failed the ASCII test
+    # and the prefix match, and is the real reason for this refusal.
+    # Displaying the original (short) $Path here would show an
+    # already-ASCII string while calling it "not printable ASCII", which
+    # is both misleading and not the value any prefix was actually
+    # compared against. Show $longPath instead, so the message always
+    # names the real, non-ASCII (or non-prefixed) directory.
+    [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $Label, $(Format-EnvPinForDisplay $longPath), is not printable ASCII, and is not under any of the folders whose environment variable cmd.exe can expand ($names). Move the dev-team checkout, and/or the Python that runs it, onto an ASCII-only path (e.g. Python installed under C:\Python312) or under one of those folders, then re-run. If the py launcher is what picked this path, you can instead point it at a different Python 3 with the PY_PYTHON environment variable or a py.ini file (https://docs.python.org/3/using/windows.html#customization).")
     exit 2
 }
 function Assert-WrapperTextAscii {

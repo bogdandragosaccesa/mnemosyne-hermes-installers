@@ -97,12 +97,25 @@ class WindowsNtEvidence(unittest.TestCase):
                 + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
                 "$WrapperPython = $env:A3_PY\n$ForgePy = 'C:\\x\\forge.py'\n$DecidersPy = 'C:\\x\\deciders.py'\n"
                 "$CmdPaths = Assert-CmdWrapperPathsAscii\nWrite-Output 'WRAPPERS_OK'\n")
-            # Clear every %ENVVAR% prefix D2 would otherwise try: the venv
-            # lives under TEMP, which on real Windows usually resolves
-            # under %LOCALAPPDATA%, and this test's whole point is "no
-            # usable prefix -> still refused", not "got rewritten".
-            proc = self._ps51(tmp, body, {"A3_PY": str(py), "LOCALAPPDATA": "",
-                                          "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
+            # This test's whole point is "no usable prefix -> still
+            # refused", not "got rewritten". The venv lives under TEMP,
+            # which on real Windows usually resolves under %LOCALAPPDATA%,
+            # itself under %USERPROFILE% -- those two are the only ones
+            # genuinely at risk of accidentally prefix-matching it (APPDATA
+            # is Roaming, never an ancestor of TEMP; neither is
+            # ProgramFiles), so only they need neutralising. Point them at
+            # a dummy, non-existent, un-nested path rather than blanking
+            # them to "": an empty value is dropped from the Win32
+            # environment block entirely, and clearing LOCALAPPDATA,
+            # USERPROFILE, APPDATA and ProgramFiles to "" TOGETHER crashes
+            # Windows PowerShell 5.1 itself at startup (a real,
+            # host-reproduced System.Management.Automation.Utils
+            # type-initializer exception -- see t_b8be23cc) before any
+            # installer code runs. A non-empty, ASCII, un-nested dummy
+            # value keeps PS 5.1 happy while still matching no prefix.
+            no_match = "C:\\NoPrefixMatchXYZ"
+            proc = self._ps51(tmp, body, {"A3_PY": str(py), "LOCALAPPDATA": no_match,
+                                          "USERPROFILE": no_match})
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertNotIn("WRAPPERS_OK", proc.stdout)
         self.assertIn("not printable ASCII", proc.stderr)
@@ -138,9 +151,18 @@ class WindowsNtEvidence(unittest.TestCase):
                 "$forgeCmdContent = \"@echo off`r`nREM t`r`n$($ForgeGuard.Guards)`\"$($WrapperPythonCmd.Embed)`\" `\"$($ForgePyCmd.Embed)`\" %*`r`nexit /b %ERRORLEVEL%`r`n$($ForgeGuard.Tail)\"\n"
                 f"Set-Content -LiteralPath {_ps_q(Path(tmp) / 'forge.cmd')} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
                 "Write-Output \"EMBED=$($WrapperPythonCmd.Embed)\"\n")
+            # Only LOCALAPPDATA is under test here. Leave USERPROFILE/
+            # APPDATA/ProgramFiles at their real, non-empty, inherited
+            # values: `local` is a deeper (longer) directory than any of
+            # those real profile paths can be, so the longest-prefix rule
+            # in Resolve-CmdEmbeddablePath always picks LOCALAPPDATA
+            # regardless of what the others hold. Blanking the others to
+            # "" gains nothing for this test and, together with
+            # LOCALAPPDATA, is what crashes Windows PowerShell 5.1 at
+            # startup (see t_b8be23cc) before the installer code it's
+            # meant to exercise ever runs.
             proc = self._ps51(tmp, body, {"A3_PY": str(py), "A3_SCRIPT": str(script),
-                                          "LOCALAPPDATA": str(local), "USERPROFILE": "",
-                                          "APPDATA": "", "ProgramFiles": ""})
+                                          "LOCALAPPDATA": str(local)})
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("%LOCALAPPDATA%\\venv\\Scripts\\python.exe", proc.stdout)
             cmd_path = Path(tmp) / "forge.cmd"
@@ -203,8 +225,12 @@ class WindowsNtEvidence(unittest.TestCase):
                 "    \"exit /b %ERRORLEVEL%`r`n$($ForgeGuard.Tail)\"\n"
                 f"Set-Content -LiteralPath {_ps_q(forge_cmd_path)} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
                 "Write-Output \"EMBED=$($WrapperPythonCmd.Embed)\"\n")
-            proc = self._ps51(tmp, body, {"A3_PY": missing_py, "LOCALAPPDATA": local_value,
-                                          "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
+            # Same reasoning as the LOCALAPPDATA-rewrite test above: only
+            # LOCALAPPDATA is under test, `local_value` outranks any real
+            # USERPROFILE/APPDATA/ProgramFiles value by length so they
+            # never need neutralising, and blanking all four together is
+            # what crashes Windows PowerShell 5.1 at startup.
+            proc = self._ps51(tmp, body, {"A3_PY": missing_py, "LOCALAPPDATA": local_value})
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("%LOCALAPPDATA%\\hermes\\tools\\python-3.12\\python.exe", proc.stdout)
             self.assertTrue(forge_cmd_path.read_bytes().isascii(), "forge.cmd must stay pure ASCII")
