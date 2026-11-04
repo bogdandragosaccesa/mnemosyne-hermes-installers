@@ -174,6 +174,57 @@ class WindowsNtEvidence(unittest.TestCase):
         self.assertNotIn("WRAPPER_RAN", run.stdout)
         self.assertNotEqual(run.returncode, 0)
 
+    def test_guard_echo_does_not_run_a_fragment_when_localappdata_has_ampersand(self):
+        # S1 (review round 1): the old unquoted/expanded echo let cmd.exe
+        # split the guard's error line on '&' and run the trailing
+        # fragment as a command, even though the whole point of this
+        # branch is to fail closed. LOCALAPPDATA's VALUE contains '&'
+        # here; the fixed echo must print the literal, UNEXPANDED
+        # "%LOCALAPPDATA%" token (doubled '%', quoted), so the value is
+        # never substituted into the line at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            local_value = str(Path(tmp) / "R&D (x)" / "AppData" / "Local")
+            sentinel_dir = Path(tmp) / "sentinel_bin"
+            sentinel_dir.mkdir(parents=True)
+            marker = Path(tmp) / "SENTINEL_RAN.txt"
+            # A buggy unquoted split of "...R&D (x)\AppData\Local\..."
+            # would try to run something starting with "D" as a command.
+            # If cmd.exe ever executes it, a marker file appears.
+            sentinel_cmd = sentinel_dir / "D.cmd"
+            sentinel_cmd.write_text(f"@echo off\r\necho SENTINEL_RAN> \"{marker}\"\r\n")
+            missing_py = str(Path(local_value) / "hermes" / "tools" / "python-3.12" / "python.exe")
+            forge_cmd_path = Path(tmp) / "forge.cmd"
+            body = (
+                "$ErrorActionPreference = 'Stop'\n"
+                "$HermesRoot = $null\n"
+                + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
+                + "".join(_function(TEXT, f) + "\n" for f in (
+                    "Test-AsciiOrdinalRange", "Get-PersistedEnvVar", "Get-CmdPrefixCandidates",
+                    "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii", "Get-CmdGuardBlock"))
+                + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
+                "$WrapperPython = $env:A3_PY\n$ForgePy = 'C:\\x\\forge.py'\n$DecidersPy = 'C:\\x\\deciders.py'\n"
+                "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
+                "$WrapperPythonCmd = $CmdPaths.WrapperPython\n$ForgePyCmd = $CmdPaths.ForgePy\n"
+                "$ForgeGuard = Get-CmdGuardBlock -Prefix 'dt_forge' -Pairs @("
+                "[ordered]@{ Label = 'the wrapper Python'; Embed = $WrapperPythonCmd })\n"
+                "$forgeCmdContent = \"@echo off`r`nREM t`r`n$($ForgeGuard.Guards)\" +\n"
+                "    \"`\\\"$($WrapperPythonCmd.Embed)`\\\" `\\\"C:\\\\x\\\\forge.py`\\\" %*`r`n\" +\n"
+                "    \"exit /b %ERRORLEVEL%`r`n$($ForgeGuard.Tail)\"\n"
+                f"Set-Content -LiteralPath {_ps_q(forge_cmd_path)} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
+                "Write-Output \"EMBED=$($WrapperPythonCmd.Embed)\"\n")
+            proc = self._ps51(tmp, body, {"A3_PY": missing_py, "LOCALAPPDATA": local_value,
+                                          "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("%LOCALAPPDATA%\\hermes\\tools\\python-3.12\\python.exe", proc.stdout)
+            self.assertTrue(forge_cmd_path.read_bytes().isascii(), "forge.cmd must stay pure ASCII")
+            env = dict(os.environ)
+            env.update({"LOCALAPPDATA": local_value, "PATH": f"{sentinel_dir}{os.pathsep}{env.get('PATH', '')}"})
+            run = subprocess.run(["cmd.exe", "/d", "/c", str(forge_cmd_path)], capture_output=True,
+                                 text=True, errors="replace", timeout=120, env=env)
+            self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+            self.assertIn("%LOCALAPPDATA%", run.stderr, run.stderr)
+            self.assertFalse(marker.exists(), "the '&' fragment ran a sentinel command")
+
     def test_both_wrappers_run_an_ascii_python_and_propagate_its_exit_code(self):
         if not str(sys.executable).isascii():
             self.skipTest("this runner's own Python is on a non-ASCII path")

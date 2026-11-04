@@ -703,19 +703,32 @@ function Resolve-WrapperPython {
         $savedEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         try {
             # D7 (review): ask py -3 to print sys.executable as an
-            # ASCII-only hex encoding of its raw UTF-16LE code units
-            # (surrogatepass keeps a lone surrogate intact instead of
-            # raising). Under Windows PowerShell 5.1 a bare
-            # `print(sys.executable)` is decoded through the console's
-            # OEM/ANSI code page, which mangles a non-ASCII path (a
-            # non-ASCII Windows user name) before PowerShell ever sees it
-            # -- the reviewer's repro -- making an existing interpreter
-            # look like "no Python 3 found". Hex is 7-bit clean, so the
-            # code page never touches it; this -c program is also kept
-            # free of double quotes (single-quoted PS string; the doubled
-            # '' inside is PS's own escape for an embedded single quote),
-            # because PS 5.1's native-argument quoting of a literal '"' is
+            # ASCII-only hex encoding of its raw UTF-16LE code units.
+            # Hex is 7-bit clean, so the console's OEM/ANSI code page
+            # never touches it -- under Windows PowerShell 5.1 a bare
+            # `print(sys.executable)` is decoded through that code page,
+            # which mangles a non-ASCII path (a non-ASCII Windows user
+            # name) before PowerShell ever sees it -- the reviewer's
+            # repro -- making an existing interpreter look like "no
+            # Python 3 found". This -c program is also kept free of
+            # double quotes (single-quoted PS string; the doubled '' is
+            # PS's own escape for an embedded single quote), because
+            # PS 5.1's native-argument quoting of a literal '"' is
             # unreliable.
+            # C2 (review round 1): 'surrogatepass' keeps a lone surrogate
+            # intact THROUGH sys.executable.encode() on the Python side,
+            # but that is not the whole trip -- the PowerShell side below
+            # decodes the hex with [Text.Encoding]::Unicode, and that
+            # encoding uses U+FFFD REPLACEMENT CHARACTER fallback for an
+            # unpaired surrogate (.NET docs: Encoding.Unicode "Remarks",
+            # https://learn.microsoft.com/en-us/dotnet/api/system.text.encoding.unicode#remarks),
+            # so a lone surrogate does NOT round-trip end to end. That is
+            # fine here: the decoded path then simply fails Test-Path (a
+            # replacement character is not a character any real NTFS
+            # path contains), and falls through to the normal "not
+            # found" handling below -- it fails safe, it just isn't the
+            # exact original path in a report-only variable nothing else
+            # trusts.
             $hex = & py -3 -c 'import sys; print(sys.executable.encode(''utf-16-le'',''surrogatepass'').hex())' 2>$null
         } finally { $ErrorActionPreference = $savedEap }
         if ($LASTEXITCODE -eq 0 -and $hex) {
@@ -758,6 +771,41 @@ function Format-EnvPinForDisplay {
     }
     return $sb.ToString()
 }
+function Test-AsciiOrdinalRange {
+    <# S2 (review round 1): PowerShell's `-match` is CASE-INSENSITIVE by
+       default, and .NET's case folding treats some non-ASCII code points
+       as equal to an ASCII letter -- U+0130 (LATIN CAPITAL LETTER I WITH
+       DOT ABOVE, i.e. Turkish "I") folds to 'i', and U+212A (KELVIN SIGN)
+       folds to 'k' -- so `-match '[^\x20-\x7E]'` reported both as "already
+       ASCII" and let them through unrewritten, and the same bug was in
+       the Assert-WrapperTextAscii defence meant to catch exactly this.
+       Under Windows PowerShell 5.1 (.NET Framework) that folding is also
+       CULTURE-SENSITIVE, so the exact set of affected characters would
+       depend on the machine's locale. This helper never folds case and
+       never uses the regex engine: a plain per-character ordinal ([int]
+       cast of each [char]) comparison against [$Min, $Max], so the result
+       is the same on every machine and every .NET runtime. #>
+    param([string] $Value, [int] $Min, [int] $Max)
+    foreach ($ch in $Value.ToCharArray()) {
+        $code = [int]$ch
+        if ($code -lt $Min -or $code -gt $Max) { return $false }
+    }
+    return $true
+}
+function Get-PersistedEnvVar {
+    <# Thin wrapper around [Environment]::GetEnvironmentVariable(Name,
+       Scope) so Get-CmdPrefixCandidates's registry read can be
+       substituted in a test harness (the static .NET call itself cannot
+       be mocked). Off Windows (this suite also runs under Linux pwsh)
+       the registry-backed overload throws; callers treat that the same
+       as "nothing persisted there". #>
+    param([string] $Name, [string] $Scope)
+    try {
+        return [Environment]::GetEnvironmentVariable($Name, $Scope)
+    } catch {
+        return $null
+    }
+}
 function Get-CmdPrefixCandidates {
     <# D2 (review follow-up): prefix candidates to rewrite a non-ASCII path
        into an %ENVVAR% form a .cmd file can embed verbatim (ASCII) and
@@ -782,18 +830,20 @@ function Get-CmdPrefixCandidates {
     }
     if ($HermesRoot) {
         $trimmedRoot = $HermesRoot.TrimEnd('\')
-        foreach ($scope in @('User', 'Machine')) {
-            try {
-                $persisted = [Environment]::GetEnvironmentVariable('HERMES_ROOT', $scope)
-            } catch {
-                # Not supported off Windows (this suite also runs under
-                # Linux pwsh): treat as "nothing persisted there".
-                $persisted = $null
-            }
-            if ($persisted -and $persisted.TrimEnd('\').Equals($trimmedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $cands.Add([pscustomobject]@{ Name = 'HERMES_ROOT'; Value = $persisted })
-                break
-            }
+        # C1 (review round 1): a user-scope value, when non-empty, is the
+        # one a later cmd.exe process actually sees -- it overrides a
+        # machine-scope value of the same name (the exception is PATH,
+        # which this isn't). The old loop accepted a matching Machine
+        # value even when a DIFFERENT User value was also set, which
+        # would make the rewritten wrapper expand %HERMES_ROOT% to the
+        # wrong path at run time. Compute the effective value the same
+        # way cmd.exe would, and only use it as a prefix if THAT value
+        # equals $HermesRoot.
+        $userVal = Get-PersistedEnvVar 'HERMES_ROOT' 'User'
+        $machineVal = Get-PersistedEnvVar 'HERMES_ROOT' 'Machine'
+        $effective = if ($userVal) { $userVal } else { $machineVal }
+        if ($effective -and $effective.TrimEnd('\').Equals($trimmedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $cands.Add([pscustomobject]@{ Name = 'HERMES_ROOT'; Value = $effective })
         }
     }
     return $cands.ToArray()
@@ -815,7 +865,7 @@ function Resolve-CmdEmbeddablePath {
        nothing written) -- the caller never falls back to a different,
        possibly wrong, interpreter or script. #>
     param([string] $Label, [string] $Path, [object[]] $Prefixes)
-    if (-not ($Path -match '[^\x20-\x7E]')) {
+    if (Test-AsciiOrdinalRange $Path 0x20 0x7E) {
         return [ordered]@{ Embed = $Path; Rewritten = $false }
     }
     $bestName = $null; $bestLen = -1; $bestRemainder = $null
@@ -827,7 +877,7 @@ function Resolve-CmdEmbeddablePath {
         $rest = $Path.Substring($val.Length)
         if ($rest.Length -gt 0 -and $rest[0] -ne '\') { continue }   # separator-boundary check
         $remainder = $rest.TrimStart('\')
-        if ($remainder -match '[^\x20-\x7E]') { continue }
+        if (-not (Test-AsciiOrdinalRange $remainder 0x20 0x7E)) { continue }
         if ($remainder.Contains('%') -or $remainder.Contains('"')) { continue }
         if ($val.Length -gt $bestLen) {
             $bestLen = $val.Length; $bestName = $p.Name; $bestRemainder = $remainder
@@ -850,7 +900,7 @@ function Assert-WrapperTextAscii {
        marker or comment introduced non-ASCII text), and writing a
        silently corrupted wrapper is worse than refusing. #>
     param([string] $Label, [string] $Text)
-    if ($Text -match '[^\x00-\x7F]') {
+    if (-not (Test-AsciiOrdinalRange $Text 0x00 0x7F)) {
         [Console]::Error.WriteLine("Internal error: the generated $Label wrapper is not plain ASCII after path-prefix rewriting; refusing to write it. This should be unreachable -- please report this as a bug.")
         exit 2
     }
@@ -884,8 +934,24 @@ function Get-CmdGuardBlock {
         if (-not $pair.Embed.Rewritten) { continue }
         $gotoLabel = ":${Prefix}_missing_$i"
         $guards += "if not exist `"$($pair.Embed.Embed)`" goto $gotoLabel`r`n"
+        # S1 (review round 1): cmd.exe expands every %VAR% in a line
+        # BEFORE it parses that line, so an earlier version of this echo
+        # printed the EXPANDED path unquoted -- a '&' in it (legal in a
+        # file name, and a plain ASCII remainder such as "R&D" has one)
+        # split the line and ran the fragments after it as commands, on
+        # the very path meant to fail closed. D4 also asked for the
+        # UNEXPANDED form in the message, not the expanded one. Fix:
+        # double every '%' in the rewritten Embed (cmd.exe prints "%%" as
+        # a literal '%' -- see 'for /?' for the %% idiom, used here to
+        # SUPPRESS expansion rather than to loop) and wrap the whole
+        # thing in double quotes. Inside double quotes, '&', '^', '(' and
+        # ')' are literal (cmd's own Remarks: those characters "must be
+        # preceded by ... quotation marks" to be literal), and the
+        # remainder can never contain '"' (Resolve-CmdEmbeddablePath
+        # rejects that), so the quotes can't be closed early.
+        $displayEmbed = $pair.Embed.Embed.Replace('%', '%%')
         $tail += "$gotoLabel`r`n" +
-                 "echo dev-team: $($pair.Label) was not found at $($pair.Embed.Embed) 1>&2`r`n" +
+                 "echo dev-team: $($pair.Label) was not found at `"$displayEmbed`" 1>&2`r`n" +
                  "echo This happens when this wrapper runs under a different Windows user than installed it, or after the Python moved -- re-run install-dev-team-windows.ps1 as this user. 1>&2`r`n" +
                  "exit /b 1`r`n"
         $i++
@@ -939,7 +1005,9 @@ function Assert-CmdWrapperPathsAscii {
        same-named interpreter installed. Accepted rather than further
        mitigated, because: (a) both are Hermes-managed CPython builds laid
        down by the same installer code under the same naming scheme, so
-       any behaviour difference is at most a CPython patch-level one; (b)
+       any behaviour difference is at most a CPython patch-level one (the
+       `python-3.x` directory name pins the minor version, e.g.
+       "python-3.12", so it is never a cross-minor-version mismatch); (b)
        forge.py/deciders.py are stdlib-only by design (no venv, no
        site-packages dependency), so there is nothing version-sensitive a
        different user's interpreter could get wrong; (c) the D4 guard
@@ -949,7 +1017,29 @@ function Assert-CmdWrapperPathsAscii {
        is the same class of residual risk the original "prefer the
        interpreter Hermes itself installed" choice already accepted for
        the single-user case -- "a valid Hermes Python ran this", just not
-       necessarily the one this exact installer run resolved. #>
+       necessarily the one this exact installer run resolved.
+       C5 (review round 1): the same reasoning applies when forge.py or
+       deciders.py itself is rewritten under %USERPROFILE% rather than
+       %LOCALAPPDATA% -- under user B, "%USERPROFILE%\...\forge.py" also
+       resolves into B's OWN checkout at that same relative path, so this
+       is still "a valid install ran this", never some unrelated file.
+       And a SYSTEM/service account that ends up running the wrapper gets
+       its own %LOCALAPPDATA% under ...\systemprofile\AppData\Local,
+       which almost never has a matching hermes\tools\python-3.x there,
+       so the D4 guard fails closed (exit 1, no silent run) rather than
+       accidentally picking up a real user's interpreter.
+       C6 (review round 1, known issue, not fixed): if DelayedExpansion
+       is enabled for cmd.exe (registry default, or the caller invoking
+       this wrapper via `cmd /v:on`), a literal '!' inside an EXPANDED
+       %ENVVAR% value is consumed by cmd's `!var!` syntax instead of
+       being left alone, and '!' is a legal Windows user-name/path
+       character. This is not new in this change -- it already affects
+       any literal, non-rewritten ASCII path with '!' in v1.3.1 -- and
+       DelayedExpansion is off by default, so it is left as a known
+       issue rather than adding `setlocal DisableDelayedExpansion` (which
+       would need to apply only to wrappers that actually contain a
+       rewritten path, since an all-ASCII wrapper must stay
+       byte-identical to v1.3.1). #>
     $prefixes = Get-CmdPrefixCandidates -HermesRoot $HermesRoot
     $embeds = [ordered]@{}
     foreach ($pair in @(

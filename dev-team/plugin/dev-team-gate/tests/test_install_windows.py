@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -2012,8 +2013,8 @@ class WindowsCmdWrapperNonAsciiTests(unittest.TestCase):
         self.text = PS1.read_text(encoding="utf-8")
 
     _WRAPPER_FUNCS = (
-        "Format-EnvPinForDisplay", "Get-CmdPrefixCandidates",
-        "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii",
+        "Format-EnvPinForDisplay", "Test-AsciiOrdinalRange", "Get-PersistedEnvVar",
+        "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii",
         "Get-CmdGuardBlock",
     )
 
@@ -2297,6 +2298,217 @@ class WindowsCmdWrapperNonAsciiTests(unittest.TestCase):
         self.assertIn("py launcher reported", proc.stderr)
         self.assertIn("does not exist", proc.stderr)
         self.assertNotIn("UNREACHABLE", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_guard_echo_pins_quoted_doubled_percent_bytes_for_ampersand_remainder(self):
+        # S1 (review round 1): pin the exact bytes of a rewritten forge.cmd
+        # whose guarded remainder contains '&' (a legal filename char, and
+        # the reviewer's repro used an ASCII remainder "R&D"). The OLD
+        # unquoted/expanded echo would let cmd.exe split this line and run
+        # the fragment after '&' as a command on the fail-closed path.
+        local = "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local"
+        wrapper_python = "C:\\Python312\\python.exe"  # ASCII: embedded literally, no guard
+        forge_py = local + "\\dev-team\\R&D (x)\\forge\\forge.py"
+        deciders_py = local + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = (f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = ''\n"
+                     "$env:APPDATA = ''\n$env:ProgramFiles = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            forge_text = forge_path.read_bytes().decode("ascii")
+            expected_forge = (
+                "@echo off\r\n"
+                "REM dev-team forge wrapper (install-dev-team-windows.ps1)\r\n"
+                'if not exist "%LOCALAPPDATA%\\dev-team\\R&D (x)\\forge\\forge.py" goto :dt_forge_missing_0\r\n'
+                '"C:\\Python312\\python.exe" "%LOCALAPPDATA%\\dev-team\\R&D (x)\\forge\\forge.py" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n"
+                ":dt_forge_missing_0\r\n"
+                'echo dev-team: forge.py was not found at "%%LOCALAPPDATA%%\\dev-team\\R&D (x)\\forge\\forge.py" 1>&2\r\n'
+                "echo This happens when this wrapper runs under a different Windows user than "
+                "installed it, or after the Python moved -- re-run install-dev-team-windows.ps1 "
+                "as this user. 1>&2\r\n"
+                "exit /b 1\r\n")
+            self.assertEqual(forge_text, expected_forge)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_guard_structure_guards_before_run_line_labels_after_errorlevel_exit(self):
+        # S1/C3: structural shape of the guard block, not just substrings
+        # -- every "if not exist" guard line comes before the run line
+        # (and hence before "exit /b %ERRORLEVEL%"), every ":label" comes
+        # after it, and every goto target has a matching label.
+        local = "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local"
+        wrapper_python = local + "\\hermes\\tools\\python-3.12\\python.exe"
+        forge_py = local + "\\dev-team\\forge\\forge.py"
+        deciders_py = local + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = (f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = ''\n"
+                     "$env:APPDATA = ''\n$env:ProgramFiles = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            for p in (forge_path, deciders_path):
+                text = p.read_bytes().decode("ascii")
+                lines = text.split("\r\n")
+                errorlevel_idx = lines.index("exit /b %ERRORLEVEL%")
+                guard_idxs = [i for i, l in enumerate(lines) if l.startswith("if not exist")]
+                label_idxs = [i for i, l in enumerate(lines) if l.startswith(":")]
+                self.assertTrue(guard_idxs, f"{p} has no guard lines")
+                self.assertTrue(label_idxs, f"{p} has no labels")
+                self.assertTrue(all(i < errorlevel_idx for i in guard_idxs),
+                                 f"{p}: a guard line comes after the run line")
+                self.assertTrue(all(i > errorlevel_idx for i in label_idxs),
+                                 f"{p}: a label comes before exit /b %ERRORLEVEL%, so it "
+                                 "could be fallen into on the success path")
+                goto_targets = {t.lstrip(":") for t in re.findall(r"goto (\S+)", text)}
+                label_names = {l[1:] for l in lines if l.startswith(":")}
+                self.assertEqual(goto_targets, label_names, f"{p}: goto/label mismatch")
+                self.assertEqual(len(goto_targets), 2, f"{p}: expected one guard per rewritten path")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_non_ascii_lookalike_i_with_dot_above_is_rewritten_not_corrupted(self):
+        # S2: U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE, Turkish "I")
+        # folds to ASCII 'i' under PowerShell's default case-insensitive
+        # -match, so the old check reported this path as already
+        # printable ASCII, embedded it literally, and -Encoding ascii
+        # then wrote '?' in its place.
+        local = "C:\\Users\\\u0130smail\\AppData\\Local"
+        wrapper_python = local + "\\hermes\\tools\\python-3.12\\python.exe"
+        forge_py = local + "\\dev-team\\forge\\forge.py"
+        deciders_py = local + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = (f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = ''\n"
+                     "$env:APPDATA = ''\n$env:ProgramFiles = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            forge_text = forge_path.read_bytes().decode("ascii")
+            self.assertIn("%LOCALAPPDATA%\\hermes\\tools\\python-3.12\\python.exe", forge_text)
+            self.assertNotIn("?", forge_text, "the non-ASCII İ was corrupted into '?'")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_non_ascii_lookalike_kelvin_sign_is_rewritten_not_corrupted(self):
+        # S2: U+212A KELVIN SIGN folds to ASCII 'k' under the same bug.
+        local = "C:\\Users\\\u212Aelvin\\AppData\\Local"
+        wrapper_python = local + "\\hermes\\tools\\python-3.12\\python.exe"
+        forge_py = local + "\\dev-team\\forge\\forge.py"
+        deciders_py = local + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = (f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = ''\n"
+                     "$env:APPDATA = ''\n$env:ProgramFiles = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            forge_text = forge_path.read_bytes().decode("ascii")
+            self.assertIn("%LOCALAPPDATA%\\hermes\\tools\\python-3.12\\python.exe", forge_text)
+            self.assertNotIn("?", forge_text, "the non-ASCII Kelvin sign was corrupted into '?'")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_non_ascii_lookalike_with_no_usable_prefix_refuses_with_exit_2(self):
+        # S2: the same lookalike under no known prefix must still hard-refuse
+        # (exit 2, nothing written), not silently embed it as "ASCII".
+        wrapper_python = "D:\\P\u0130thon\\python.exe"
+        forge_py = "C:\\dev-team\\forge\\forge.py"
+        deciders_py = "C:\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = ("$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n"
+                     "$env:APPDATA = ''\n$env:ProgramFiles = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("not printable ASCII", proc.stderr)
+        self.assertFalse(forge_path.exists())
+        self.assertFalse(deciders_path.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_d9_defense_catches_a_case_insensitive_ascii_lookalike(self):
+        # S2: Assert-WrapperTextAscii (D9, defence in depth) has the same
+        # case-insensitive -match bug as Resolve-CmdEmbeddablePath; feed it
+        # text containing U+0130 directly (bypassing path resolution) and
+        # confirm it still refuses with exit 2.
+        ordinal_fn = _function(self.text, "Test-AsciiOrdinalRange")
+        assert_fn = _function(self.text, "Assert-WrapperTextAscii")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "d9.ps1"
+            harness.write_text(
+                ordinal_fn + "\n" + assert_fn + "\n"
+                + "Assert-WrapperTextAscii 'test' \"malicious \u0130 text\"\n"
+                "Write-Output 'UNREACHABLE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Internal error", proc.stderr)
+        self.assertNotIn("UNREACHABLE", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_hermes_root_prefix_uses_effective_value_not_any_matching_scope(self):
+        # C1: the effective HERMES_ROOT a later cmd.exe sees is the User
+        # value when it's non-empty, else the Machine value. A DIFFERENT
+        # User value must not be shadowed by a Machine value that happens
+        # to match $HermesRoot -- Get-PersistedEnvVar is the seam this
+        # fix introduced so the registry read can be stubbed in a test.
+        hermes_root = "C:\\dev-team\\hermes"
+        ordinal_fn = _function(self.text, "Test-AsciiOrdinalRange")
+        func_body = _function(self.text, "Get-CmdPrefixCandidates")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "c1.ps1"
+            harness.write_text(
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n"
+                "$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+                "function Get-PersistedEnvVar {\n"
+                "    param([string] $Name, [string] $Scope)\n"
+                "    if ($Scope -eq 'User') { return 'C:\\dev-team\\OTHER' }\n"
+                f"    if ($Scope -eq 'Machine') {{ return '{hermes_root}' }}\n"
+                "    return $null\n"
+                "}\n"
+                + ordinal_fn + "\n" + func_body + "\n"
+                + f"$r = Get-CmdPrefixCandidates -HermesRoot '{hermes_root}'\n"
+                "Write-Output \"NAMES=$($r | ForEach-Object { $_.Name })\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("HERMES_ROOT", proc.stdout,
+                         "a Machine value shadowed by a different User value must not be used")
+
+    def test_py_launcher_c_program_has_no_double_quotes_and_decodes_round_trip(self):
+        # C4: the py -3 -c program (never directly asserted before) must
+        # contain no '"' (PS 5.1's native-argument quoting of a literal
+        # '"' is unreliable -- see the comment at the call site), and must
+        # actually decode a non-ASCII sys.executable end to end: real
+        # python3 runs the EXACT extracted program (with sys.executable
+        # patched to a non-ASCII value), and the installer's OWN decode
+        # snippet (also extracted verbatim, run under pwsh) must recover
+        # the exact original string.
+        m = re.search(r"& py -3 -c '(.*)' 2>\$null", self.text)
+        self.assertIsNotNone(m, "could not find the py -3 -c invocation")
+        program = m.group(1).replace("''", "'")
+        self.assertNotIn('"', program, "the -c program must stay free of double quotes")
+        non_ascii_exec = "C:\\Users\\Dr\u0103go\u0219\\python.exe"
+        full_program = f"import sys; sys.executable = {non_ascii_exec!r}\n" + program
+        py_proc = subprocess.run([sys.executable, "-c", full_program],
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(py_proc.returncode, 0, py_proc.stderr)
+        hex_out = py_proc.stdout.strip()
+        self.assertRegex(hex_out, r"^([0-9a-f]{4})+$")
+        if not shutil.which("pwsh"):
+            self.skipTest("pwsh not installed")
+        start = self.text.index("$hexTrimmed = ([string]$hex).Trim()")
+        end = self.text.index("$decoded = [Text.Encoding]::Unicode.GetString($bytes)") + \
+            len("$decoded = [Text.Encoding]::Unicode.GetString($bytes)")
+        decode_snippet = self.text[start:end] + "\n}\n"  # close the `if` block (slice already closes the `for`)
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "decode.ps1"
+            harness.write_text(f"$hex = '{hex_out}'\n" + decode_snippet +
+                               "\nWrite-Output \"DECODED=$decoded\"\n")
+            ps_proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                     capture_output=True, text=True, timeout=60)
+        self.assertEqual(ps_proc.returncode, 0, ps_proc.stdout + ps_proc.stderr)
+        self.assertIn(f"DECODED={non_ascii_exec}", ps_proc.stdout, ps_proc.stdout)
 
 
 if __name__ == "__main__":

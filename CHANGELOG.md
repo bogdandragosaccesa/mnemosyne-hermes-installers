@@ -30,6 +30,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   purely by discovery order again — representability no longer steers which interpreter is
   chosen, only whether its path can be embedded. An all-ASCII install's wrapper stays
   byte-identical to 1.3.1's.
+- **The guard's "not found" message could run a command instead of just printing a path.**
+  `cmd.exe` expands every `%VAR%` in a line before parsing it, so the message printed the
+  *expanded* path unquoted; an `&` in it (a legal filename character, present in e.g.
+  `R&D`) split the line and ran the trailing fragment as a command on the very path meant
+  to fail closed. The message now prints the unexpanded `%ENVVAR%` form (every `%` doubled)
+  wrapped in double quotes, so it is inert and matches what D4 originally asked for.
+- **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
+  corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
+  case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
+  and the defence-in-depth check before the wrapper is written — both missed them, and
+  `-Encoding ascii` turned them into `?`. Both checks now compare ordinal character codes
+  with no case folding and no regex engine, so the result no longer depends on the
+  machine's culture.
 
 ## [1.3.1] - 2026-11-04
 

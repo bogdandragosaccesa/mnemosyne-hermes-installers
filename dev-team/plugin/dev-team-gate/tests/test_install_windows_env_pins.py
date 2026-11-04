@@ -311,8 +311,8 @@ class CmdWrapperRefusalTests(unittest.TestCase):
     (exit 2, before anything is written), per the comment above
     Assert-CmdWrapperPathsAscii in the installer."""
 
-    _EXTRA_FUNCS = ("Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
-                    "Assert-WrapperTextAscii", "Get-CmdGuardBlock")
+    _EXTRA_FUNCS = ("Test-AsciiOrdinalRange", "Get-PersistedEnvVar", "Get-CmdPrefixCandidates",
+                    "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii", "Get-CmdGuardBlock")
 
     def _run(self, tmp, python_path, forge_py="/ascii/forge/forge.py",
              deciders_py="/ascii/deciders/deciders.py", env_extra=None):
