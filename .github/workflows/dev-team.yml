@@ -33,6 +33,16 @@ jobs:
       - name: deciders unit tests
         run: python3 -m unittest discover -s dev-team/deciders/tests
 
+      - name: scripts unit tests (stdlib-only venv)
+        # The checker's own suite (env_pin_check.py, kanban-budget.py) must
+        # pass with the standard library alone: no python-dotenv, no pwsh,
+        # no Mnemosyne venv. Any test that needs one of those skips cleanly
+        # with a reason instead of failing. python3 -I additionally ignores
+        # user site-packages and PYTHON* env vars.
+        run: |
+          python3 -m venv --without-pip /tmp/dev-team-scripts-stdlib-venv
+          /tmp/dev-team-scripts-stdlib-venv/bin/python3 -I -m unittest discover -s dev-team/scripts/tests -v
+
   install-linux:
     runs-on: ubuntu-latest
     steps:
@@ -310,4 +320,20 @@ jobs:
           & (Join-Path $env:GITHUB_WORKSPACE '.github\scripts\check-team-bank.ps1') `
             -HermesRoot $root -MnemosyneCli $cli -InitProfile 'dev-architect' `
             -ProfileDir $profileDirs -PrivateProfile @('dev-pm')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Set up Python for the Windows-only unit tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # A3 (PR #9 follow-ups): cmd.exe, Windows PowerShell 5.1 and a UTF-16
+      # environment block exist only on this runner. Proves, under 5.1, that
+      # the .env pin checker gets the value exact, and that forge.cmd /
+      # deciders.cmd refuse a non-ASCII path instead of being written
+      # corrupted (dev-team/plugin/dev-team-gate/tests/test_install_windows_nt.py).
+      - name: Windows-only env-pin and cmd-wrapper evidence (A3)
+        shell: powershell
+        run: |
+          python -m unittest discover -v -s dev-team/plugin/dev-team-gate/tests -p test_install_windows_nt.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

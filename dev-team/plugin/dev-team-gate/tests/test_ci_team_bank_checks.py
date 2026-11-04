@@ -59,9 +59,9 @@ class Layout:
 
     def __init__(self, tmp, *, team_links_to_operator=False, private=(),
                  profile_links_to=None, pin_to_operator=(), no_team_bank=False,
-                 quote_pins=False):
+                 quote_pins=False, root_name="hermes"):
         self.tmp = Path(tmp)
-        self.root = self.tmp / "hermes"
+        self.root = self.tmp / root_name
         self.operator = self.root / "mnemosyne"
         self.team = self.root / "dev-team-mnemosyne"
         (self.operator / "data").mkdir(parents=True)
@@ -97,8 +97,10 @@ class Layout:
                 def q(v):  # item 4a (review r3): same escapes as the installer
                     return "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
                 data_val, home_val = q(data_val), q(home_val)
+            # BOM-less UTF-8, as Set-EnvVarPin / set_env_var write it.
             (d / ".env").write_text(
-                f"OTHER=1\nMNEMOSYNE_DATA_DIR={data_val}\nMNEMOSYNE_HOME={home_val}\n")
+                f"OTHER=1\nMNEMOSYNE_DATA_DIR={data_val}\nMNEMOSYNE_HOME={home_val}\n",
+                encoding="utf-8")
         self.cli = self.tmp / "bin" / "mnemosyne"
         self.cli.parent.mkdir()
         self.cli.write_text(FAKE_CLI)
@@ -207,6 +209,19 @@ class _CheckContract:
     # Unquote-EnvPin/unquote_env_pin comments); this exercises the
     # legacy-only unquoting path in case a pin from that brief quoted
     # window is still on disk.
+    # PR #9 review section 3: under Windows PowerShell 5.1 a Get-Content
+    # with no -Encoding decodes these BOM-less UTF-8 pins as ANSI, so a
+    # non-ASCII bank path failed the check falsely. The pwsh driver below
+    # models 5.1's default (see _PS51_ANSI_DEFAULTS).
+    def test_non_ascii_bank_path_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lay = Layout(tmp, private=("dev-pm",),
+                         root_name="Dr\u0103go\u0219 \u0105\u00c5\u0445 \u56e2\u961f\u30d0\u30f3\u30af")
+            proc = self.check(lay, private=("dev-pm",))
+            self.assertPasses(proc)
+            self.assertTrue(lay.team_db.is_file(), "team DB was not created under dev-team-mnemosyne/data")
+            self.assertEqual(lay.operator_db.read_bytes(), b"operator-bank", "operator DB was written")
+
     def test_quoted_env_pin_is_still_resolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             lay = Layout(tmp, private=("dev-pm",), quote_pins=True)
@@ -227,6 +242,17 @@ class BashTeamBankCheckTests(_CheckContract, unittest.TestCase):
         return subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
 
 
+# pwsh 7 defaults Get-Content/Set-Content/Add-Content to UTF-8, Windows
+# PowerShell 5.1 (the ps51 job's shell) to the ANSI code page. Model 5.1 so
+# a cmdlet relying on that default reads these UTF-8 files the way 5.1 would;
+# an explicit encoding or a .NET call is unaffected, which is the fix.
+_PS51_ANSI_DEFAULTS = (
+    "$PSDefaultParameterValues['Set-Content:Encoding'] = 'Latin1'\n"
+    "$PSDefaultParameterValues['Add-Content:Encoding'] = 'Latin1'\n"
+    "$PSDefaultParameterValues['Get-Content:Encoding'] = 'Latin1'\n"
+)
+
+
 @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
 class PwshTeamBankCheckTests(_CheckContract, unittest.TestCase):
     def check(self, layout, *, init="dev-architect", private=()):
@@ -236,9 +262,10 @@ class PwshTeamBankCheckTests(_CheckContract, unittest.TestCase):
         priv = ",".join(q(p) for p in private) or ""
         driver = Path(layout.tmp) / "driver.ps1"
         driver.write_text(
+            _PS51_ANSI_DEFAULTS +
             f"& {q(PS1)} -HermesRoot {q(layout.root)} -MnemosyneCli {q(layout.cli)} "
             f"-InitProfile {q(init)} -ProfileDir @({profiles}) -PrivateProfile @({priv})\n"
-            "exit $LASTEXITCODE\n")
+            "exit $LASTEXITCODE\n", encoding="utf-8")
         env = {k: v for k, v in os.environ.items() if not k.startswith("MNEMOSYNE_")}
         return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
                               capture_output=True, text=True, timeout=120, env=env)

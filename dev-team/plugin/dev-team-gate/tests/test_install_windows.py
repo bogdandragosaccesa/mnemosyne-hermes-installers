@@ -60,6 +60,24 @@ def _function(text: str, name: str) -> str:
     return text[start:end + 2]
 
 
+ENV_PIN_CHECK_PY = DEV_TEAM / "scripts" / "env_pin_check.py"
+
+
+def _pin_prelude(text, python=None):
+    """What every harness that pins (or runs the -TeamMemory setup slice)
+    needs from outside its slice (A3): the interpreter the installer
+    resolves before any pin logic -- here the one running this suite -- the
+    checker's path, and the pin gate's functions. Redefining a function the
+    slice also defines is harmless: both definitions are the same text."""
+    import sys
+    py = (python or sys.executable).replace("'", "''")
+    return (f"$WrapperPython = '{py}'\n"
+            f"$EnvPinCheckPy = '{str(ENV_PIN_CHECK_PY).replace(chr(39), chr(39) * 2)}'\n"
+            + "".join(_function(text, f) + "\n" for f in (
+                "Format-EnvPinForDisplay", "Get-EnvPinCheckerReason",
+                "Get-EnvUnsafeValueReason", "Assert-EnvPinSafe")))
+
+
 class WindowsInstallerTests(unittest.TestCase):
     def setUp(self):
         # read_text translates CRLF, so "\n" works for either line ending
@@ -138,7 +156,7 @@ class WindowsInstallerTests(unittest.TestCase):
             harness = Path(tmp) / "env_pin.ps1"
             harness.write_text(
                 self._PS51_LEGACY_ENCODING_PRELUDE
-                + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '{bank}'\n"
                 + "Write-Output 'PIN_DONE'\n")
@@ -165,7 +183,7 @@ class WindowsInstallerTests(unittest.TestCase):
             harness = Path(tmp) / "env_pin_rewrite.ps1"
             harness.write_text(
                 self._PS51_LEGACY_ENCODING_PRELUDE
-                + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                + _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new'\n"
                 + "Write-Output 'PIN_DONE'\n")
@@ -198,7 +216,7 @@ class WindowsInstallerTests(unittest.TestCase):
             profile_dir.mkdir(parents=True)
             harness = Path(tmp) / "env_pin_special.ps1"
             harness.write_text(
-                _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value \"{bank}\"\n"
                 + "Write-Output 'PIN_DONE'\n")
@@ -242,7 +260,7 @@ class WindowsInstallerTests(unittest.TestCase):
             env_file.write_text("MNEMOSYNE_HOME='/old/quoted'\nOTHER=keep\n", encoding="utf-8")
             harness = Path(tmp) / "env_pin_rerun.ps1"
             harness.write_text(
-                _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+                _pin_prelude(self.text)
                 + _function(self.text, "Set-EnvVarPin") + "\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new/bank'\n"
                 + f"Set-EnvVarPin -ProfileDir '{profile_dir}' -VarName 'MNEMOSYNE_HOME' -Value '/new/bank2'\n"
@@ -271,7 +289,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n"
             "$TeamMemory = $env:TEAM_MEMORY_ARG\n"
-            + norm_fn + "\n" + snippet +
+            + _pin_prelude(self.text) + norm_fn + "\n" + snippet +
             "\nWrite-Output \"TEAM_HOME=$TeamMemoryHome\"\n")
         return harness
 
@@ -379,7 +397,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness = Path(tmp) / "profile_dir_guard.ps1"
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n$TeamMemory = $null\n"
-            + norm_fn + "\n" + dirlink_fn + "\n" + helpers +
+            + _pin_prelude(self.text) + norm_fn + "\n" + dirlink_fn + "\n" + helpers +
             f"\n$name = 'dev-qa'\n$profileDir = '{profile_dir}'\n"
             f"$KeepSoul = $false\n$DryRun = $false\n$soul = '{hermes_root}\\SOUL.md'\n"
             f"$Prefix = 'dev-'\n$PluginSrcMnemo = '{plugin_src_mnemo}'\n"
@@ -472,7 +490,7 @@ class WindowsInstallerTests(unittest.TestCase):
         harness = Path(tmp) / "separate_memory.ps1"
         harness.write_text(
             _function(self.text, "New-DirLink") + "\n"
-            + _function(self.text, "Get-EnvUnsafeValueReason") + "\n"
+            + _pin_prelude(self.text)
             + _function(self.text, "Set-EnvVarPin") + "\n"
             + _function(self.text, "Set-MnemosyneDataDirPin") + "\n"
             + f"$DryRun = ${'true' if dry_run else 'false'}\n$SeparateMemory = $true\n"
@@ -705,6 +723,11 @@ class WindowsInstallerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
+def _root_lines(stdout):
+    """The ROOT= lines a root-climb harness printed, each whole."""
+    return [line for line in stdout.splitlines() if line.startswith("ROOT=")]
+
+
 class WindowsT4TeamHomeRootTests(unittest.TestCase):
     """T4: the team home must live at the Hermes root, not inside whatever
     profile happens to be running the installer. install-dev-team-windows.ps1
@@ -720,7 +743,14 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_root_climb_logic_climbs_out_of_a_profile_directory(self):
         start = self.text.index("$RootConfig = Get-HermesLastLine")
-        end = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        # Stop before $WrapperPython = Resolve-WrapperPython is actually
+        # invoked: the root-climb logic this test exercises is fully
+        # computed by $HermesRoot above, and this sandbox has no 'python'
+        # (or Hermes tools / py launcher) to resolve, so running the
+        # wrapper-python resolution here would fail closed on a host that
+        # legitimately lacks a 'python' command, unrelated to what this
+        # test checks.
+        end = self.text.index("$WrapperPython = Resolve-WrapperPython")
         snippet = self.text[start:end]
         self.assertIn("-eq 'profiles'", snippet, "no profiles-climb check")
         with tempfile.TemporaryDirectory() as tmp:
@@ -737,12 +767,18 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
                                   capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"ROOT={root}", proc.stdout)
+        # Compare the whole ROOT= line, not a substring: without the climb
+        # the output is ROOT=<root>/profiles/devops, which still contains
+        # "ROOT=<root>", so an assertIn on stdout cannot see the climb go.
+        self.assertEqual(_root_lines(proc.stdout), [f"ROOT={root}"], proc.stdout)
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_root_climb_logic_leaves_the_true_root_alone(self):
         start = self.text.index("$RootConfig = Get-HermesLastLine")
-        end = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        # See the sibling test above: stop before the wrapper-python
+        # resolution is invoked, so this test doesn't require a 'python'
+        # command on the host.
+        end = self.text.index("$WrapperPython = Resolve-WrapperPython")
         snippet = self.text[start:end]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "hermes"
@@ -757,7 +793,9 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
                                   capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"ROOT={root}", proc.stdout)
+        # Whole-line match (see the sibling test): an over-climb that keeps
+        # the <root> prefix must fail too.
+        self.assertEqual(_root_lines(proc.stdout), [f"ROOT={root}"], proc.stdout)
 
     def _migration_harness(self, tmp):
         norm_fn = _function(self.text, "Get-NormalizedPath")
@@ -1299,7 +1337,7 @@ class WindowsTeamMemoryTests(unittest.TestCase):
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n"
             f"{team_memory_param}\n"
-            + norm_fn + "\n" + snippet +
+            + _pin_prelude(self.text) + norm_fn + "\n" + snippet +
             "\nWrite-Output \"TEAM_HOME=$TeamMemoryHome\"\n")
         return harness
 
@@ -1745,7 +1783,7 @@ class WindowsMnemosyneDataLinkTests(unittest.TestCase):
         kwargs_lines = "\n".join(f"${k} = {v}" for k, v in call_kwargs.items())
         harness.write_text(
             f"$HermesRoot = '{hermes_root}'\n$TeamMemory = $null\n"
-            + norm_fn + "\n" + dirlink_fn + "\n" + snippet + "\n" + fn_body +
+            + _pin_prelude(self.text) + norm_fn + "\n" + dirlink_fn + "\n" + snippet + "\n" + fn_body +
             "\nNew-Item -ItemType Directory -Path $TeamMemoryHome -Force | Out-Null\n"
             f"\n{kwargs_lines}\n"
             f"$r = Invoke-MnemosyneDataLink -ProfileDir $ProfileDirArg -Name $NameArg -Exists $ExistsArg "

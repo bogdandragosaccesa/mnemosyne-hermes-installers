@@ -176,6 +176,10 @@ $ForgePy        = Join-Path $ScriptDir 'forge\forge.py'
 $KanbanBudgetPy = Join-Path $ScriptDir 'scripts\kanban-budget.py'
 $DecidersPy       = Join-Path $ScriptDir 'deciders\deciders.py'
 $DecidersSkillDir = Join-Path $SkillsDir 'dev-team-deciders'
+# The .env pin checker (dev-team\scripts\env_pin_check.py): it decides
+# every MNEMOSYNE_HOME / MNEMOSYNE_DATA_DIR pin this installer writes
+# (Get-EnvPinCheckerReason / Assert-EnvPinSafe, below).
+$EnvPinCheckPy    = Join-Path (Join-Path $ScriptDir 'scripts') 'env_pin_check.py'
 
 # Refuse a decisions-only model in the tier table before anything is
 # written: an agent worker on a card routed to it could not run at all. The
@@ -660,6 +664,113 @@ $HermesRoot     = Split-Path -Parent $RootConfig
 if ((Split-Path -Leaf (Split-Path -Parent $HermesRoot)) -eq 'profiles') {
     $HermesRoot = Split-Path -Parent (Split-Path -Parent $HermesRoot)
 }
+# The wrappers name an absolute python.exe. A bare `python` resolves, on a
+# machine without a system Python, to the Microsoft Store alias stub in
+# WindowsApps, which prints 'Python was not found' and exits 9009 (seen in
+# CI on both runners). Prefer the interpreter Hermes itself installed, then
+# the py launcher's Python 3, then a real python.exe on PATH.
+# Resolved here, before anything is written: the same interpreter runs
+# dev-team\scripts\env_pin_check.py on every .env pin (Assert-EnvPinSafe),
+# and a wrapper path cmd.exe cannot read is refused before any profile is
+# touched (Assert-CmdWrapperPathsAscii).
+function Resolve-WrapperPython {
+    <# Candidates in that order; the first whose path is printable ASCII
+       wins, because forge.cmd/deciders.cmd embed it and cmd.exe cannot read
+       a non-ASCII path there (Assert-CmdWrapperPathsAscii). So a Hermes
+       Python under a non-ASCII %LOCALAPPDATA% (a non-ASCII user name) gives
+       way to an ASCII-path Python further down. With no ASCII candidate the
+       first one is returned, and the guard refuses it by name. #>
+    $first = $null
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $toolsDir = Join-Path $env:LOCALAPPDATA 'hermes\tools'
+    if (Test-Path -LiteralPath $toolsDir) {
+        Get-ChildItem -LiteralPath $toolsDir -Directory -Filter 'python-3*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { $candidates.Add($_) }
+        foreach ($c in $candidates) {
+            if (-not $first) { $first = $c }
+            if ($c -notmatch '[^\x20-\x7E]') { return $c }
+        }
+    }
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        # 'Continue' locally: under 'Stop', PS 5.1 turns a native command's
+        # redirected stderr (py with no Python 3 installed) into a terminating
+        # error, which would abort the install instead of falling through.
+        $savedEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $launched = & py -3 -c 'import sys; print(sys.executable)' 2>$null } finally { $ErrorActionPreference = $savedEap }
+        if ($LASTEXITCODE -eq 0 -and $launched -and (Test-Path -LiteralPath $launched.Trim())) {
+            $c = $launched.Trim()
+            if (-not $first) { $first = $c }
+            if ($c -notmatch '[^\x20-\x7E]') { return $c }
+        }
+    }
+    $onPath = @(Get-Command python -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and $_.Source -notmatch '\\WindowsApps\\' } | ForEach-Object { $_.Source })
+    foreach ($c in $onPath) {
+        if (-not $first) { $first = $c }
+        if ($c -notmatch '[^\x20-\x7E]') { return $c }
+    }
+    return $first
+}
+function Format-EnvPinForDisplay {
+    <# $Value with every UTF-16 code unit outside printable ASCII shown as
+       \uXXXX (so a lone surrogate shows too): a refusal never puts a raw
+       control or line-break character on the console, and reads the same
+       under any console code page. #>
+    param([string] $Value)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Value.ToCharArray()) {
+        $code = [int]$ch
+        if ($code -ge 0x20 -and $code -le 0x7E) { [void]$sb.Append($ch) }
+        else { [void]$sb.Append(('\u{0:X4}' -f $code)) }
+    }
+    return $sb.ToString()
+}
+function Assert-CmdWrapperPathsAscii {
+    <# PR #9 review section 3: forge.cmd and deciders.cmd embed absolute
+       paths ($WrapperPython, $ForgePy, $DecidersPy), and used to be
+       written with -Encoding ascii, which turns C:\Users\<non-ASCII name>
+       into '?'. Decision: REFUSE a non-ASCII path (exit 2, before
+       anything is written), because no encoding is provably read back by
+       cmd.exe on every machine:
+         - cmd.exe reads a batch file as 8-bit text in the console's code
+           page, not as Unicode: a UTF-16 batch file stops at its first NUL
+           byte, and the fix is to save it as ANSI (Raymond Chen, Microsoft,
+           "Diagnosing why your batch file prints a garbage character, one
+           character, and nothing more", The Old New Thing, 2021-07-26,
+           https://devblogs.microsoft.com/oldnewthing/20210726-00/?p=105483).
+           So UTF-8 bytes are misread under any OEM/ANSI code page, and the
+           ANSI code page of the installing machine is not the one of every
+           console that later runs the wrapper.
+         - `chcp 65001` inside the wrapper: chcp "Changes the active console
+           code page" (https://learn.microsoft.com/windows-server/
+           administration/windows-commands/chcp) -- the CALLER's console,
+           left changed for whatever runs in it next -- and no Microsoft
+           documentation states that cmd.exe decodes the rest of a running
+           batch file in the new code page.
+         - the 8.3 short name: short-name creation can be disabled per
+           volume, and a file created while it was disabled has none
+           (https://learn.microsoft.com/windows-server/administration/
+           windows-commands/fsutil-8dot3name), so it may not exist.
+       Never write a silently corrupted wrapper. #>
+    foreach ($pair in @(@('the wrapper Python', $WrapperPython), @('forge.py', $ForgePy), @('deciders.py', $DecidersPy))) {
+        $label = $pair[0]
+        $path = $pair[1]
+        if ($path -and ($path -match '[^\x20-\x7E]')) {
+            [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $label, $(Format-EnvPinForDisplay $path), is not printable ASCII. cmd.exe reads a .cmd file in the console code page, so that path would be corrupted in the wrapper. Use a Python 3 (and a dev-team checkout) on an ASCII-only path -- e.g. Python installed under C:\Python312 and first on PATH -- then re-run.")
+            exit 2
+        }
+    }
+}
+$WrapperPython = Resolve-WrapperPython
+if (-not $WrapperPython) {
+    [Console]::Error.WriteLine("No Python 3 found for the forge and deciders wrappers and the .env pin checker (looked in $env:LOCALAPPDATA\hermes\tools, the py launcher, and PATH outside WindowsApps). Install Hermes or Python 3, then re-run.")
+    exit 1
+}
+Assert-CmdWrapperPathsAscii
+Write-Host "wrapper python: $WrapperPython"
+
 $PluginSrcMnemo = Join-Path $HermesRoot 'plugins\mnemosyne'
 # The team's shared Mnemosyne bank: a dedicated directory, never the
 # operator's own bank ($HermesRoot\mnemosyne, or whatever MNEMOSYNE_HOME
@@ -841,35 +952,53 @@ function Test-PathIsOrUnder {
     return $Desc.StartsWith("$Anc$sep", [System.StringComparison]::OrdinalIgnoreCase)
 }
 function Get-EnvUnsafeValueReason {
-    <# review r3 minor #4 (round 2): the pin format decided for the .env
-       writer is unquoted KEY=value (Set-EnvVarPin, below) -- NOT
+    <# A PowerShell-side SUBSET of dev-team\scripts\env_pin_check.py. The
+       checker (Get-EnvPinCheckerReason, below) is the authority: every pin
+       goes through Assert-EnvPinSafe, which runs this first -- for the
+       specific messages -- and then the checker. Every rule here is also
+       a checker rule; the checker refuses strictly more: every
+       str.splitlines() boundary (U+000B, U+000C, U+001C-U+001E, U+0085,
+       U+2028, U+2029) anywhere, the Python-isspace() characters .NET's \s
+       lacks (U+001C-U+001F) at either end or before '#', unassigned code
+       points, and anything its transcribed readers read back differently.
+
+       The pin format is unquoted KEY=value (Set-EnvVarPin, below) -- NOT
        python-dotenv's single-quote-escaped format, which does not round-
-       trip through Mnemosyne's own .env reader (mcp_server.py
-       :_load_dotenv, ~823-833: `v.strip().strip("'\"")`, which strips a
-       bounding quote character but never unescapes `\\` or `\'`, so an
-       escaped value comes back corrupted there). Unquoted values read
-       back byte-exact through BOTH readers except for the shapes below,
-       so refuse those up front instead of silently writing a value
-       either reader would misread:
+       trip through Mnemosyne's own .env reader (mnemosyne mcp_server.py
+       _load_dotenv, :832 `v.strip().strip("'\"")`, which never unescapes
+       `\\` or `\'`). Refused here:
+         - an unpaired UTF-16 surrogate -- it has no UTF-8 encoding:
+           Set-EnvVarPin's UTF8Encoding($false) would silently write U+FFFD
+           instead (and outside Windows .NET hands the checker U+FFFD too,
+           so there only this rule sees it);
          - a newline (CR or LF) -- would split into more than one .env line;
-         - leading/trailing whitespace -- Mnemosyne's reader strips it,
-           python-dotenv's parser does not, so the two readers would
-           disagree on the stored value;
+         - leading/trailing whitespace -- BOTH readers strip it, so what is
+           read back is not the value pinned (nor the link target):
+           python-dotenv 1.2.2 consumes whitespace after '=' (parser.py:24
+           `_equal_sign` = `(=[^\S\r\n]*)`, read at :157) and rstrip()s an
+           unquoted value (parser.py:123-125 parse_unquoted_value), and
+           Mnemosyne's reader does `v.strip()` (mcp_server.py:832);
          - a leading/trailing quote character (' or ") -- Mnemosyne's
-           reader strips exactly one bounding pair, python-dotenv's does
-           not unless the whole value is quoted, so the two disagree;
-         - whitespace immediately followed by '#' -- python-dotenv's
-           parser truncates there (`/t/x #y` becomes `/t/x`); Mnemosyne's
-           naive reader does not;
+           `.strip("'\"")` removes any number of quote characters from each
+           end, paired or not, while python-dotenv parses a leading quote
+           as the start of a quoted value; neither gives the value back;
+         - whitespace immediately followed by '#' -- python-dotenv's parser
+           cuts the value there (parser.py:125 `\s+#.*`, Unicode-aware, so
+           NBSP counts: `/t/x #y` becomes `/t/x`); Mnemosyne's reader does
+           not;
          - a literal '${' -- python-dotenv (via env_loader's
            _resolve_dotenv_assignments) expands `${VAR}` in an unquoted
            value (review r3 round-2 coverage finding: `'C:\a\${HOME}\b'`
            comes back as `'C:\a\/home/<user>\b'` there), while
            Mnemosyne's reader does not expand it at all and returns the
            value verbatim; the two readers would disagree.
+       .NET's \s, used below, is [\f\n\r\t\v\x85\p{Z}]: it covers NBSP but
+       not U+001C-U+001F, and is only tested at the ends and before '#'.
        Returns $null when $Value is safe, otherwise a human-readable
        reason. #>
     param([string] $Value)
+    try { [void](New-Object System.Text.UTF8Encoding($false, $true)).GetByteCount($Value) }
+    catch { return 'contains an unpaired UTF-16 surrogate (it has no UTF-8 encoding)' }
     if ($Value -match "`r|`n") { return 'contains a newline' }
     if ($Value -match '^\s' -or $Value -match '\s$') { return 'starts or ends with whitespace' }
     if ($Value.Length -gt 0) {
@@ -883,6 +1012,52 @@ function Get-EnvUnsafeValueReason {
     if ($Value.Contains('${')) { return 'contains a literal ${' }
     return $null
 }
+function Get-EnvPinCheckerReason {
+    <# Runs dev-team\scripts\env_pin_check.py KEY with $WrapperPython. The
+       value travels ONLY in $env:DEV_TEAM_ENV_CHECK_VALUE -- a UTF-16
+       environment block on Windows, so it arrives exact, with no 5.1 argv
+       quoting rules involved -- and the variable is removed afterwards.
+       Exit 0: safe, $null. Exit 1: unsafe, one ASCII reason line on stdout.
+       Anything else -- exit 2 (internal error), any other code, no Python,
+       no checker -- fails closed: a reason is returned, so the caller
+       refuses. #>
+    param([string] $Key, [string] $Value)
+    if (-not $WrapperPython) { return 'could not be checked: no Python was resolved to run env_pin_check.py' }
+    if (-not $EnvPinCheckPy -or -not (Test-Path -LiteralPath $EnvPinCheckPy)) {
+        return "could not be checked: env_pin_check.py is missing ($EnvPinCheckPy)"
+    }
+    $savedEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $rc = $null
+    $out = @()
+    try {
+        $env:DEV_TEAM_ENV_CHECK_VALUE = $Value
+        $out = @(& $WrapperPython -I $EnvPinCheckPy $Key 2>&1 | ForEach-Object { "$_" })
+        $rc = $LASTEXITCODE
+    } catch {
+        $out = @($_.Exception.Message)
+    } finally {
+        Remove-Item -LiteralPath Env:DEV_TEAM_ENV_CHECK_VALUE -ErrorAction SilentlyContinue
+        $ErrorActionPreference = $savedEap
+    }
+    $detail = (@($out | Where-Object { $_ }) -join ' ').Trim()
+    if ($rc -eq 0) { return $null }
+    if ($rc -eq 1 -and $detail) { return "is refused by env_pin_check.py: $(Format-EnvPinForDisplay $detail)" }
+    if ($null -eq $rc) { $rc = 'not run' }
+    return "could not be checked: env_pin_check.py exited $rc ($(Format-EnvPinForDisplay $detail))"
+}
+function Assert-EnvPinSafe {
+    <# The one gate every .env pin passes, on the exact KEY and value: the
+       PowerShell subset, then the checker. Unsafe, or not checkable:
+       exit 2, naming the pin. #>
+    param([string] $Key, [string] $Value, [string] $Subject)
+    $reason = Get-EnvUnsafeValueReason $Value
+    if (-not $reason) { $reason = Get-EnvPinCheckerReason -Key $Key -Value $Value }
+    if ($reason) {
+        [Console]::Error.WriteLine("$Subject`: refusing to pin $Key=$(Format-EnvPinForDisplay $Value): the value $reason; it would not read back identically from .env.")
+        exit 2
+    }
+}
 $OperatorMnemoHome = Join-Path $HermesRoot 'mnemosyne'
 $rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRoot 'dev-team-mnemosyne' }
 # F4a (review r3 minor #4, round 2 operator decision): refuse, rather than
@@ -894,7 +1069,7 @@ $rawTeamMemoryHome = if ($TeamMemory) { $TeamMemory } else { Join-Path $HermesRo
 # value can't be resolved to a real path at all.
 $_teamMemoryUnsafeReason = Get-EnvUnsafeValueReason $rawTeamMemoryHome
 if ($_teamMemoryUnsafeReason) {
-    [Console]::Error.WriteLine("-TeamMemory $_teamMemoryUnsafeReason; it would not read back identically from .env. Pick a path without that.")
+    [Console]::Error.WriteLine("-TeamMemory ($(Format-EnvPinForDisplay $rawTeamMemoryHome)) $_teamMemoryUnsafeReason; it would not read back identically from .env. Pick a path without that.")
     exit 2
 }
 # Every path below is canonical (no '.', '..', repeated separator, link or
@@ -942,6 +1117,21 @@ $_hermesRootProfilesUnsafeReason = Get-EnvUnsafeValueReason $HermesRootProfilesR
 if ($_hermesRootProfilesUnsafeReason) {
     [Console]::Error.WriteLine("`$HermesRoot\profiles ($HermesRootProfilesReal) $_hermesRootProfilesUnsafeReason; profile-local Mnemosyne pins derived from it would not read back identically from .env.")
     exit 2
+}
+# A3: the checker (env_pin_check.py, authoritative) on every value this run
+# will pin, with its KEY, before any side effect: the team bank's two pins,
+# and each selected profile's own-bank pins (written when a profile keeps or
+# is given a private bank). Set-MnemosyneDataDirPin / Set-EnvVarPin check the
+# exact written values again.
+Assert-EnvPinSafe 'MNEMOSYNE_HOME' $TeamMemoryHome '-TeamMemory (the team bank)'
+Assert-EnvPinSafe 'MNEMOSYNE_DATA_DIR' (Join-Path $TeamMemoryHome 'data') '-TeamMemory (the team bank data directory)'
+if ($Profiles) {
+    foreach ($role in $Profiles.Keys) {
+        if (-not (Test-Selected $role)) { continue }
+        $_ownBank = Join-Path (Join-Path $HermesRootProfilesReal "$Prefix$role") 'mnemosyne'
+        Assert-EnvPinSafe 'MNEMOSYNE_HOME' $_ownBank "$Prefix$role (its own Mnemosyne bank)"
+        Assert-EnvPinSafe 'MNEMOSYNE_DATA_DIR' (Join-Path $_ownBank 'data') "$Prefix$role (its own Mnemosyne data directory)"
+    }
 }
 $_teamHomeReal = $TeamMemoryHome
 function Test-TouchesOperatorBank {
@@ -1041,18 +1231,12 @@ function Set-EnvVarPin {
        an already-broken precondition this function does not try to
        repair. #>
     param([string] $ProfileDir, [string] $VarName, [string] $Value)
-    # F4a defense-in-depth (round-3 reviewer finding): the early refusals
-    # above only check -TeamMemory's raw and resolved forms, and
-    # $HermesRootProfilesReal. Re-check the exact value actually being
-    # written here too, so no call site -- present or future -- can pin
-    # an unsafe value by constructing it some other way. This must never
-    # fire in the normal run (the callers already refused first); it is
-    # a backstop, not the primary check.
-    $_pinUnsafeReason = Get-EnvUnsafeValueReason $Value
-    if ($_pinUnsafeReason) {
-        [Console]::Error.WriteLine("Refusing to pin $VarName into $ProfileDir\.env: the value $_pinUnsafeReason; it would not read back identically from .env.")
-        exit 2
-    }
+    # F4a defense-in-depth (round-3 reviewer finding), A3: the preflight
+    # above checks the values this run is expected to pin. Re-check the
+    # exact value actually being written here too -- the PowerShell subset
+    # and env_pin_check.py, with this KEY -- so no call site, present or
+    # future, can pin an unsafe value by constructing it some other way.
+    Assert-EnvPinSafe $VarName $Value "$ProfileDir\.env"
     New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
     $envFile = Join-Path $ProfileDir '.env'
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -1075,6 +1259,10 @@ function Set-MnemosyneDataDirPin {
     # F1: DataDir is always "<bank>\data" at every call site, so its
     # parent is exactly the bank root MNEMOSYNE_HOME must name.
     $homeDir = Split-Path -Parent $DataDir
+    # A3: before the dry-run branch, so -DryRun reports the refusal the real
+    # run would hit.
+    Assert-EnvPinSafe 'MNEMOSYNE_DATA_DIR' $DataDir "$ProfileDir\.env"
+    Assert-EnvPinSafe 'MNEMOSYNE_HOME' $homeDir "$ProfileDir\.env"
     if ($DryRun) {
         Write-Host "  would pin in .env: MNEMOSYNE_DATA_DIR=$DataDir"
         Write-Host "  would pin in .env: MNEMOSYNE_HOME=$homeDir"
@@ -1664,40 +1852,6 @@ if (Test-Selected $EntryProfile) {
         Write-Host '  script: bin\kanban-budget.py'
     }
 }
-
-# The wrappers name an absolute python.exe. A bare `python` resolves, on a
-# machine without a system Python, to the Microsoft Store alias stub in
-# WindowsApps, which prints 'Python was not found' and exits 9009 (seen in
-# CI on both runners). Prefer the interpreter Hermes itself installed, then
-# the py launcher's Python 3, then a real python.exe on PATH.
-function Resolve-WrapperPython {
-    $toolsDir = Join-Path $env:LOCALAPPDATA 'hermes\tools'
-    if (Test-Path -LiteralPath $toolsDir) {
-        $hermesPy = Get-ChildItem -LiteralPath $toolsDir -Directory -Filter 'python-3*' -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName 'python.exe' } |
-            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-        if ($hermesPy) { return $hermesPy }
-    }
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        # 'Continue' locally: under 'Stop', PS 5.1 turns a native command's
-        # redirected stderr (py with no Python 3 installed) into a terminating
-        # error, which would abort the install instead of falling through.
-        $savedEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        try { $launched = & py -3 -c 'import sys; print(sys.executable)' 2>$null } finally { $ErrorActionPreference = $savedEap }
-        if ($LASTEXITCODE -eq 0 -and $launched -and (Test-Path -LiteralPath $launched.Trim())) { return $launched.Trim() }
-    }
-    $onPath = Get-Command python -All -ErrorAction SilentlyContinue |
-        Where-Object { $_.Source -and $_.Source -notmatch '\\WindowsApps\\' } | Select-Object -First 1
-    if ($onPath) { return $onPath.Source }
-    return $null
-}
-$WrapperPython = Resolve-WrapperPython
-if (-not $WrapperPython) {
-    [Console]::Error.WriteLine("No Python 3 found for the forge and deciders wrappers (looked in $env:LOCALAPPDATA\hermes\tools, the py launcher, and PATH outside WindowsApps). Install Hermes or Python 3, then re-run.")
-    exit 1
-}
-Write-Host "wrapper python: $WrapperPython"
 
 # forge on a PATH the gateway sees. On Windows that is the same directory
 # hermes.exe itself resolves from on PATH - the lesson from the graft plugin
