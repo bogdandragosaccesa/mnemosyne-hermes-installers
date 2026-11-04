@@ -7,6 +7,126 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Which paths `forge.cmd` / `deciders.cmd` embed literally is now decided by three
+  characters, not nine.** `cmd.exe`'s metacharacter set is `& ^ % ! ( ) " < >`, but every
+  embedded path is wrapped in double quotes, and inside double quotes `cmd.exe` treats `&`,
+  `^`, `(` and `)` as literal text. So a pure-ASCII path containing only those — e.g.
+  `C:\Users\bob\src (copy)\...`, `...\Programs\R&D\python.exe`, or
+  `C:\Program Files (x86)\Python312\python.exe`, which matches no `%ENVVAR%` prefix at all —
+  is embedded literally and unguarded, exactly as 1.3.1 wrote it, instead of being rewritten
+  to an `%ENVVAR%` form (which would add variable guards, exit 1 under a trimmed
+  environment, and follow `%USERPROFILE%` to whichever user runs the wrapper) or refused.
+  Only `%` (starts another expansion even inside quotes), `"` (closes the quoting) and `!`
+  (consumed by `!var!` under `cmd /v:on`) are treated as unsafe: such a path is rewritten
+  when it sits under one of the prefix folders, and **refused with exit 2 otherwise** — so a
+  checkout or Python at e.g. `D:\dev!\...`, outside every profile folder, no longer
+  installs, where 1.3.1 accepted it. When the unusable path came from `py -3` or from
+  `PATH`, that source is skipped in favour of the next one rather than failing the install,
+  and the skip now prints a `Write-Warning` naming both the path that was passed over and
+  the one used instead, with `PY_PYTHON` / `py.ini` as the way to choose differently —
+  1.3.1 used the `py -3` interpreter in that situation, so the switch must not be silent.
+  (#12)
+
+### Fixed
+
+- **Resolves the v1.3.1 known issues "no ASCII-path Python, no wrappers" and "a non-ASCII
+  `py -3` path gives a vague error".** A non-ASCII wrapper Python, `forge.py` or
+  `deciders.py` path is now embedded in `forge.cmd` / `deciders.cmd` as an `%ENVVAR%`
+  prefix (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `%ProgramW6432%` — or plain
+  `%ProgramFiles%` on a 32-bit Windows OS, where `%ProgramW6432%` does not exist — or a
+  *persisted* `HERMES_ROOT`, tried last, below every OS profile variable) plus an ASCII
+  remainder, instead of refusing outright — so a Windows user with a non-ASCII user name
+  whose only Python is Hermes' own under `%LOCALAPPDATA%`, and whose checkout is under
+  their profile, can now install. `cmd.exe` expands the variable from its own UTF-16
+  environment at run time, so the `.cmd` file on disk stays pure ASCII. Each rewritten
+  path gets an `if not defined` guard (an unset prefix variable can never silently resolve
+  to the current drive's root) followed by an `if not exist` guard (via `goto`, not a
+  parenthesized block, since an expanded value can contain `)`) that fails with a clear
+  message instead of silently running a stale, wrong, or planted interpreter; a wrapper
+  with at least one rewritten path also gets `setlocal DisableDelayedExpansion`, so a
+  literal `!` in an expanded path is never consumed by `cmd /v:on`'s own `!var!` syntax
+  before the guard and the run line agree on it. The path comparison that decides whether a
+  path sits under one of those folders now canonicalizes both sides to the long (non-8.3)
+  path form first, so a process whose own path arrived as an 8.3 short name (e.g. a
+  `RUNNER~1` account) against a long-form `%LOCALAPPDATA%` still matches instead of being
+  wrongly refused; and the installer never writes a wrapper with an empty embedded
+  interpreter path — that is a hard refusal (exit 2), not a silently broken `.cmd` file. A
+  non-ASCII path under none of those folders is still refused with exit 2, before anything
+  is written, naming the offending path and the folders it was *not* found under. `py -3`
+  discovery now asks Python to print `sys.executable` as an ASCII-only hex encoding of its
+  UTF-16LE code units (taking the last non-empty output line, so a deprecation notice or
+  launcher warning printed before it is never mistaken for the hex itself), decoded in
+  PowerShell, so a non-ASCII launcher path is no longer mangled by the console code page
+  under Windows PowerShell 5.1 and no longer reported as "No Python 3 found" when the
+  launcher did in fact report one. A `py -3` or `PATH` Python that exists but cannot be
+  embedded (non-ASCII and under none of those folders, or containing one of the characters
+  named under "Changed" below) no longer forces a hard refusal on
+  its own: each of those two sources now falls back to the next one when a *later* source
+  has an embeddable candidate, and only refuses when nothing embeddable was found anywhere;
+  the refusal message also now mentions `PY_PYTHON`/`py.ini` as a way to point the `py`
+  launcher at a different Python 3. The interpreter Hermes itself installed under
+  `%LOCALAPPDATA%\hermes\tools` is preferred purely by discovery order again —
+  representability no longer steers which interpreter is chosen for that one source, only
+  whether its path can be embedded — and it is still never skipped in favour of a fallback,
+  unlike `py -3`/`PATH`. An all-ASCII install whose path takes the literal embed (see
+  "Changed" above) gets a wrapper byte-identical to 1.3.1's with exactly one exception: when
+  that literally embedded path contains a `^`, the wrapper gains a single `setlocal
+  DisableDelayedExpansion` line, so `cmd /v:on`'s delayed-expansion pass cannot strip that
+  caret (it strips carets inside quotes on any line that also carries a `!`, which a
+  caller's argument can supply through `%*`) and run a path other than the one embedded. An
+  all-ASCII path containing `%`, `"` or `!` is not part of that byte-identical case: as
+  "Changed" above states, it is either rewritten to the `%ENVVAR%` form described here
+  (gaining the `if not defined`/`if not exist` guards and `setlocal`) or refused with exit
+  2, depending on whether it sits under a prefix folder. (#12)
+- **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
+  corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
+  case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
+  and the defence-in-depth check before the wrapper is written — both missed them, and
+  `-Encoding ascii` turned them into `?`. Both checks now compare ordinal character codes
+  with no case folding and no regex engine, so the result no longer depends on the
+  machine's culture. (#12)
+
+### Internal
+
+These describe bugs introduced and fixed *within this PR*. No released version ever carried
+them, so they are not "Fixed" entries; they are listed because the review trail refers to
+them.
+
+- **An 8.3 short name (e.g. `C:\DEV-TE~1\DRGO~1\...`) bypassed the new `%ENVVAR%` rewrite
+  instead of triggering it.** A short name is printable ASCII *by construction* even when
+  the long form it denotes is not, and the ASCII-ness check that decides the wrapper's fast
+  path ran on the path exactly as given, before its long form was ever looked at — so a
+  non-ASCII install surfaced through an 8.3 short name had its short name embedded in
+  `forge.cmd`/`deciders.cmd` literally, unrewritten. A path containing `~` is now
+  canonicalized to its long form first, and the ASCII-ness decision (and, when it isn't
+  ASCII, the prefix rewrite) is made on that long form. A path with no `~` still takes the
+  fast path with no `GetLongPathName` call at all; every path that misses the fast path, and
+  every prefix value, is canonicalized. (#12)
+- **The new guard's "not found" message could run a command instead of just printing a
+  path.** `cmd.exe` expands every `%VAR%` in a line before parsing it, so the message
+  printed the *expanded* path unquoted; an `&` in it (a legal filename character, present in
+  e.g. `R&D`) split the line and ran the trailing fragment as a command on the very path
+  meant to fail closed. The message now prints the unexpanded `%ENVVAR%` form (every `%`
+  doubled) wrapped in double quotes, so it is inert. (#12)
+- **`Test-WrapperPythonEmbeddable` kept a second copy of the literal-embed rule** and so
+  could call a candidate embeddable that the real check then refused, aborting the install
+  (exit 2) instead of falling back to the next interpreter source. The rule now has a single
+  implementation, consulted from one place. (#12)
+
+### Known issues
+
+- **A persisted `HERMES_ROOT` is not canonicalized to its long (non-8.3) form before the
+  equality check that decides whether it is offered as an `%ENVVAR%` prefix at all.** The
+  *prefix match itself* does canonicalize it, like every other candidate. What is not
+  canonicalized is the separate comparison of the effective persisted `HERMES_ROOT` value
+  against the Hermes root this installer is working on: if one side arrives in 8.3 short
+  form and the other in long form, that comparison fails and `HERMES_ROOT` is never added as
+  a candidate. This fails *closed* — at worst the installer falls through to the next
+  candidate or refuses (exit 2) rather than embedding a wrong path, and `HERMES_ROOT` is
+  already the lowest-priority (tier 2) candidate. Tracked for a future round. (#12)
+
 ## [1.3.1] - 2026-11-04
 
 ### Added
@@ -58,13 +178,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   machine whose user name is non-ASCII and whose only Python is Hermes' own under
   `%LOCALAPPDATA%`, the install fails until a Python 3 on an ASCII-only path (for example
   `C:\Python312`, first on `PATH`) is installed and the dev-team checkout is on an ASCII
-  path too. (#10)
+  path too. (#10) — fixed in Unreleased (#12).
 - **Windows PowerShell 5.1: a non-ASCII `py -3` path gives a vague error.** The path that
   `py -3` prints for `sys.executable` is decoded by PowerShell in the console's OEM code
   page, so a non-ASCII path from the launcher comes back garbled, fails `Test-Path` and is
   skipped without a message. If it was the only Python found, the installer exits 1 with
   `No Python 3 found for the forge and deciders wrappers …` instead of naming the
-  non-ASCII path. (#10)
+  non-ASCII path. (#10) — fixed in Unreleased (#12).
 
 ## [1.3.0] - 2026-11-03
 

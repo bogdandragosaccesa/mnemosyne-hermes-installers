@@ -30,7 +30,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from test_install_windows import DEV_TEAM, PS1, _function, _pin_prelude  # noqa: E402
+from test_install_windows import DEV_TEAM, PS1, _function, _pin_prelude, _resolve_wrapper_python_prelude, CMD_WRAPPER_FUNCS  # noqa: E402
 
 CHECKER = DEV_TEAM / "scripts" / "env_pin_check.py"
 sys.path.insert(0, str(CHECKER.parent))
@@ -302,56 +302,78 @@ class CheckerIsAuthoritativeStaticTests(unittest.TestCase):
         self.assertIn("any number", body)
 
 
-# --- item 4: forge.cmd / deciders.cmd under a non-ASCII path ---------------
 @unittest.skipUnless(PWSH, "pwsh not installed")
 class CmdWrapperRefusalTests(unittest.TestCase):
-    """Decision: REFUSE (see the comment above Assert-CmdWrapperPathsAscii in
-    the installer for the evidence). The wrapper embeds absolute paths that
-    cmd.exe decodes in the console code page, so a non-ASCII path cannot be
-    written without corrupting it; the installer exits 2, before anything
-    is written, and names the offending path."""
+    """D1-D9 (review follow-up, pr10-review.md section 4): a non-ASCII path
+    under a known folder (LOCALAPPDATA/APPDATA/USERPROFILE/ProgramFiles/a
+    persisted HERMES_ROOT) is rewritten to an %ENVVAR% form instead of
+    refused; only a non-ASCII path under none of those is still refused
+    (exit 2, before anything is written), per the comment above
+    Assert-CmdWrapperPathsAscii in the installer."""
+
+    _EXTRA_FUNCS = CMD_WRAPPER_FUNCS
 
     def _run(self, tmp, python_path, forge_py="/ascii/forge/forge.py",
-             deciders_py="/ascii/deciders/deciders.py"):
+             deciders_py="/ascii/deciders/deciders.py", env_extra=None):
         h = Path(tmp) / "wrapper.ps1"
         h.write_text(
             "$ErrorActionPreference = 'Stop'\n"
+            f"$HermesRoot = '{tmp}/hermes'\n"
             + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
+            + "".join(_function(TEXT, f) + "\n" for f in self._EXTRA_FUNCS)
             + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
             + "$WrapperPython = $env:PY_ARG\n"
             + f"$ForgePy = $env:FORGE_ARG\n$DecidersPy = $env:DECIDERS_ARG\n"
-            + "Assert-CmdWrapperPathsAscii\nWrite-Output 'WRAPPERS_OK'\n", encoding="utf-8")
-        return run_ps(h, {"PY_ARG": python_path, "FORGE_ARG": forge_py, "DECIDERS_ARG": deciders_py})
+            + "$CmdPaths = Assert-CmdWrapperPathsAscii\nWrite-Output 'WRAPPERS_OK'\n", encoding="utf-8")
+        env = {"PY_ARG": python_path, "FORGE_ARG": forge_py, "DECIDERS_ARG": deciders_py}
+        env.update(env_extra or {})
+        return run_ps(h, env)
 
-    def test_non_ascii_python_is_refused_with_exit_2(self):
+    def test_non_ascii_python_with_no_usable_prefix_is_refused_with_exit_2(self):
         with tempfile.TemporaryDirectory() as tmp:
-            proc = self._run(tmp, "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local\\hermes\\tools\\python-3.12\\python.exe")
+            # No LOCALAPPDATA/USERPROFILE/etc set to cover this path, so
+            # there is no %ENVVAR% form to rewrite it to.
+            proc = self._run(tmp, "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local\\hermes\\tools\\python-3.12\\python.exe",
+                             env_extra={"LOCALAPPDATA": "", "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertNotIn("WRAPPERS_OK", proc.stdout)
         self.assertIn("ASCII", proc.stderr)
         self.assertIn("python", proc.stderr)
         self.assertIn("Dr\\u0103go\\u0219", proc.stderr)
 
-    def test_non_ascii_script_path_is_refused_too(self):
+    def test_non_ascii_python_under_localappdata_is_rewritten_not_refused(self):
+        local = "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(tmp, local + "\\hermes\\tools\\python-3.12\\python.exe",
+                             env_extra={"LOCALAPPDATA": local, "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("WRAPPERS_OK", proc.stdout)
+
+    def test_non_ascii_script_path_with_no_usable_prefix_is_refused_too(self):
         with tempfile.TemporaryDirectory() as tmp:
             proc = self._run(tmp, "C:\\Python312\\python.exe",
-                             forge_py="C:\\Users\\\u0425\\dev-team\\forge\\forge.py")
+                             forge_py="C:\\Users\\\u0425\\dev-team\\forge\\forge.py",
+                             env_extra={"LOCALAPPDATA": "", "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("forge.py", proc.stderr)
 
     def test_ascii_paths_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
-            proc = self._run(tmp, "C:\\Python312\\python.exe")
+            proc = self._run(tmp, "C:\\Python312\\python.exe",
+                             env_extra={"LOCALAPPDATA": "", "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("WRAPPERS_OK", proc.stdout)
 
 
 @unittest.skipUnless(PWSH, "pwsh not installed")
-class WrapperPythonPrefersAsciiTests(unittest.TestCase):
-    """The refusal's remedy must be reachable: with Hermes's own Python
-    under a non-ASCII %LOCALAPPDATA% (a non-ASCII user name), an
-    ASCII-path Python further down the resolver order is used instead.
-    Only when every candidate is non-ASCII does the guard refuse."""
+class WrapperPythonFirstCandidateWinsTests(unittest.TestCase):
+    """D6 (review follow-up, pr10-review.md section 4): the FIRST EXISTING
+    candidate wins, full stop -- no preference for an ASCII-representable
+    path over a non-ASCII one (that preference, and its '$first'
+    bookkeeping, were deleted). Whether the winning path can be embedded in
+    forge.cmd/deciders.cmd is decided afterwards, separately, by
+    Assert-CmdWrapperPathsAscii (which can now rewrite it via an %ENVVAR%
+    prefix instead of refusing outright)."""
 
     def _layout(self, tmp, ascii_python_on_path):
         t = Path(tmp)
@@ -368,19 +390,19 @@ class WrapperPythonPrefersAsciiTests(unittest.TestCase):
         h = t / "resolve.ps1"
         h.write_text(
             "$ErrorActionPreference = 'Stop'\n"
-            + _function(TEXT, "Resolve-WrapperPython") + "\n"
+            + _resolve_wrapper_python_prelude(TEXT) + "\n"
             + "Write-Output (\"PY=\" + (Resolve-WrapperPython))\n", encoding="utf-8")
         env = {"LOCALAPPDATA": str(local), "PATH": str(bindir)}
         return h, env, hermes_py_dir / "python.exe", py
 
-    def test_ascii_python_on_path_wins_over_a_non_ascii_hermes_python(self):
+    def test_hermes_tools_python_wins_even_when_non_ascii_and_an_ascii_python_is_on_path(self):
         with tempfile.TemporaryDirectory() as tmp:
-            h, env, _hermes_py, path_py = self._layout(tmp, ascii_python_on_path=True)
+            h, env, hermes_py, _path_py = self._layout(tmp, ascii_python_on_path=True)
             proc = run_ps(h, env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"PY={path_py}", proc.stdout)
+        self.assertIn(f"PY={hermes_py}", proc.stdout)
 
-    def test_only_non_ascii_candidates_keeps_the_first_for_the_guard_to_refuse(self):
+    def test_only_non_ascii_candidates_still_resolves_the_hermes_python(self):
         with tempfile.TemporaryDirectory() as tmp:
             h, env, hermes_py, _path_py = self._layout(tmp, ascii_python_on_path=False)
             proc = run_ps(h, env)
@@ -390,7 +412,7 @@ class WrapperPythonPrefersAsciiTests(unittest.TestCase):
 
 class CmdWrapperStaticTests(unittest.TestCase):
     def test_refusal_runs_before_any_profile_is_touched(self):
-        call = TEXT.index("\nAssert-CmdWrapperPathsAscii\n")
+        call = TEXT.index("\n$CmdPaths = Assert-CmdWrapperPathsAscii\n")
         first_loop = TEXT.index("\nforeach ($role in $Profiles.Keys) {\n    if (-not (Test-Selected")
         self.assertLess(call, first_loop)
         self.assertLess(call, TEXT.index("$PluginSrcMnemo = Join-Path $HermesRoot"))
