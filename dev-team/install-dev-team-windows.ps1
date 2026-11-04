@@ -690,7 +690,22 @@ function Test-WrapperPythonEmbeddable {
        silent-wrong-Python outcome D6 forbids. #>
     param([string] $Path)
     if (-not $Path) { return $false }
-    if (Test-AsciiOrdinalRange $Path 0x20 0x7E) { return $true }
+    # F1 (round 6 review): this used to be a bare ASCII-ordinal check, a
+    # SECOND, independent copy of Resolve-CmdEmbeddablePath's own
+    # fast-path rule that this function's docstring claims to mirror
+    # exactly via the -NoRefuse probe below. When only this copy was
+    # gated against Test-ContainsCmdShellMetachar (A3 round-5 fix) and
+    # this one was not, a metachar-bearing ASCII path (e.g. "C:\Program
+    # Files (x86)\Python312\python.exe") returned $true here -- "embeddable"
+    # -- without ever reaching the probe, while a later, real call to
+    # Resolve-CmdEmbeddablePath (made WITHOUT -NoRefuse, from
+    # Assert-CmdWrapperPathsAscii) took the gated rewrite-or-refuse path
+    # and could refuse it outright. Resolve-WrapperPython would then have
+    # already committed to that candidate instead of falling back to the
+    # next source -- reinstating the exact M3 regression this function
+    # exists to prevent. Gating this copy identically to line ~1051-1052
+    # keeps the two in agreement again.
+    if ((Test-AsciiOrdinalRange $Path 0x20 0x7E) -and -not (Test-ContainsCmdShellMetachar $Path)) { return $true }
     $prefixes = Get-CmdPrefixCandidates -HermesRoot $HermesRoot
     $probe = Resolve-CmdEmbeddablePath -Label 'probe' -Path $Path -Prefixes $prefixes -NoRefuse
     return [bool]$probe
@@ -880,6 +895,32 @@ function Test-ContainsCmdShellMetachar {
     }
     return $false
 }
+function Test-ContainsUnsafeCmdEmbedChar {
+    <# F2 (round 6 review): NOT every character Test-ContainsCmdShellMetachar
+       flags is actually unsafe once it is embedded -- every embed site
+       wraps it in double quotes (the run line, and the guard's echo via
+       Get-CmdGuardBlock), under which cmd.exe treats '&','^','(',')' as
+       literal text (see Get-CmdGuardBlock's S1 comment and
+       test_guard_echo_pins_quoted_doubled_percent_bytes_for_ampersand_remainder,
+       and the identical reasoning in Resolve-CmdEmbeddablePath's remainder
+       check below). Only '%' (starts another expansion even inside
+       quotes), '"' (closes the quoting outright) and '!' (consumed under
+       `cmd /v:on`, i.e. delayed expansion, which this installer's own
+       wrappers do not enable but a caller's shell might) are genuinely
+       unsafe in a literal quoted embed. '<' and '>' are listed for
+       symmetry with Test-ContainsCmdShellMetachar but can never actually
+       occur -- they are illegal in a Windows file name. This function
+       decides whether a path that matches NO %ENVVAR% prefix in
+       Resolve-CmdEmbeddablePath may still fall back to the pre-A3,
+       literal-embed, unrewritten form (Rewritten = $false) instead of a
+       hard refusal: safe when this returns $false, refused when it
+       returns $true. #>
+    param([string] $Value)
+    foreach ($ch in $Value.ToCharArray()) {
+        if ('%!"'.IndexOf($ch) -ge 0) { return $true }
+    }
+    return $false
+}
 function Get-LongPathName {
     <# Round 2 (review): prefix matching in Resolve-CmdEmbeddablePath compares
        $Path against LOCALAPPDATA/APPDATA/USERPROFILE/ProgramFiles. On a CI
@@ -999,25 +1040,40 @@ function Get-CmdPrefixCandidates {
     return $cands.ToArray()
 }
 function Resolve-CmdEmbeddablePath {
-    <# D1-D2: a path that is already printable ASCII is returned literally,
-       unrewritten (Rewritten = $false) -- byte-identical to the
-       pre-D1..D9 wrapper for every ASCII-only install. A non-ASCII path is
-       rewritten to "%NAME%\<remainder>" only when it sits under one of
-       $Prefixes at a path-separator boundary (an exact match, or the next
-       character is '\' -- so e.g. prefix "C:\Users\Drag" never matches
+    <# D1-D2: a path that is already printable ASCII AND contains none of
+       cmd.exe's shell metacharacters (Test-ContainsCmdShellMetachar: & ^ %
+       ! ( ) " < >) is returned literally, unrewritten (Rewritten = $false)
+       -- byte-identical to the pre-D1..D9 wrapper for every ASCII-no-
+       metachar install. Everything else -- non-ASCII, OR ASCII with a
+       metachar -- first tries the %NAME%\<remainder> rewrite: it is
+       rewritten only when it sits under one of $Prefixes at a
+       path-separator boundary (an exact match, or the next character is
+       '\' -- so e.g. prefix "C:\Users\Drag" never matches
        "C:\Users\Dragos2\..."), matched case-insensitively (OrdinalIgnoreCase
        -- NTFS paths are case-insensitive), and only when the remaining,
        rewritten part is itself printable ASCII with no '%' (would start
        another, unintended expansion) and no '"' (would break out of the
-       wrapper's quoting). Among every prefix that qualifies, the lowest
-       TIER wins first (see Get-CmdPrefixCandidates -- M2, round 2 review:
-       HERMES_ROOT is tier 2, every OS profile variable is tier 1, so
-       HERMES_ROOT is only ever used when no OS variable matches, never
-       because it happens to be textually longer), then the LONGEST one
-       within that tier, so e.g. LOCALAPPDATA beats USERPROFILE when a path
-       sits under both. No qualifying prefix at all is a hard refusal (exit
-       2, nothing written) -- the caller never falls back to a different,
-       possibly wrong, interpreter or script -- UNLESS -NoRefuse is given,
+       wrapper's quoting) -- '&','^','(',')' ARE legal in this remainder,
+       since it is always embedded inside double quotes (see
+       Get-CmdGuardBlock's S1 comment). Among every prefix that qualifies,
+       the lowest TIER wins first (see Get-CmdPrefixCandidates -- M2, round
+       2 review: HERMES_ROOT is tier 2, every OS profile variable is tier
+       1, so HERMES_ROOT is only ever used when no OS variable matches,
+       never because it happens to be textually longer), then the LONGEST
+       one within that tier, so e.g. LOCALAPPDATA beats USERPROFILE when a
+       path sits under both. A3 round-5 fix / F2 round-6 review: when NO
+       prefix qualifies, a path that is ASCII and whose only disqualifying
+       metachars are the quote-safe ones (not '%','"','!' --
+       Test-ContainsUnsafeCmdEmbedChar) still falls back to the literal,
+       unrewritten, unguarded embed (Rewritten = $false) -- the pre-A3
+       behaviour for exactly this case, e.g. "C:\Program Files
+       (x86)\Python312\python.exe", which matches no %ENVVAR% prefix (there
+       is no ProgramFiles(x86) candidate) but is safe to embed literally.
+       Everything else with no qualifying prefix -- non-ASCII, or ASCII
+       with a genuinely unsafe metachar ('%','"','!') -- is a hard refusal
+       (exit 2, nothing written) -- the caller never falls back to a
+       different, possibly wrong, interpreter or script -- UNLESS
+       -NoRefuse is given,
        in which case it returns $null instead: used by
        Test-WrapperPythonEmbeddable to PROBE embeddability for the py
        launcher/PATH fallback (M3) without the exit-2 side effect. #>
@@ -1094,6 +1150,28 @@ function Resolve-CmdEmbeddablePath {
         $sep = if ($bestRemainder) { '\' } else { '' }
         return [ordered]@{ Embed = "%$bestName%$sep$bestRemainder"; Rewritten = $true; PrefixName = $bestName }
     }
+    # F2 (round 6 review): no %ENVVAR% prefix covers this path. Before
+    # refusing outright, check whether $Path is ASCII and, if it failed
+    # the fast path only because of a metacharacter, whether that
+    # metacharacter is actually unsafe once embedded. '&','^','(',')'
+    # are LEGAL in the literal, unrewritten embed -- every use site
+    # double-quotes it (see Get-CmdGuardBlock's S1 comment and the
+    # identical reasoning on the remainder check above) -- so a path
+    # such as "C:\Program Files (x86)\Python312\python.exe", which is
+    # pure ASCII, matches no prefix (there is deliberately no
+    # ProgramFiles(x86) candidate in Get-CmdPrefixCandidates -- see its
+    # m2 comment), and contains none of '%','"','!', is still safe to
+    # embed literally and unguarded: exactly what it got before the A3
+    # fast-path gate existed, and exactly how it worked before this
+    # function's metachar exclusion was added. A path that is not ASCII
+    # at all, or that contains '%' (starts another expansion), '"'
+    # (breaks the wrapper's quoting) or '!' (consumed under delayed
+    # expansion) still falls through to the hard refusal below --
+    # Test-ContainsUnsafeCmdEmbedChar draws that line.
+    if ((Test-AsciiOrdinalRange $asciiCheckPath 0x20 0x7E) -and
+            -not (Test-ContainsUnsafeCmdEmbedChar $asciiCheckPath)) {
+        return [ordered]@{ Embed = $Path; Rewritten = $false; PrefixName = $null }
+    }
     if ($NoRefuse) { return $null }
     $names = ($Prefixes | ForEach-Object { $_.Name }) -join ', '
     if (-not $names) { $names = '(none available in this environment)' }
@@ -1107,7 +1185,7 @@ function Resolve-CmdEmbeddablePath {
     # is both misleading and not the value any prefix was actually
     # compared against. Show $longPath instead, so the message always
     # names the real, non-ASCII (or non-prefixed) directory.
-    [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $Label, $(Format-EnvPinForDisplay $longPath), is not printable ASCII, and is not under any of the folders whose environment variable cmd.exe can expand ($names). Move the dev-team checkout, and/or the Python that runs it, onto an ASCII-only path (e.g. Python installed under C:\Python312) or under one of those folders, then re-run. If the py launcher is what picked this path, you can instead point it at a different Python 3 with the PY_PYTHON environment variable or a py.ini file (https://docs.python.org/3/using/windows.html#customization).")
+    [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $Label, $(Format-EnvPinForDisplay $longPath), is not printable ASCII, or contains a '%', '`"' or '!' character that cannot be safely embedded, and is not under any of the folders whose environment variable cmd.exe can expand ($names). Move the dev-team checkout, and/or the Python that runs it, onto an ASCII-only path with none of those characters (e.g. Python installed under C:\Python312) or under one of those folders, then re-run. If the py launcher is what picked this path, you can instead point it at a different Python 3 with the PY_PYTHON environment variable or a py.ini file (https://docs.python.org/3/using/windows.html#customization).")
     exit 2
 }
 function Assert-WrapperTextAscii {
