@@ -64,15 +64,20 @@ class AssigneePrefixTests(_Base):
             with self.subTest(role=role):
                 self.assertIsInstance(self.create(title="t", assignee=role), str)
 
-    def test_mis_cased_prefix_refused(self):
-        """Exact, case-sensitive: the dispatcher resolves a profile directory by
-        its exact name, so `Dev-qa` is not the installed `dev-qa`."""
+    def test_mis_cased_prefix_allowed(self):
+        """Finding 4: Hermes lowercases an assignee before storing it
+        (`profiles.normalize_profile_name`), so `Dev-qa` IS the installed
+        `dev-qa`. Both sides of the comparison are normalised with
+        `.strip().lower()`."""
         self.write_prefix()
         for assignee in ("Dev-qa", "DEV-qa", "dEv-qa"):
             with self.subTest(assignee=assignee):
-                msg = self.create(title="t", assignee=assignee)
-                self.assertIsInstance(msg, str)
-                self.assertEqual(msg, guard_mod._prefix_refusal(assignee, PREFIX))
+                self.assertIsNone(self.create(title="t", assignee=assignee))
+
+    def test_a_mis_cased_installed_prefix_accepts_its_own_cards(self):
+        self.write_prefix("T2-\n")
+        self.assertIsNone(self.create(title="t", assignee="t2-qa"))
+        self.assertIsNone(self.create(title="t", assignee="T2-qa"))
 
     def test_other_team_prefix_refused(self):
         self.write_prefix()

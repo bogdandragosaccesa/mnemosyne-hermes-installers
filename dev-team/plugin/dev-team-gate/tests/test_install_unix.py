@@ -144,6 +144,7 @@ FAKE_HERMES = textwrap.dedent(r"""
       "config get")
         case "$3" in
           memory.provider) echo mnemosyne ;;
+          terminal.env_passthrough) echo "${FAKE_ENV_PASSTHROUGH:-[]}" ;;
           *) echo False ;;
         esac ;;
       "config set") ;;

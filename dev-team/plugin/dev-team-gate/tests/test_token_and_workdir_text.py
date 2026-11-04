@@ -132,8 +132,13 @@ class ChangelogUnreleasedTests(unittest.TestCase):
         self.assertTrue(headings, "[Unreleased] has no ### category heading")
         for heading in headings:
             with self.subTest(heading=heading):
+                # Keep a Changelog's six change types, plus one deliberate
+                # project addition: `Known issues` records a gap a release
+                # does NOT fix (e.g. one that predates the PR and is out of
+                # its scope), so it is not a change and belongs under none of
+                # the six.
                 self.assertIn(heading, ("Added", "Changed", "Deprecated", "Removed",
-                                        "Fixed", "Security"))
+                                        "Fixed", "Security", "Known issues"))
 
     def test_every_entry_carries_a_pr_number(self):
         bullets = [b for b in re.findall(r"^- (?:.|\n(?!\n|- |### ))*", self.section, re.M)]

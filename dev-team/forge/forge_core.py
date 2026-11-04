@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
 import subprocess
 import sys
@@ -115,12 +116,32 @@ _SECRET_SUBSTITUTIONS = (
     (re.compile(r"Authorization:\s*[^\r\n\"']*", re.IGNORECASE), "Authorization: ***"),
 )
 
+# Variables whose VALUE is the operator's forge credential. `redact` removes
+# those literals as well as the shapes above: the shape list is a guess about
+# what a token looks like, these are the token itself.
+_ENV_TOKEN_VARS = ("DEV_TEAM_GH_TOKEN", "GH_TOKEN")
+
 
 def redact(text: str) -> str:
-    """Strip common credential shapes out of text before it is ever printed."""
+    """Strip common credential shapes out of text before it is ever printed.
+
+    Two layers, both applied:
+
+    * the `_SECRET_SUBSTITUTIONS` shapes above -- a heuristic, and the only
+      thing available when no token is configured here;
+    * the LITERAL values of `_ENV_TOKEN_VARS`, when set and non-blank. Those
+      are the operator's actual credential, known exactly, so a forge whose
+      tokens do not match a GitHub shape (or a vendor that changes its
+      prefixes) cannot leak one verbatim. A blank value is skipped: replacing
+      `" "` would rewrite every space in the message.
+    """
     out = text
     for pattern, replacement in _SECRET_SUBSTITUTIONS:
         out = pattern.sub(replacement, out)
+    for name in _ENV_TOKEN_VARS:
+        value = os.environ.get(name) or ""
+        if value.strip():
+            out = out.replace(value, "***")  # literal, never a regex
     return out
 
 
