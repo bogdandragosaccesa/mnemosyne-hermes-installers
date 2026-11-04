@@ -32,6 +32,8 @@ different commits. See [Installation](docs/installation.md#where-mnemosyne-comes
 - [dev-team](dev-team/README.md) — an autonomous software delivery team: eight role profiles
   governed by a Hermes plugin that mechanically enforces stage completion (QA, review, green
   CI) instead of trusting an agent's say-so. The maintained team; start here.
+- [How the dev team works](docs/how-the-dev-team-works.md) — dev-team for newcomers: what is
+  installed, one request from start to finish (two diagrams), and where to look while it runs
 - [SDLC team profiles](old/sdlc-team/README.md) — superseded by `dev-team/`, kept frozen: nine
   role profiles, each with its own SOUL, all wired to Mnemosyne
 - [Outsourcing team profiles](old/outsourcing-team/README.md) — superseded by `dev-team/`, kept

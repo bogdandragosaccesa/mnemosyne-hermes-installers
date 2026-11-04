@@ -7,6 +7,9 @@ One sentence, a budget and a repository in. A pull request with green CI, marked
 human merge, out. No human in between unless a stop condition fires — merge and deploy are
 always human, by design.
 
+New to Hermes? Start with [How the dev team works](../docs/how-the-dev-team-works.md): what
+gets installed, one request from start to finish, and where to look while it runs.
+
 `dev-team` keeps Hermes kanban exactly as it is and adds what it doesn't have: an engine that
 enforces "nothing is done without QA acceptance" instead of leaving it to an agent's judgment.
 A change moves through six fixed stages. Each stage hands the next a small typed `metadata`
@@ -24,9 +27,12 @@ flowchart TB
     BOARD[["<b>Kanban board</b> — one per repository<br/>intake → plan → implement → validate → review → pr-ci"]]
     FORGE["<b>forge</b> CLI<br/>github · gitlab · gitea · jenkins"]
     OP(["<b>Operator</b><br/>merges, deploys, holds the forge token"])
+    DEC["<b>deciders</b> CLI<br/>suggests a model tier per implement card<br/>from model-tiers.json · steers, never approves"]
+    MEM[("<b>team-only Mnemosyne bank</b><br/>dev-team-mnemosyne, shared by every dev- profile<br/>never the operator's own bank")]
 
     H -- "1 · sentence + budget + repo" --> PM
-    PM -- "2 · intake card" --> BOARD
+    PM -- "2 · board + unattended devops onboarding card, then intake card" --> BOARD
+    PM --- MEM
     BOARD -- "3 · every kanban_complete" --> GATE
     GATE -- "4 · pr-ci only: re-reads CI" --> FORGE
     GATE -- "5 · valid: next stage card" --> BOARD
@@ -34,7 +40,9 @@ flowchart TB
 
     subgraph PIPE["one branch, one PR — each stage is its own card, each a child of the last"]
       direction LR
+      ONB["onboarding: devops<br/>clone · forge detect"] --> PLAN
       INTAKE[intake: pm] --> PLAN[plan: pm]
+      PLAN -. "deciders tier" .-> DEC
       PLAN --> IMPL[implement: backend-db / frontend]
       IMPL --> VAL[validate: qa]
       VAL --> REV[review: reviewer]
