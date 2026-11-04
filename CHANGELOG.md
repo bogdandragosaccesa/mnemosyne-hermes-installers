@@ -19,15 +19,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to an `%ENVVAR%` form (which would add variable guards, exit 1 under a trimmed
   environment, and follow `%USERPROFILE%` to whichever user runs the wrapper) or refused.
   Only `%` (starts another expansion even inside quotes), `"` (closes the quoting) and `!`
-  (consumed by `!var!` under `cmd /v:on`) are treated as unsafe, but only `!` is ever
-  rewritten: a `!` path is rewritten when it sits under one of the prefix folders, and
-  **refused with exit 2 otherwise** — so a checkout or Python at e.g. `D:\dev!\...`,
-  outside every profile folder, no longer installs, where 1.3.1 accepted it. A `%` or `"`
-  path is **refused with exit 2 regardless** of whether it sits under a prefix folder: the
-  remainder check at `dev-team/install-dev-team-windows.ps1:1189` skips a rewritten
-  remainder bearing either character, so such a path is never rewritten even under a prefix
-  folder (`"` cannot occur in a Windows file name, so in practice this means every `%` path
-  is refused). When the unusable path came from `py -3`, that source is skipped in favour
+  (consumed by `!var!` under `cmd /v:on`) are treated as unsafe, but of those three, only
+  `!` can be rewritten: a `!` path is rewritten when it sits under one of the prefix
+  folders, and **refused with exit 2 otherwise** — so a checkout or Python at e.g.
+  `D:\dev!\...`, outside every profile folder, no longer installs, where 1.3.1 accepted it.
+  A `%` or `"` **below the matched prefix folder** is refused with exit 2 even under a
+  prefix folder: the remainder check at `dev-team/install-dev-team-windows.ps1:1189` skips
+  a rewritten remainder bearing either character, so that part of the path is never
+  rewritten. A `%` *in the prefix folder's own path*, however, is substituted away by the
+  `%ENVVAR%` embed before the remainder check ever sees it, so the path is still rewritten
+  and the install succeeds — only a `%` or `"` that survives into the remainder is refused.
+  When the unusable path came from `py -3`, that source is skipped in favour
   of `PATH` rather than failing the install, and the skip now prints a `Write-Warning`
   (`dev-team/install-dev-team-windows.ps1:844-845`) naming both the path that was passed
   over and the one used instead, with `PY_PYTHON` / `py.ini` as the way to choose
@@ -86,7 +88,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Changed" above states, only a `!` path is either rewritten to the `%ENVVAR%` form
   described here (gaining the `if not defined`/`if not exist` guards and `setlocal`) or
   refused with exit 2, depending on whether it sits under a prefix folder — a `%` or `"`
-  path is refused with exit 2 regardless. (#12)
+  below the matched prefix folder is refused with exit 2 even under a prefix folder, while
+  one that lies in the prefix folder's own path is substituted away and the path is still
+  rewritten. (#12)
 - **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
   corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
   case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
