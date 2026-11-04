@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-11-04
+
 ### Changed
 
 - **Which paths `forge.cmd` / `deciders.cmd` embed literally is now decided by three
@@ -24,18 +26,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   folders, and **refused with exit 2 otherwise** — so a checkout or Python at e.g.
   `D:\dev!\...`, outside every profile folder, no longer installs, where 1.3.1 accepted it.
   A `%` or `"` **below the matched prefix folder** is refused with exit 2 even under a
-  prefix folder: the remainder check at `dev-team/install-dev-team-windows.ps1:1189` skips
+  prefix folder: the remainder check in `Resolve-CmdEmbeddablePath` skips
   a rewritten remainder bearing either character, so that part of the path is never
   rewritten. A `%` *in the prefix folder's own path*, however, is substituted away by the
   `%ENVVAR%` embed before the remainder check ever sees it, so the path is still rewritten
   and the install succeeds — only a `%` or `"` that survives into the remainder is refused.
   When the unusable path came from `py -3`, that source is skipped in favour
   of `PATH` rather than failing the install, and the skip now prints a `Write-Warning`
-  (`dev-team/install-dev-team-windows.ps1:844-845`) naming both the path that was passed
+  (in `Resolve-WrapperPython`) naming both the path that was passed
   over and the one used instead, with `PY_PYTHON` / `py.ini` as the way to choose
   differently — 1.3.1 used the `py -3` interpreter in that situation, so the switch must
   not be silent. An unusable `PATH` Python, being the last source, cannot be skipped in
-  favour of anything and ends in a refusal with exit 2. (#12)
+  favour of anything and ends in a refusal with exit 2. (#12, #13)
 
 ### Fixed
 
@@ -622,7 +624,8 @@ Hermes Agent, covering Linux, macOS and Windows.
 - `--no-embeddings` / `-NoEmbeddings` has no effect, because `mnemosyne-hermes` 0.5.0
   declares `mnemosyne-memory[embeddings]` as a hard dependency.
 
-[Unreleased]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.2...HEAD
+[1.3.2]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.1.0...v1.2.0
