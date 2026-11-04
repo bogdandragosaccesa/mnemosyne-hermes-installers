@@ -19,15 +19,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to an `%ENVVAR%` form (which would add variable guards, exit 1 under a trimmed
   environment, and follow `%USERPROFILE%` to whichever user runs the wrapper) or refused.
   Only `%` (starts another expansion even inside quotes), `"` (closes the quoting) and `!`
-  (consumed by `!var!` under `cmd /v:on`) are treated as unsafe: such a path is rewritten
-  when it sits under one of the prefix folders, and **refused with exit 2 otherwise** — so a
-  checkout or Python at e.g. `D:\dev!\...`, outside every profile folder, no longer
-  installs, where 1.3.1 accepted it. When the unusable path came from `py -3` or from
-  `PATH`, that source is skipped in favour of the next one rather than failing the install,
-  and the skip now prints a `Write-Warning` naming both the path that was passed over and
-  the one used instead, with `PY_PYTHON` / `py.ini` as the way to choose differently —
-  1.3.1 used the `py -3` interpreter in that situation, so the switch must not be silent.
-  (#12)
+  (consumed by `!var!` under `cmd /v:on`) are treated as unsafe, but only `!` is ever
+  rewritten: a `!` path is rewritten when it sits under one of the prefix folders, and
+  **refused with exit 2 otherwise** — so a checkout or Python at e.g. `D:\dev!\...`,
+  outside every profile folder, no longer installs, where 1.3.1 accepted it. A `%` or `"`
+  path is **refused with exit 2 regardless** of whether it sits under a prefix folder: the
+  remainder check at `dev-team/install-dev-team-windows.ps1:1189` skips a rewritten
+  remainder bearing either character, so such a path is never rewritten even under a prefix
+  folder (`"` cannot occur in a Windows file name, so in practice this means every `%` path
+  is refused). When the unusable path came from `py -3`, that source is skipped in favour
+  of `PATH` rather than failing the install, and the skip now prints a `Write-Warning`
+  (`dev-team/install-dev-team-windows.ps1:844-845`) naming both the path that was passed
+  over and the one used instead, with `PY_PYTHON` / `py.ini` as the way to choose
+  differently — 1.3.1 used the `py -3` interpreter in that situation, so the switch must
+  not be silent. An unusable `PATH` Python, being the last source, cannot be skipped in
+  favour of anything and ends in a refusal with exit 2. (#12)
 
 ### Fixed
 
@@ -77,9 +83,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   caret (it strips carets inside quotes on any line that also carries a `!`, which a
   caller's argument can supply through `%*`) and run a path other than the one embedded. An
   all-ASCII path containing `%`, `"` or `!` is not part of that byte-identical case: as
-  "Changed" above states, it is either rewritten to the `%ENVVAR%` form described here
-  (gaining the `if not defined`/`if not exist` guards and `setlocal`) or refused with exit
-  2, depending on whether it sits under a prefix folder. (#12)
+  "Changed" above states, only a `!` path is either rewritten to the `%ENVVAR%` form
+  described here (gaining the `if not defined`/`if not exist` guards and `setlocal`) or
+  refused with exit 2, depending on whether it sits under a prefix folder — a `%` or `"`
+  path is refused with exit 2 regardless. (#12)
 - **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
   corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
   case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
