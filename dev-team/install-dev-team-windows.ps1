@@ -673,6 +673,28 @@ if ((Split-Path -Leaf (Split-Path -Parent $HermesRoot)) -eq 'profiles') {
 # dev-team\scripts\env_pin_check.py on every .env pin (Assert-EnvPinSafe),
 # and a wrapper path cmd.exe cannot read is refused before any profile is
 # touched (Assert-CmdWrapperPathsAscii).
+function Test-WrapperPythonEmbeddable {
+    <# M3 (round 2 review): a candidate from the py launcher or PATH that
+       cannot be embedded in forge.cmd/deciders.cmd (not ASCII, and under
+       no %ENVVAR% prefix this installer can rewrite) must not be chosen at
+       all -- Resolve-WrapperPython falls back to the next source instead,
+       rather than committing to a path Assert-CmdWrapperPathsAscii will
+       later have to hard-refuse (M3's regression: main picked a usable
+       PATH Python in that situation; this installer used to refuse the
+       whole install instead). Probes with Resolve-CmdEmbeddablePath's own
+       -NoRefuse mode, so this is the exact same rule, not a reimplementation
+       of it. Hermes' own interpreter (toolsDir, above) is NEVER probed here
+       -- it stays strict, per D6: it is always under %LOCALAPPDATA% in
+       practice, and steering away from it toward "a different, unrelated
+       installation" because of a representability quirk is exactly the
+       silent-wrong-Python outcome D6 forbids. #>
+    param([string] $Path)
+    if (-not $Path) { return $false }
+    if (Test-AsciiOrdinalRange $Path 0x20 0x7E) { return $true }
+    $prefixes = Get-CmdPrefixCandidates -HermesRoot $HermesRoot
+    $probe = Resolve-CmdEmbeddablePath -Label 'probe' -Path $Path -Prefixes $prefixes -NoRefuse
+    return [bool]$probe
+}
 function Resolve-WrapperPython {
     <# D6 (review follow-up, pr10-review.md section 4): candidates in that
        order, and the FIRST ONE THAT EXISTS wins -- no preference for an
@@ -686,7 +708,17 @@ function Resolve-WrapperPython {
        installation -- exactly the "silently runs a different Python"
        outcome this installer must never produce. No usable form at all is
        a hard failure (exit 2 in Assert-CmdWrapperPathsAscii), not a
-       fallback to another interpreter. #>
+       fallback to another interpreter.
+       M3 (round 2 review): that "no fallback" rule above is about Hermes'
+       OWN interpreter (toolsDir) only. For the py launcher and PATH
+       sources it was a regression: a non-ASCII, non-embeddable py -3
+       result used to make the WHOLE install exit 2 even when PATH had a
+       perfectly usable ASCII (or otherwise embeddable) Python right
+       behind it -- main (pre-D1..D9) picked that PATH Python and
+       installed fine. Each of those two sources now falls back to the
+       next one when its own candidate exists but can't be embedded;
+       Hermes' own interpreter is still never skipped for that reason. #>
+    $pyCandidate = $null
     $toolsDir = Join-Path $env:LOCALAPPDATA 'hermes\tools'
     if (Test-Path -LiteralPath $toolsDir) {
         $found = Get-ChildItem -LiteralPath $toolsDir -Directory -Filter 'python-3*' -ErrorAction SilentlyContinue |
@@ -729,10 +761,21 @@ function Resolve-WrapperPython {
             # found" handling below -- it fails safe, it just isn't the
             # exact original path in a report-only variable nothing else
             # trusts.
+            # m3 (round 2 review): py -3 can print something other than
+            # the hex line before it (a deprecation notice, a launcher
+            # warning), and an earlier version joined EVERY line of $hex
+            # into one string before matching -- a single stray line made
+            # the whole thing fail the hex regex, giving "No Python 3
+            # found" even though the launcher DID report a path (exactly
+            # the misleading message this change set out to remove). Use
+            # the LAST non-empty line: the -c program's only output is the
+            # final `print(...)`, so whatever else py -3 writes to stdout
+            # comes before it.
             $hex = & py -3 -c 'import sys; print(sys.executable.encode(''utf-16-le'',''surrogatepass'').hex())' 2>$null
         } finally { $ErrorActionPreference = $savedEap }
         if ($LASTEXITCODE -eq 0 -and $hex) {
-            $hexTrimmed = ([string]$hex).Trim()
+            $hexLines = @(@($hex) | Where-Object { $_ -and ([string]$_).Trim() })
+            $hexTrimmed = if ($hexLines.Count -gt 0) { ([string]$hexLines[-1]).Trim() } else { '' }
             # No [Convert]::FromHexString: that overload is .NET 5+ only
             # and this must also run under PowerShell 5.1 (.NET Framework).
             if ($hexTrimmed -match '^([0-9a-f]{4})+$') {
@@ -747,14 +790,32 @@ function Resolve-WrapperPython {
                 # claiming no Python 3 exists when one was in fact
                 # reported (just not at a path that currently resolves).
                 $script:WrapperPythonLauncherPath = $decoded
-                if (Test-Path -LiteralPath $decoded) { return $decoded }
+                # M3 (round 2 review): a py -3 result that EXISTS but can't
+                # be embedded in forge.cmd/deciders.cmd must not win OUTRIGHT
+                # over a PATH candidate that can -- that was the regression
+                # (main picked the usable PATH Python; this installer forced
+                # a hard refusal instead). But if PATH has nothing better
+                # either, still resolve to this one rather than $null: it IS
+                # a real Python 3 ("no Python 3 found" would be false), and
+                # Assert-CmdWrapperPathsAscii's own refusal message (which
+                # already suggests an ASCII-only install path) is the
+                # correct place for that failure, not a fabricated "nothing
+                # found at all".
+                if (Test-Path -LiteralPath $decoded) {
+                    if (Test-WrapperPythonEmbeddable $decoded) { return $decoded }
+                    $pyCandidate = $decoded
+                }
             }
         }
     }
     $onPathCmd = Get-Command python -All -ErrorAction SilentlyContinue |
         Where-Object { $_.Source -and $_.Source -notmatch '\\WindowsApps\\' } |
         Select-Object -First 1
-    if ($onPathCmd) { return $onPathCmd.Source }
+    if ($onPathCmd) {
+        if (Test-WrapperPythonEmbeddable $onPathCmd.Source) { return $onPathCmd.Source }
+        if (-not $pyCandidate) { $pyCandidate = $onPathCmd.Source }
+    }
+    if ($pyCandidate) { return $pyCandidate }
     return $null
 }
 function Format-EnvPinForDisplay {
@@ -792,6 +853,41 @@ function Test-AsciiOrdinalRange {
     }
     return $true
 }
+function Get-LongPathName {
+    <# Round 2 (review): prefix matching in Resolve-CmdEmbeddablePath compares
+       $Path against LOCALAPPDATA/APPDATA/USERPROFILE/ProgramFiles. On a CI
+       (or any) machine where the process's own path arrives through an 8.3
+       short name (e.g. "C:\Users\RUNNER~1\...") while those env vars hold the
+       canonical LONG form (e.g. "C:\Users\runneradmin\..."), an ordinal
+       string compare of the two forms never matches even though they denote
+       the same directory -- the install would wrongly refuse (or, worse,
+       silently embed a short-name path a later run under the long name can't
+       prefix-rewrite). Canonicalize to the long form on BOTH sides before
+       comparing. GetLongPathName is a thin kernel32 call: it only inspects
+       the path string and the filesystem's own 8.3<->long mapping, nothing
+       mutates or is created. Off Windows, or when the path does not exist
+       (GetLongPathName requires the path to resolve), the input is returned
+       unchanged -- never a failure, since a non-existent path can't have a
+       short name to begin with and an unresolvable call means "nothing to
+       canonicalize", not "refuse". #>
+    param([string] $Path)
+    if (-not $Path) { return $Path }
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'DevTeamNative.PathNative').Type) {
+            Add-Type -Namespace DevTeamNative -Name PathNative -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathName(string lpszShortPath, System.Text.StringBuilder lpszLongPath, uint cchBuffer);
+'@ -ErrorAction Stop
+        }
+        $sb = New-Object System.Text.StringBuilder 1024
+        $len = [DevTeamNative.PathNative]::GetLongPathName($Path, $sb, [uint32]$sb.Capacity)
+        if ($len -gt 0 -and $len -lt [uint32]$sb.Capacity) { return $sb.ToString() }
+    } catch {
+        # Not Windows, Add-Type unavailable, or the call failed: fall through
+        # and use the path exactly as given.
+    }
+    return $Path
+}
 function Get-PersistedEnvVar {
     <# Thin wrapper around [Environment]::GetEnvironmentVariable(Name,
        Scope) so Get-CmdPrefixCandidates's registry read can be
@@ -811,9 +907,21 @@ function Get-CmdPrefixCandidates {
        into an %ENVVAR% form a .cmd file can embed verbatim (ASCII) and
        cmd.exe expands from its own (UTF-16) environment at run time.
        Read from THIS PROCESS's environment for LOCALAPPDATA/APPDATA/
-       USERPROFILE/ProgramFiles: Windows seeds those into every new
+       USERPROFILE/ProgramW6432: Windows seeds those into every new
        process from the user's profile, so a later cmd.exe run by the same
-       user sees the same values this installer saw.
+       user sees the same values this installer saw. These are TIER 1.
+       m2 (round 2 review): %ProgramFiles% is always ASCII on disk (so it
+       can never actually match a non-ASCII remainder on its own), and
+       under a 32-bit cmd.exe (WOW64) it is REDIRECTED to
+       "...\Program Files (x86)" -- a different, narrower directory than
+       the one this (64-bit PowerShell) process resolved
+       (https://learn.microsoft.com/en-us/windows/win32/winprog64/wow64-implementation-details),
+       so a wrapper written against %ProgramFiles% here could expand to the
+       wrong folder under a 32-bit cmd.exe later. %ProgramW6432% always
+       names the true 64-bit Program Files regardless of the caller's
+       bitness, and is only ever ABSENT on a 32-bit Windows OS -- where
+       there is no WOW64 redirection to begin with, so plain %ProgramFiles%
+       is safe there and used as the fallback.
        HERMES_ROOT is different: it is not one of those profile-seeded
        variables, so it is only used when PERSISTED -- read directly from
        the registry (HKCU or HKLM 'Environment', via the User/Machine
@@ -821,12 +929,27 @@ function Get-CmdPrefixCandidates {
        the $HermesRoot this installer actually resolved. A process-only
        HERMES_ROOT (set for this invocation alone, e.g. by a CI step or a
        parent script) would expand to nothing in a cmd.exe spawned later,
-       silently breaking the wrapper, so it is never used as a prefix. #>
+       silently breaking the wrapper, so it is never used as a prefix.
+       M2 (round 2 review): even when persisted and matching, HERMES_ROOT
+       is TIER 2 (see Resolve-CmdEmbeddablePath) -- Hermes itself never
+       defines or reads HERMES_ROOT (it uses HERMES_HOME), so this is a
+       variable only a user's own shell profile or a CI step happens to
+       set; it must never outrank an OS profile variable just because it
+       is textually longer, or a user who changes/unsets it later silently
+       repoints the wrapper at a different Python. It is tried only when no
+       tier-1 variable matches at all. #>
     param([string] $HermesRoot)
     $cands = New-Object System.Collections.Generic.List[object]
-    foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'ProgramFiles')) {
+    foreach ($name in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE')) {
         $val = [Environment]::GetEnvironmentVariable($name)
-        if ($val) { $cands.Add([pscustomobject]@{ Name = $name; Value = $val }) }
+        if ($val) { $cands.Add([pscustomobject]@{ Name = $name; Value = $val; Tier = 1 }) }
+    }
+    $programFiles64 = [Environment]::GetEnvironmentVariable('ProgramW6432')
+    if ($programFiles64) {
+        $cands.Add([pscustomobject]@{ Name = 'ProgramW6432'; Value = $programFiles64; Tier = 1 })
+    } else {
+        $programFiles = [Environment]::GetEnvironmentVariable('ProgramFiles')
+        if ($programFiles) { $cands.Add([pscustomobject]@{ Name = 'ProgramFiles'; Value = $programFiles; Tier = 1 }) }
     }
     if ($HermesRoot) {
         $trimmedRoot = $HermesRoot.TrimEnd('\')
@@ -843,7 +966,7 @@ function Get-CmdPrefixCandidates {
         $machineVal = Get-PersistedEnvVar 'HERMES_ROOT' 'Machine'
         $effective = if ($userVal) { $userVal } else { $machineVal }
         if ($effective -and $effective.TrimEnd('\').Equals($trimmedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $cands.Add([pscustomobject]@{ Name = 'HERMES_ROOT'; Value = $effective })
+            $cands.Add([pscustomobject]@{ Name = 'HERMES_ROOT'; Value = $effective; Tier = 2 })
         }
     }
     return $cands.ToArray()
@@ -859,37 +982,53 @@ function Resolve-CmdEmbeddablePath {
        -- NTFS paths are case-insensitive), and only when the remaining,
        rewritten part is itself printable ASCII with no '%' (would start
        another, unintended expansion) and no '"' (would break out of the
-       wrapper's quoting). Among every prefix that qualifies, the LONGEST
-       one wins, so e.g. LOCALAPPDATA beats USERPROFILE when a path sits
-       under both. No qualifying prefix at all is a hard refusal (exit 2,
-       nothing written) -- the caller never falls back to a different,
-       possibly wrong, interpreter or script. #>
-    param([string] $Label, [string] $Path, [object[]] $Prefixes)
+       wrapper's quoting). Among every prefix that qualifies, the lowest
+       TIER wins first (see Get-CmdPrefixCandidates -- M2, round 2 review:
+       HERMES_ROOT is tier 2, every OS profile variable is tier 1, so
+       HERMES_ROOT is only ever used when no OS variable matches, never
+       because it happens to be textually longer), then the LONGEST one
+       within that tier, so e.g. LOCALAPPDATA beats USERPROFILE when a path
+       sits under both. No qualifying prefix at all is a hard refusal (exit
+       2, nothing written) -- the caller never falls back to a different,
+       possibly wrong, interpreter or script -- UNLESS -NoRefuse is given,
+       in which case it returns $null instead: used by
+       Test-WrapperPythonEmbeddable to PROBE embeddability for the py
+       launcher/PATH fallback (M3) without the exit-2 side effect. #>
+    param([string] $Label, [string] $Path, [object[]] $Prefixes, [switch] $NoRefuse)
     if (Test-AsciiOrdinalRange $Path 0x20 0x7E) {
-        return [ordered]@{ Embed = $Path; Rewritten = $false }
+        return [ordered]@{ Embed = $Path; Rewritten = $false; PrefixName = $null }
     }
-    $bestName = $null; $bestLen = -1; $bestRemainder = $null
+    # Round 2 (review): canonicalize to the LONG path form on BOTH sides
+    # before any prefix comparison -- see Get-LongPathName. $Path itself is
+    # canonicalized too (not just the prefixes) so an 8.3-short $Path still
+    # matches a long-form LOCALAPPDATA/USERPROFILE/etc, and the computed
+    # remainder is relative to the long form the %ENVVAR% will actually
+    # expand to at run time.
+    $longPath = Get-LongPathName $Path
+    $bestName = $null; $bestTier = [int]::MaxValue; $bestLen = -1; $bestRemainder = $null
     foreach ($p in $Prefixes) {
-        $val = ([string]$p.Value).TrimEnd('\')
-        if (-not $val -or $Path.Length -lt $val.Length) { continue }
-        $prefixPart = $Path.Substring(0, $val.Length)
+        $val = (Get-LongPathName ([string]$p.Value)).TrimEnd('\')
+        if (-not $val -or $longPath.Length -lt $val.Length) { continue }
+        $prefixPart = $longPath.Substring(0, $val.Length)
         if (-not $prefixPart.Equals($val, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-        $rest = $Path.Substring($val.Length)
+        $rest = $longPath.Substring($val.Length)
         if ($rest.Length -gt 0 -and $rest[0] -ne '\') { continue }   # separator-boundary check
         $remainder = $rest.TrimStart('\')
         if (-not (Test-AsciiOrdinalRange $remainder 0x20 0x7E)) { continue }
         if ($remainder.Contains('%') -or $remainder.Contains('"')) { continue }
-        if ($val.Length -gt $bestLen) {
-            $bestLen = $val.Length; $bestName = $p.Name; $bestRemainder = $remainder
+        $tier = if ($null -ne $p.Tier) { [int]$p.Tier } else { 1 }
+        if ($tier -lt $bestTier -or ($tier -eq $bestTier -and $val.Length -gt $bestLen)) {
+            $bestTier = $tier; $bestLen = $val.Length; $bestName = $p.Name; $bestRemainder = $remainder
         }
     }
     if ($bestName) {
         $sep = if ($bestRemainder) { '\' } else { '' }
-        return [ordered]@{ Embed = "%$bestName%$sep$bestRemainder"; Rewritten = $true }
+        return [ordered]@{ Embed = "%$bestName%$sep$bestRemainder"; Rewritten = $true; PrefixName = $bestName }
     }
+    if ($NoRefuse) { return $null }
     $names = ($Prefixes | ForEach-Object { $_.Name }) -join ', '
     if (-not $names) { $names = '(none available in this environment)' }
-    [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $Label, $(Format-EnvPinForDisplay $Path), is not printable ASCII, and is not under any of the folders whose environment variable cmd.exe can expand ($names). Move the dev-team checkout, and/or the Python that runs it, onto an ASCII-only path (e.g. Python installed under C:\Python312) or under one of those folders, then re-run.")
+    [Console]::Error.WriteLine("Refusing to write forge.cmd/deciders.cmd: the path of $Label, $(Format-EnvPinForDisplay $Path), is not printable ASCII, and is not under any of the folders whose environment variable cmd.exe can expand ($names). Move the dev-team checkout, and/or the Python that runs it, onto an ASCII-only path (e.g. Python installed under C:\Python312) or under one of those folders, then re-run. If the py launcher is what picked this path, you can instead point it at a different Python 3 with the PY_PYTHON environment variable or a py.ini file (https://docs.python.org/3/using/windows.html#customization).")
     exit 2
 }
 function Assert-WrapperTextAscii {
@@ -925,7 +1064,30 @@ function Get-CmdGuardBlock {
        D5: this guard only proves the %ENVVAR%-expanded path EXISTS; it
        cannot tell whose interpreter it is. See Assert-CmdWrapperPathsAscii
        for why that residual risk (another Windows user's same-named
-       Hermes-managed Python) is accepted rather than further mitigated. #>
+       Hermes-managed Python) is accepted rather than further mitigated.
+       M1 (round 2 review): an UNSET %VAR% expands to nothing in a batch
+       file, so `if not exist "%VAR%\tools\python.exe" ...` becomes
+       `if not exist "\tools\python.exe" ...` -- a path on the CURRENT
+       DRIVE's root, which a non-admin user can create folders under by
+       default. A wrapper started with a trimmed environment (a sandbox, a
+       service, a gateway that strips profile variables) would then have
+       its guard check "\tools\python.exe" instead of refusing, and a
+       planted python.exe there would run. Fix: emit `if not defined NAME
+       goto <label>` (the `if` doc: "defined <variable> ... true condition
+       if *variable* is defined") immediately before each `if not exist`,
+       going to the SAME label -- the failure message already covers
+       "wasn't found", which is equally true of "the variable that names
+       it isn't set".
+       m1 (round 2 review, C6 follow-up): under `cmd /v:on` (delayed
+       expansion), a literal '!' in the EXPANDED %VAR% value is consumed
+       by cmd's own `!var!` syntax in BOTH the guard and the run line
+       before either is evaluated -- e.g. a remainder "a!b!c" is read as
+       "ac" in both places, so the guard can approve a different path than
+       the one actually run. `setlocal DisableDelayedExpansion` (the
+       setlocal doc: applies "regardless of the setting before") emitted
+       once, alongside the guard lines, fixes this -- and ONLY when there
+       is at least one rewritten path, so an all-ASCII install's wrapper
+       (no guards at all) stays byte-identical to before this change. #>
     param([string] $Prefix, [object[]] $Pairs)
     $guards = ''
     $tail = ''
@@ -933,6 +1095,7 @@ function Get-CmdGuardBlock {
     foreach ($pair in $Pairs) {
         if (-not $pair.Embed.Rewritten) { continue }
         $gotoLabel = ":${Prefix}_missing_$i"
+        $guards += "if not defined $($pair.Embed.PrefixName) goto $gotoLabel`r`n"
         $guards += "if not exist `"$($pair.Embed.Embed)`" goto $gotoLabel`r`n"
         # S1 (review round 1): cmd.exe expands every %VAR% in a line
         # BEFORE it parses that line, so an earlier version of this echo
@@ -956,6 +1119,7 @@ function Get-CmdGuardBlock {
                  "exit /b 1`r`n"
         $i++
     }
+    if ($guards) { $guards = "setlocal DisableDelayedExpansion`r`n" + $guards }
     return [ordered]@{ Guards = $guards; Tail = $tail }
 }
 function Assert-CmdWrapperPathsAscii {
@@ -1047,6 +1211,17 @@ function Assert-CmdWrapperPathsAscii {
         @{ Key = 'ForgePy';       Label = 'forge.py';            Path = $ForgePy },
         @{ Key = 'DecidersPy';    Label = 'deciders.py';         Path = $DecidersPy })) {
         $embeds[$pair.Key] = Resolve-CmdEmbeddablePath -Label $pair.Label -Path $pair.Path -Prefixes $prefixes
+        # Round 2 (review): defence in depth -- Resolve-CmdEmbeddablePath
+        # itself never returns an empty Embed (it either embeds the literal
+        # path, embeds a non-empty "%NAME%\<remainder>", or exits 2), but a
+        # caller that skips Assert-CmdWrapperPathsAscii (or a future bug in
+        # that function) must never reach Set-Content with an empty embed --
+        # cmd.exe would run `"" "<script>"`, i.e. no interpreter at all,
+        # silently. Refuse instead of writing a corrupt wrapper.
+        if (-not $embeds[$pair.Key].Embed) {
+            [Console]::Error.WriteLine("Internal error: the embed for $($pair.Label) resolved empty; refusing to write forge.cmd/deciders.cmd rather than write a wrapper with no interpreter path. This should be unreachable -- please report this as a bug.")
+            exit 2
+        }
     }
     return $embeds
 }

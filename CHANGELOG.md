@@ -12,37 +12,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Resolves the v1.3.1 known issues "no ASCII-path Python, no wrappers" and "a non-ASCII
   `py -3` path gives a vague error".** A non-ASCII wrapper Python, `forge.py` or
   `deciders.py` path is now embedded in `forge.cmd` / `deciders.cmd` as an `%ENVVAR%`
-  prefix (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `%ProgramFiles%`, or a *persisted*
-  `HERMES_ROOT`) plus an ASCII remainder, instead of refusing outright — so a Windows user
-  with a non-ASCII user name whose only Python is Hermes' own under `%LOCALAPPDATA%`, and
-  whose checkout is under their profile, can now install. `cmd.exe` expands the variable
-  from its own UTF-16 environment at run time, so the `.cmd` file on disk stays pure ASCII.
-  Each rewritten path gets an `if not exist` guard (via `goto`, not a parenthesized block,
-  since an expanded value can contain `)`) that fails with a clear message instead of
-  silently running a stale or wrong interpreter. A non-ASCII path under none of those
-  folders is still refused with exit 2, before anything is written, naming the offending
-  path and the folders it was *not* found under. `py -3` discovery now asks Python to print
-  `sys.executable` as an ASCII-only hex encoding of its UTF-16LE code units, decoded in
+  prefix (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `%ProgramW6432%` — or plain
+  `%ProgramFiles%` on a 32-bit Windows OS, where `%ProgramW6432%` does not exist — or a
+  *persisted* `HERMES_ROOT`, tried last, below every OS profile variable) plus an ASCII
+  remainder, instead of refusing outright — so a Windows user with a non-ASCII user name
+  whose only Python is Hermes' own under `%LOCALAPPDATA%`, and whose checkout is under
+  their profile, can now install. `cmd.exe` expands the variable from its own UTF-16
+  environment at run time, so the `.cmd` file on disk stays pure ASCII. Each rewritten
+  path gets an `if not defined` guard (an unset prefix variable can never silently resolve
+  to the current drive's root) followed by an `if not exist` guard (via `goto`, not a
+  parenthesized block, since an expanded value can contain `)`) that fails with a clear
+  message instead of silently running a stale, wrong, or planted interpreter; a wrapper
+  with at least one rewritten path also gets `setlocal DisableDelayedExpansion`, so a
+  literal `!` in an expanded path is never consumed by `cmd /v:on`'s own `!var!` syntax
+  before the guard and the run line agree on it. The path comparison that decides whether a
+  path sits under one of those folders now canonicalizes both sides to the long (non-8.3)
+  path form first, so a process whose own path arrived as an 8.3 short name (e.g. a
+  `RUNNER~1` account) against a long-form `%LOCALAPPDATA%` still matches instead of being
+  wrongly refused; and the installer never writes a wrapper with an empty embedded
+  interpreter path — that is a hard refusal (exit 2), not a silently broken `.cmd` file. A
+  non-ASCII path under none of those folders is still refused with exit 2, before anything
+  is written, naming the offending path and the folders it was *not* found under. `py -3`
+  discovery now asks Python to print `sys.executable` as an ASCII-only hex encoding of its
+  UTF-16LE code units (taking the last non-empty output line, so a deprecation notice or
+  launcher warning printed before it is never mistaken for the hex itself), decoded in
   PowerShell, so a non-ASCII launcher path is no longer mangled by the console code page
   under Windows PowerShell 5.1 and no longer reported as "No Python 3 found" when the
-  launcher did in fact report one (the message now says so and names the reported path).
-  The interpreter Hermes itself installed under `%LOCALAPPDATA%\hermes\tools` is preferred
-  purely by discovery order again — representability no longer steers which interpreter is
-  chosen, only whether its path can be embedded. An all-ASCII install's wrapper stays
-  byte-identical to 1.3.1's.
+  launcher did in fact report one. A `py -3` or `PATH` Python that exists but cannot be
+  embedded (non-ASCII and under none of those folders) no longer forces a hard refusal on
+  its own: each of those two sources now falls back to the next one when a *later* source
+  has an embeddable candidate, and only refuses when nothing embeddable was found anywhere;
+  the refusal message also now mentions `PY_PYTHON`/`py.ini` as a way to point the `py`
+  launcher at a different Python 3. The interpreter Hermes itself installed under
+  `%LOCALAPPDATA%\hermes\tools` is preferred purely by discovery order again —
+  representability no longer steers which interpreter is chosen for that one source, only
+  whether its path can be embedded — and it is still never skipped in favour of a fallback,
+  unlike `py -3`/`PATH`. An all-ASCII install's wrapper stays byte-identical to 1.3.1's.
+  (#12)
 - **The guard's "not found" message could run a command instead of just printing a path.**
   `cmd.exe` expands every `%VAR%` in a line before parsing it, so the message printed the
   *expanded* path unquoted; an `&` in it (a legal filename character, present in e.g.
   `R&D`) split the line and ran the trailing fragment as a command on the very path meant
   to fail closed. The message now prints the unexpanded `%ENVVAR%` form (every `%` doubled)
-  wrapped in double quotes, so it is inert and matches what D4 originally asked for.
+  wrapped in double quotes, so it is inert. (#12)
 - **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
   corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
   case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
   and the defence-in-depth check before the wrapper is written — both missed them, and
   `-Encoding ascii` turned them into `?`. Both checks now compare ordinal character codes
   with no case folding and no regex engine, so the result no longer depends on the
-  machine's culture.
+  machine's culture. (#12)
 
 ## [1.3.1] - 2026-11-04
 
@@ -95,13 +114,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   machine whose user name is non-ASCII and whose only Python is Hermes' own under
   `%LOCALAPPDATA%`, the install fails until a Python 3 on an ASCII-only path (for example
   `C:\Python312`, first on `PATH`) is installed and the dev-team checkout is on an ASCII
-  path too. (#10)
+  path too. (#10) — fixed in Unreleased (#12).
 - **Windows PowerShell 5.1: a non-ASCII `py -3` path gives a vague error.** The path that
   `py -3` prints for `sys.executable` is decoded by PowerShell in the console's OEM code
   page, so a non-ASCII path from the launcher comes back garbled, fails `Test-Path` and is
   skipped without a message. If it was the only Python found, the installer exits 1 with
   `No Python 3 found for the forge and deciders wrappers …` instead of naming the
-  non-ASCII path. (#10)
+  non-ASCII path. (#10) — fixed in Unreleased (#12).
 
 ## [1.3.0] - 2026-11-03
 

@@ -30,7 +30,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from test_install_windows import DEV_TEAM, PS1, _function, _pin_prelude  # noqa: E402
+from test_install_windows import DEV_TEAM, PS1, _function, _pin_prelude, _resolve_wrapper_python_prelude, CMD_WRAPPER_FUNCS  # noqa: E402
 
 CHECKER = DEV_TEAM / "scripts" / "env_pin_check.py"
 sys.path.insert(0, str(CHECKER.parent))
@@ -311,8 +311,7 @@ class CmdWrapperRefusalTests(unittest.TestCase):
     (exit 2, before anything is written), per the comment above
     Assert-CmdWrapperPathsAscii in the installer."""
 
-    _EXTRA_FUNCS = ("Test-AsciiOrdinalRange", "Get-PersistedEnvVar", "Get-CmdPrefixCandidates",
-                    "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii", "Get-CmdGuardBlock")
+    _EXTRA_FUNCS = CMD_WRAPPER_FUNCS
 
     def _run(self, tmp, python_path, forge_py="/ascii/forge/forge.py",
              deciders_py="/ascii/deciders/deciders.py", env_extra=None):
@@ -391,7 +390,7 @@ class WrapperPythonFirstCandidateWinsTests(unittest.TestCase):
         h = t / "resolve.ps1"
         h.write_text(
             "$ErrorActionPreference = 'Stop'\n"
-            + _function(TEXT, "Resolve-WrapperPython") + "\n"
+            + _resolve_wrapper_python_prelude(TEXT) + "\n"
             + "Write-Output (\"PY=\" + (Resolve-WrapperPython))\n", encoding="utf-8")
         env = {"LOCALAPPDATA": str(local), "PATH": str(bindir)}
         return h, env, hermes_py_dir / "python.exe", py

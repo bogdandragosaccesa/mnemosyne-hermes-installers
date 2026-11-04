@@ -29,7 +29,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from test_install_windows import PS1, _function, _pin_prelude  # noqa: E402
+from test_install_windows import PS1, _function, _pin_prelude, CMD_WRAPPER_FUNCS, _cmd_wrapper_prelude  # noqa: E402
 
 TEXT = PS1.read_text(encoding="utf-8")
 NON_ASCII_DIR = "Dr\u0103go\u0219 \u0105\u00c5\u0445 \u56e2\u961f"
@@ -93,10 +93,7 @@ class WindowsNtEvidence(unittest.TestCase):
             body = (
                 "$ErrorActionPreference = 'Stop'\n"
                 "$HermesRoot = $null\n"
-                + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
-                + "".join(_function(TEXT, f) + "\n" for f in (
-                    "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
-                    "Assert-WrapperTextAscii", "Get-CmdGuardBlock"))
+                + _cmd_wrapper_prelude(TEXT)
                 + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
                 "$WrapperPython = $env:A3_PY\n$ForgePy = 'C:\\x\\forge.py'\n$DecidersPy = 'C:\\x\\deciders.py'\n"
                 "$CmdPaths = Assert-CmdWrapperPathsAscii\nWrite-Output 'WRAPPERS_OK'\n")
@@ -128,10 +125,7 @@ class WindowsNtEvidence(unittest.TestCase):
             body = (
                 "$ErrorActionPreference = 'Stop'\n"
                 f"$HermesRoot = $null\n"
-                + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
-                + "".join(_function(TEXT, f) + "\n" for f in (
-                    "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
-                    "Assert-WrapperTextAscii", "Get-CmdGuardBlock"))
+                + _cmd_wrapper_prelude(TEXT)
                 + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
                 "$WrapperPython = $env:A3_PY\n"
                 f"$ForgePy = $env:A3_SCRIPT\n$DecidersPy = $env:A3_SCRIPT\n"
@@ -197,10 +191,7 @@ class WindowsNtEvidence(unittest.TestCase):
             body = (
                 "$ErrorActionPreference = 'Stop'\n"
                 "$HermesRoot = $null\n"
-                + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
-                + "".join(_function(TEXT, f) + "\n" for f in (
-                    "Test-AsciiOrdinalRange", "Get-PersistedEnvVar", "Get-CmdPrefixCandidates",
-                    "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii", "Get-CmdGuardBlock"))
+                + _cmd_wrapper_prelude(TEXT)
                 + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
                 "$WrapperPython = $env:A3_PY\n$ForgePy = 'C:\\x\\forge.py'\n$DecidersPy = 'C:\\x\\deciders.py'\n"
                 "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
@@ -208,7 +199,7 @@ class WindowsNtEvidence(unittest.TestCase):
                 "$ForgeGuard = Get-CmdGuardBlock -Prefix 'dt_forge' -Pairs @("
                 "[ordered]@{ Label = 'the wrapper Python'; Embed = $WrapperPythonCmd })\n"
                 "$forgeCmdContent = \"@echo off`r`nREM t`r`n$($ForgeGuard.Guards)\" +\n"
-                "    \"`\\\"$($WrapperPythonCmd.Embed)`\\\" `\\\"C:\\\\x\\\\forge.py`\\\" %*`r`n\" +\n"
+                "    \"`\"$($WrapperPythonCmd.Embed)`\" `\"C:\\\\x\\\\forge.py`\" %*`r`n\" +\n"
                 "    \"exit /b %ERRORLEVEL%`r`n$($ForgeGuard.Tail)\"\n"
                 f"Set-Content -LiteralPath {_ps_q(forge_cmd_path)} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
                 "Write-Output \"EMBED=$($WrapperPythonCmd.Embed)\"\n")
@@ -233,10 +224,32 @@ class WindowsNtEvidence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             stub = Path(tmp) / "stub.py"
             stub.write_text("import sys\nprint('STUB_ARGS=' + '|'.join(sys.argv[1:]))\nsys.exit(3)\n")
+            # Round 2 (review): this test used to leave $WrapperPythonCmd,
+            # $ForgePyCmd, $DecidersPyCmd and $ForgeGuard/$DecidersGuard
+            # undefined before using them in the extracted $forgeCmdContent/
+            # $decidersCmdContent lines -- $null.Embed is $null, so the
+            # wrapper was built with an EMPTY embedded interpreter path
+            # ("" "<script>" %*), silently. Compute them via the real
+            # Assert-CmdWrapperPathsAscii/Get-CmdGuardBlock chain, exactly as
+            # the installer does immediately before those two lines
+            # (install-dev-team-windows.ps1, around $CmdPaths/$ForgeGuard/
+            # $DecidersGuard), so the embed is never empty.
             body = ("$ErrorActionPreference = 'Stop'\n"
+                    "$HermesRoot = $null\n"
+                    + _cmd_wrapper_prelude(TEXT)
+                    + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
                     f"$WrapperPython = {_ps_q(sys.executable)}\n"
                     f"$ForgePy = {_ps_q(stub)}\n$DecidersPy = {_ps_q(stub)}\n"
                     "$ForgeMarker = 'REM forge'\n$DecidersMarker = 'REM deciders'\n"
+                    "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
+                    "$WrapperPythonCmd = $CmdPaths.WrapperPython\n"
+                    "$ForgePyCmd = $CmdPaths.ForgePy\n$DecidersPyCmd = $CmdPaths.DecidersPy\n"
+                    "$ForgeGuard = Get-CmdGuardBlock -Prefix 'dt_forge' -Pairs @("
+                    "[ordered]@{ Label = 'the wrapper Python'; Embed = $WrapperPythonCmd }, "
+                    "[ordered]@{ Label = 'forge.py'; Embed = $ForgePyCmd })\n"
+                    "$DecidersGuard = Get-CmdGuardBlock -Prefix 'dt_deciders' -Pairs @("
+                    "[ordered]@{ Label = 'the wrapper Python'; Embed = $WrapperPythonCmd }, "
+                    "[ordered]@{ Label = 'deciders.py'; Embed = $DecidersPyCmd })\n"
                     + lines["forgeCmdContent"] + "\n" + lines["decidersCmdContent"] + "\n"
                     f"Set-Content -LiteralPath {_ps_q(Path(tmp) / 'forge.cmd')} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
                     f"Set-Content -LiteralPath {_ps_q(Path(tmp) / 'deciders.cmd')} -Value $decidersCmdContent -NoNewline -Encoding ascii\n")
