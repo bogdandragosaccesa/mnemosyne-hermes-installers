@@ -723,6 +723,11 @@ class WindowsInstallerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
+def _root_lines(stdout):
+    """The ROOT= lines a root-climb harness printed, each whole."""
+    return [line for line in stdout.splitlines() if line.startswith("ROOT=")]
+
+
 class WindowsT4TeamHomeRootTests(unittest.TestCase):
     """T4: the team home must live at the Hermes root, not inside whatever
     profile happens to be running the installer. install-dev-team-windows.ps1
@@ -762,7 +767,10 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
                                   capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"ROOT={root}", proc.stdout)
+        # Compare the whole ROOT= line, not a substring: without the climb
+        # the output is ROOT=<root>/profiles/devops, which still contains
+        # "ROOT=<root>", so an assertIn on stdout cannot see the climb go.
+        self.assertEqual(_root_lines(proc.stdout), [f"ROOT={root}"], proc.stdout)
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_root_climb_logic_leaves_the_true_root_alone(self):
@@ -785,7 +793,9 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
             proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
                                   capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"ROOT={root}", proc.stdout)
+        # Whole-line match (see the sibling test): an over-climb that keeps
+        # the <root> prefix must fail too.
+        self.assertEqual(_root_lines(proc.stdout), [f"ROOT={root}"], proc.stdout)
 
     def _migration_harness(self, tmp):
         norm_fn = _function(self.text, "Get-NormalizedPath")
