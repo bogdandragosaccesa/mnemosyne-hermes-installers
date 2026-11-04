@@ -75,12 +75,27 @@ def _function(text: str, name: str) -> str:
 # A harness extracting Get-CmdPrefixCandidates/Resolve-CmdEmbeddablePath
 # without these three is exactly the stale-dependency-list bug fixed here --
 # every call site must use this one tuple instead of hand-rolling its own.
+#
+# N4 (round-7 review): Test-ContainsUnsafeCmdEmbedChar was MISSING from this
+# tuple even though Resolve-CmdEmbeddablePath's literal-embed gate calls it.
+# Every existing test passed only because the `-and` on the ASCII check
+# short-circuited on non-ASCII input before that call was ever reached; an
+# ASCII metachar path (e.g. "C:\Program Files (x86)\Python312\python.exe")
+# made the harness die with rc=1, "... is not recognized as ... function" --
+# not a clean red/green result. Test-ContainsCmdShellMetachar is gone from
+# both the installer and this tuple: round 7 (D2) collapsed the two drifting
+# copies of the literal-embed rule into Test-ContainsUnsafeCmdEmbedChar
+# alone, so the wider A3 round-5 classifier has no call site left.
 CMD_WRAPPER_FUNCS = (
-    "Test-AsciiOrdinalRange", "Test-ContainsCmdShellMetachar", "Get-LongPathName",
+    "Test-AsciiOrdinalRange", "Test-ContainsUnsafeCmdEmbedChar", "Get-LongPathName",
     "Get-PersistedEnvVar", "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
     "Assert-WrapperTextAscii", "Get-CmdGuardBlock",
 )
-RESOLVE_WRAPPER_PYTHON_DEPS = CMD_WRAPPER_FUNCS + ("Test-WrapperPythonEmbeddable",)
+# Format-EnvPinForDisplay: Resolve-WrapperPython itself calls it since N3
+# (the skipped-py-launcher warning), so it is part of the real chain now,
+# not only of the cmd-wrapper harnesses below.
+RESOLVE_WRAPPER_PYTHON_DEPS = ("Format-EnvPinForDisplay",) + CMD_WRAPPER_FUNCS + \
+    ("Test-WrapperPythonEmbeddable",)
 
 
 def _resolve_wrapper_python_prelude(text: str) -> str:
@@ -2816,6 +2831,274 @@ class WindowsCmdWrapperNonAsciiTests(unittest.TestCase):
                                   capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("ProgramFiles", proc.stdout, proc.stdout)
+
+    # ---- N1/N2/N3/N4 + D1 (round-7 review, pr12-review-r2.md §3) ----
+
+    def _embeddable_prelude(self):
+        """_wrapper_prelude plus Test-WrapperPythonEmbeddable itself, which
+        probes through the real Resolve-CmdEmbeddablePath (-NoRefuse)."""
+        return self._wrapper_prelude() + _function(self.text, "Test-WrapperPythonEmbeddable") + "\n"
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N4_ascii_x86_path_with_no_prefix_falls_back_to_a_literal_embed(self):
+        # N4: the round-6 literal fallback had no test AND the harness could
+        # not even reach it -- CMD_WRAPPER_FUNCS was missing
+        # Test-ContainsUnsafeCmdEmbedChar, so this exact path died with
+        # rc=1 ("... is not recognized as ... function") instead of
+        # producing a verdict. "C:\Program Files (x86)\..." is pure ASCII,
+        # matches no %ENVVAR% prefix (there is deliberately no
+        # ProgramFiles(x86) candidate) and contains only quote-safe
+        # metacharacters, so it must be embedded literally, unrewritten.
+        path = "C:\\Program Files (x86)\\Python312\\python.exe"
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n"
+                "$env:ProgramFiles = ''\n$env:ProgramW6432 = ''\n"
+                + self._wrapper_prelude() +
+                "$prefixes = Get-CmdPrefixCandidates\n"
+                f"$r = Resolve-CmdEmbeddablePath -Label 'python' -Path '{path}' -Prefixes $prefixes\n"
+                "Write-Output \"EMBED=$($r.Embed)\"\n"
+                "Write-Output \"REWRITTEN=$($r.Rewritten)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"EMBED={path}", proc.stdout, proc.stdout)
+        self.assertIn("REWRITTEN=False", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N1_ascii_path_with_quote_safe_metachars_under_a_prefix_stays_literal(self):
+        # N1: the A3 round-5 gate put EVERY cmd.exe metacharacter
+        # (& ^ % ! ( ) " < >) through the %ENVVAR%-rewrite branch, so an
+        # all-ASCII path containing only the quote-safe ones (& ^ ( ))
+        # started being rewritten the moment it happened to sit under a
+        # profile folder -- gaining variable guards, an exit 1 under a
+        # trimmed environment, and following %USERPROFILE% to whichever
+        # user runs the wrapper. 1.3.1 embedded all three of these
+        # literally. Only '%', '"' and '!' are genuinely unsafe in a
+        # quoted literal embed, so only those may force the rewrite.
+        local = "C:\\Users\\bob\\AppData\\Local"
+        userprofile = "C:\\Users\\bob"
+        cases = (
+            ("AMP", local + "\\Programs\\R&D\\python.exe"),
+            ("PARENS", userprofile + "\\src (copy)\\dev-team\\forge\\forge.py"),
+            ("CARET", userprofile + "\\a^b\\python.exe"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            body = (
+                f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = '{userprofile}'\n"
+                "$env:APPDATA = ''\n$env:ProgramFiles = ''\n$env:ProgramW6432 = ''\n"
+                + self._wrapper_prelude() +
+                "$prefixes = Get-CmdPrefixCandidates\n")
+            for name, p in cases:
+                body += (f"$r = Resolve-CmdEmbeddablePath -Label 'x' -Path '{p}' -Prefixes $prefixes\n"
+                         f"Write-Output \"{name}_EMBED=$($r.Embed)\"\n"
+                         f"Write-Output \"{name}_REWRITTEN=$($r.Rewritten)\"\n")
+            harness.write_text(body)
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for name, p in cases:
+            with self.subTest(case=name):
+                self.assertIn(f"{name}_EMBED={p}", proc.stdout, proc.stdout)
+                self.assertIn(f"{name}_REWRITTEN=False", proc.stdout, proc.stdout)
+        self.assertNotIn("%LOCALAPPDATA%", proc.stdout, proc.stdout)
+        self.assertNotIn("%USERPROFILE%", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N4_refuses_an_ascii_path_containing_a_bang_or_a_percent(self):
+        # N4 + N1's boundary: the three characters that are NOT safe in a
+        # quoted literal embed must still be refused (exit 2) when no
+        # %ENVVAR% prefix covers the path -- widening the literal fallback
+        # to '& ^ ( )' must not widen it to '%', '!' or '"'. '"' is not
+        # testable here: it is illegal in a Windows file name.
+        for name, path in (("BANG", "D:\\dev!\\python.exe"),
+                           ("PERCENT", "D:\\50%off\\python.exe")):
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    harness = Path(tmp) / "harness.ps1"
+                    harness.write_text(
+                        "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n"
+                        "$env:ProgramFiles = ''\n$env:ProgramW6432 = ''\n"
+                        + self._wrapper_prelude() +
+                        "$prefixes = Get-CmdPrefixCandidates\n"
+                        f"$r = Resolve-CmdEmbeddablePath -Label 'python' -Path '{path}' -Prefixes $prefixes\n"
+                        "Write-Output 'UNREACHABLE'\n")
+                    proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                          capture_output=True, text=True, timeout=60)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertNotIn("UNREACHABLE", proc.stdout, proc.stdout)
+                self.assertIn("cannot be safely embedded", proc.stderr, proc.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N2_wrapper_python_embeddable_agrees_with_the_probe_for_an_8_3_short_path(self):
+        # N2: Test-WrapperPythonEmbeddable kept its OWN fast path, which
+        # skipped the 8.3 long-form canonicalisation the real
+        # Resolve-CmdEmbeddablePath does. An 8.3 short candidate is
+        # printable ASCII by construction, so this function said
+        # "embeddable" and Resolve-WrapperPython committed to it -- then
+        # the later, real, non-probe call refused the whole install with
+        # exit 2 instead of falling back to the next source. That is
+        # exactly the M3 regression this function exists to prevent.
+        # Review repro: D:\PYTHN~1\python.exe -> D:\Pythoen\python.exe.
+        short_path = "D:\\PYTHN~1\\python.exe"
+        long_path = "D:\\Pyth\u00f6n\\python.exe"
+
+        def q(s):
+            return s.replace("'", "''")
+
+        stub = (
+            "function Get-LongPathName {\n"
+            "    param([string] $Path)\n"
+            f"    if ($Path -eq '{q(short_path)}') {{ return '{q(long_path)}' }}\n"
+            "    return $Path\n"
+            "}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n"
+                "$env:ProgramFiles = ''\n$env:ProgramW6432 = ''\n$HermesRoot = $null\n"
+                + self._embeddable_prelude() + stub +
+                f"$e = Test-WrapperPythonEmbeddable '{q(short_path)}'\n"
+                f"$p = Resolve-CmdEmbeddablePath -Label 'probe' -Path '{q(short_path)}' "
+                "-Prefixes (Get-CmdPrefixCandidates -HermesRoot $HermesRoot) -NoRefuse\n"
+                "Write-Output \"EMBEDDABLE=$e\"\n"
+                "Write-Output \"PROBE=$([bool]$p)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PROBE=False", proc.stdout, proc.stdout)
+        self.assertIn("EMBEDDABLE=False", proc.stdout,
+                      "Test-WrapperPythonEmbeddable disagreed with its own -NoRefuse probe: "
+                      + proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N4_wrapper_python_embeddable_for_metachar_paths(self):
+        # N4: Test-WrapperPythonEmbeddable with a metacharacter path -- the
+        # quote-safe ones are embeddable (literally), the unsafe ones are
+        # not, and in both cases the answer must come from the single
+        # -NoRefuse probe, not a second copy of the rule.
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n"
+                "$env:ProgramFiles = ''\n$env:ProgramW6432 = ''\n$HermesRoot = $null\n"
+                + self._embeddable_prelude() +
+                "Write-Output \"X86=$(Test-WrapperPythonEmbeddable 'C:\\Program Files (x86)\\Python312\\python.exe')\"\n"
+                "Write-Output \"AMP=$(Test-WrapperPythonEmbeddable 'C:\\R&D\\python.exe')\"\n"
+                "Write-Output \"BANG=$(Test-WrapperPythonEmbeddable 'D:\\dev!\\python.exe')\"\n"
+                "Write-Output \"PERCENT=$(Test-WrapperPythonEmbeddable 'D:\\50%off\\python.exe')\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("X86=True", proc.stdout, proc.stdout)
+        self.assertIn("AMP=True", proc.stdout, proc.stdout)
+        self.assertIn("BANG=False", proc.stdout, proc.stdout)
+        self.assertIn("PERCENT=False", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_D1_literal_embed_containing_a_caret_gets_setlocal(self):
+        # D1 (round-7 decision): a LITERAL (unrewritten) embed containing
+        # '^' had no `setlocal DisableDelayedExpansion`. Under `cmd /v:on`,
+        # cmd's delayed-expansion pass strips carets inside quotes when the
+        # line also contains a '!' (which `%*` can supply from a caller's
+        # argument), so the path actually run differs from the path
+        # embedded. The fix widens the EXISTING setlocal trigger rather
+        # than pushing '^' paths into the rewrite branch -- that would
+        # reintroduce N1 for caret paths. Pinned as exact bytes: the
+        # wrapper must be 1.3.1's wrapper plus that one line, and nothing
+        # else (no guards, no tail, since nothing was rewritten).
+        wrapper_python = "C:\\P^y\\python.exe"
+        forge_py = "C:\\dev-team\\forge\\forge.py"
+        deciders_py = "C:\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = ("$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n"
+                     "$env:ProgramFiles = ''\n$env:ProgramW6432 = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            expected_forge = (
+                b"@echo off\r\n"
+                b"REM dev-team forge wrapper (install-dev-team-windows.ps1)\r\n"
+                b"setlocal DisableDelayedExpansion\r\n"
+                b'"C:\\P^y\\python.exe" "C:\\dev-team\\forge\\forge.py" %*\r\n'
+                b"exit /b %ERRORLEVEL%\r\n")
+            self.assertEqual(forge_path.read_bytes(), expected_forge)
+            self.assertNotIn(b"if not exist", deciders_path.read_bytes(),
+                             "a literal caret embed must not gain existence guards")
+            self.assertIn(b"setlocal DisableDelayedExpansion", deciders_path.read_bytes())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_N3_warns_when_the_py_launcher_choice_is_skipped_for_an_unsafe_char(self):
+        # N3: an ASCII `py -3` path containing '!' (or '%') is not
+        # embeddable, so Resolve-WrapperPython silently switched to the
+        # PATH Python -- 1.3.1 used the launcher's one. The switch is
+        # defensible (a '!' path breaks under `cmd /v:on`) but it must not
+        # be silent: the operator has to be told which interpreter they
+        # actually got and why.
+        func_body = _resolve_wrapper_python_prelude(self.text)
+        with tempfile.TemporaryDirectory() as tmp:
+            bang_py = Path(tmp) / "Tools!" / "python.exe"
+            bang_py.parent.mkdir(parents=True)
+            bang_py.write_text("stub")
+            hex_form = str(bang_py).encode("utf-16-le").hex()
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            path_py = bindir / "python"
+            path_py.write_text("#!/bin/sh\n")
+            path_py.chmod(0o755)
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$env:LOCALAPPDATA = '{tmp}\\no-tools-here'\n"
+                "$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+                "$env:ProgramW6432 = ''\n$HermesRoot = $null\n"
+                f"$env:PATH = '{bindir}'\n"
+                "function py { Write-Output '" + hex_form + "'; $global:LASTEXITCODE = 0 }\n"
+                + func_body + "\n"
+                "$r = Resolve-WrapperPython\n"
+                "Write-Output \"RESOLVED=$r\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"RESOLVED={path_py}", proc.stdout, proc.stdout)
+        # Write-Warning goes to PowerShell's warning stream; which OS stream
+        # that lands on depends on the host, so check both.
+        out = proc.stdout + proc.stderr
+        self.assertIn("WARNING", out, out)
+        self.assertIn("cannot be safely embedded", out, out)
+        self.assertIn(str(bang_py), out, out)
+        self.assertIn("PY_PYTHON", out, out)
+
+    def test_D2_the_literal_embed_rule_has_exactly_one_deciding_call_site(self):
+        # D2 (round-7 decision): round-6 F1, N1 and N2 were all the same
+        # bug -- two copies of the literal-embed rule drifted apart. The
+        # rule is Test-ContainsUnsafeCmdEmbedChar, and exactly ONE place may
+        # DECIDE embeddability from it: Resolve-CmdEmbeddablePath's fast
+        # path. Test-WrapperPythonEmbeddable must reach the same answer
+        # through that function's -NoRefuse probe and never ask the
+        # classifier itself (that second copy WAS N2). The superseded,
+        # wider Test-ContainsCmdShellMetachar must have no call site left
+        # at all.
+        # Not a ban on every mention: N3's skipped-py-launcher warning
+        # reads the classifier to explain WHY a candidate was declined,
+        # which decides nothing about an embed.
+        gate = _function(self.text, "Resolve-CmdEmbeddablePath")
+        code = [ln for ln in gate.splitlines() if not ln.strip().startswith("#")]
+        calls = [ln.strip() for ln in code if "Test-ContainsUnsafeCmdEmbedChar $" in ln]
+        self.assertEqual(len(calls), 1,
+                         "Resolve-CmdEmbeddablePath consults the literal-embed gate "
+                         + f"{len(calls)} times, not once: " + "; ".join(calls))
+        probe = _function(self.text, "Test-WrapperPythonEmbeddable")
+        probe_code = [ln for ln in probe.splitlines() if not ln.strip().startswith("#")]
+        own = [ln.strip() for ln in probe_code
+               if "Test-ContainsUnsafeCmdEmbedChar" in ln or "Test-AsciiOrdinalRange" in ln]
+        self.assertEqual(own, [], "Test-WrapperPythonEmbeddable has its own copy of the rule "
+                                  "again instead of using the -NoRefuse probe: " + "; ".join(own))
+        stale = re.findall(r"Test-ContainsCmdShellMetachar\s+\$\w+", self.text)
+        self.assertEqual(stale, [], "the superseded, wider metachar gate is called again: "
+                                    + "; ".join(stale))
 
     def test_py_launcher_c_program_has_no_double_quotes_and_decodes_round_trip(self):
         # C4: the py -3 -c program (never directly asserted before) must

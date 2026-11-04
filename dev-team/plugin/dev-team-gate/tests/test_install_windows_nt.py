@@ -288,6 +288,58 @@ class WindowsNtEvidence(unittest.TestCase):
                     self.assertIn("STUB_ARGS=a|b c", run.stdout, run.stdout + run.stderr)
                     self.assertEqual(run.returncode, 3)
 
+    def test_R1_a_literal_ascii_path_with_ampersand_and_parens_runs_under_cmd(self):
+        # R1 (round-7, load-bearing): commit 8650469's message claims a
+        # literal "R&D (x)" path "fail[ed] closed (rc=3)" on a Windows VM,
+        # while the round-6 literal fallback and N1's fix both depend on
+        # exactly that literal form WORKING. One of the two claims is
+        # wrong, and only a runner with a real cmd.exe can say which.
+        # Settle it: an all-ASCII path containing '&', '(' and ')' is
+        # embedded LITERALLY (not rewritten -- that is N1), the wrapper
+        # stays pure ASCII, and cmd.exe runs that interpreter and
+        # propagates its exit code.
+        line = re.search(r"^\$forgeCmdContent = .*$", TEXT, re.M).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "R&D (x)"
+            venv_dir = base / "venv"
+            venv.create(venv_dir, with_pip=False)
+            py = venv_dir / "Scripts" / "python.exe"
+            self.assertTrue(py.exists(), py)
+            self.assertTrue(str(py).isascii(), f"this runner's TEMP is not ASCII: {py}")
+            stub = base / "stub.py"
+            stub.write_text("import sys\nprint('STUB_ARGS=' + '|'.join(sys.argv[1:]))\nsys.exit(3)\n")
+            forge_cmd_path = Path(tmp) / "forge.cmd"
+            body = ("$ErrorActionPreference = 'Stop'\n"
+                    "$HermesRoot = $null\n"
+                    + _cmd_wrapper_prelude(TEXT)
+                    + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
+                    "$WrapperPython = $env:A3_PY\n"
+                    "$ForgePy = $env:A3_SCRIPT\n$DecidersPy = $env:A3_SCRIPT\n"
+                    "$ForgeMarker = 'REM forge'\n"
+                    "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
+                    "$WrapperPythonCmd = $CmdPaths.WrapperPython\n"
+                    "$ForgePyCmd = $CmdPaths.ForgePy\n"
+                    "$ForgeGuard = Get-CmdGuardBlock -Prefix 'dt_forge' -Pairs @("
+                    "[ordered]@{ Label = 'the wrapper Python'; Embed = $WrapperPythonCmd }, "
+                    "[ordered]@{ Label = 'forge.py'; Embed = $ForgePyCmd })\n"
+                    + line + "\n"
+                    f"Set-Content -LiteralPath {_ps_q(forge_cmd_path)} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
+                    "Write-Output \"EMBED=$($WrapperPythonCmd.Embed)\"\n"
+                    "Write-Output \"REWRITTEN=$($WrapperPythonCmd.Rewritten)\"\n")
+            proc = self._ps51(tmp, body, {"A3_PY": str(py), "A3_SCRIPT": str(stub)})
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            # N1: literal, not rewritten -- no %ENVVAR%, no guard lines.
+            self.assertIn(f"EMBED={py}", proc.stdout, proc.stdout)
+            self.assertIn("REWRITTEN=False", proc.stdout, proc.stdout)
+            raw = forge_cmd_path.read_bytes()
+            self.assertTrue(raw.isascii(), "forge.cmd must stay pure ASCII")
+            self.assertNotIn(b"if not exist", raw, "a literal embed must gain no existence guard")
+            # R1, settled: does cmd.exe actually run this literal path?
+            run = subprocess.run(["cmd.exe", "/d", "/c", str(forge_cmd_path), "a", "b c"],
+                                 capture_output=True, text=True, errors="replace", timeout=120)
+        self.assertIn("STUB_ARGS=a|b c", run.stdout, run.stdout + run.stderr)
+        self.assertEqual(run.returncode, 3, run.stdout + run.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

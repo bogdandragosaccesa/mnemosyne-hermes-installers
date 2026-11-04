@@ -7,6 +7,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Which paths `forge.cmd` / `deciders.cmd` embed literally is now decided by three
+  characters, not nine.** `cmd.exe`'s metacharacter set is `& ^ % ! ( ) " < >`, but every
+  embedded path is wrapped in double quotes, and inside double quotes `cmd.exe` treats `&`,
+  `^`, `(` and `)` as literal text. So a pure-ASCII path containing only those — e.g.
+  `C:\Users\bob\src (copy)\...`, `...\Programs\R&D\python.exe`, or
+  `C:\Program Files (x86)\Python312\python.exe`, which matches no `%ENVVAR%` prefix at all —
+  is embedded literally and unguarded, exactly as 1.3.1 wrote it, instead of being rewritten
+  to an `%ENVVAR%` form (which would add variable guards, exit 1 under a trimmed
+  environment, and follow `%USERPROFILE%` to whichever user runs the wrapper) or refused.
+  Only `%` (starts another expansion even inside quotes), `"` (closes the quoting) and `!`
+  (consumed by `!var!` under `cmd /v:on`) are treated as unsafe: such a path is rewritten
+  when it sits under one of the prefix folders, and **refused with exit 2 otherwise** — so a
+  checkout or Python at e.g. `D:\dev!\...`, outside every profile folder, no longer
+  installs, where 1.3.1 accepted it. When the unusable path came from `py -3` or from
+  `PATH`, that source is skipped in favour of the next one rather than failing the install,
+  and the skip now prints a `Write-Warning` naming both the path that was passed over and
+  the one used instead, with `PY_PYTHON` / `py.ini` as the way to choose differently —
+  1.3.1 used the `py -3` interpreter in that situation, so the switch must not be silent.
+  (#12)
+
 ### Fixed
 
 - **Resolves the v1.3.1 known issues "no ASCII-path Python, no wrappers" and "a non-ASCII
@@ -39,7 +61,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PowerShell, so a non-ASCII launcher path is no longer mangled by the console code page
   under Windows PowerShell 5.1 and no longer reported as "No Python 3 found" when the
   launcher did in fact report one. A `py -3` or `PATH` Python that exists but cannot be
-  embedded (non-ASCII and under none of those folders) no longer forces a hard refusal on
+  embedded (non-ASCII and under none of those folders, or containing one of the characters
+  named under "Changed" below) no longer forces a hard refusal on
   its own: each of those two sources now falls back to the next one when a *later* source
   has an embeddable candidate, and only refuses when nothing embeddable was found anywhere;
   the refusal message also now mentions `PY_PYTHON`/`py.ini` as a way to point the `py`
@@ -47,14 +70,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `%LOCALAPPDATA%\hermes\tools` is preferred purely by discovery order again —
   representability no longer steers which interpreter is chosen for that one source, only
   whether its path can be embedded — and it is still never skipped in favour of a fallback,
-  unlike `py -3`/`PATH`. An all-ASCII install's wrapper stays byte-identical to 1.3.1's.
-  (#12)
-- **The guard's "not found" message could run a command instead of just printing a path.**
-  `cmd.exe` expands every `%VAR%` in a line before parsing it, so the message printed the
-  *expanded* path unquoted; an `&` in it (a legal filename character, present in e.g.
-  `R&D`) split the line and ran the trailing fragment as a command on the very path meant
-  to fail closed. The message now prints the unexpanded `%ENVVAR%` form (every `%` doubled)
-  wrapped in double quotes, so it is inert. (#12)
+  unlike `py -3`/`PATH`. An all-ASCII install's wrapper is byte-identical to 1.3.1's with
+  exactly one exception: when a literally embedded path contains a `^`, the wrapper gains a
+  single `setlocal DisableDelayedExpansion` line, so `cmd /v:on`'s delayed-expansion pass
+  cannot strip that caret (it strips carets inside quotes on any line that also carries a
+  `!`, which a caller's argument can supply through `%*`) and run a path other than the one
+  embedded. (#12)
 - **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
   corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
   case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
@@ -62,26 +83,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `-Encoding ascii` turned them into `?`. Both checks now compare ordinal character codes
   with no case folding and no regex engine, so the result no longer depends on the
   machine's culture. (#12)
-- **An 8.3 short name (e.g. `C:\DEV-TE~1\DRGO~1\...`) silently bypassed the `%ENVVAR%`
-  rewrite instead of triggering it.** A short name is printable ASCII *by construction*
-  even when the long form it denotes is not, and the ASCII-ness check that decides the
-  wrapper's fast path ran on the path exactly as given, before its long form was ever
-  looked at — so a non-ASCII install surfaced through an 8.3 short name had its short name
-  embedded in `forge.cmd`/`deciders.cmd` literally, unrewritten. A path containing `~` is
-  now canonicalized to its long form first, and the ASCII-ness decision (and, when it
-  isn't ASCII, the prefix rewrite) is made on that long form; a path with no `~` is
-  completely unaffected (still no `GetLongPathName` call at all, still byte-identical).
+
+### Internal
+
+These describe bugs introduced and fixed *within this PR*. No released version ever carried
+them, so they are not "Fixed" entries; they are listed because the review trail refers to
+them.
+
+- **An 8.3 short name (e.g. `C:\DEV-TE~1\DRGO~1\...`) bypassed the new `%ENVVAR%` rewrite
+  instead of triggering it.** A short name is printable ASCII *by construction* even when
+  the long form it denotes is not, and the ASCII-ness check that decides the wrapper's fast
+  path ran on the path exactly as given, before its long form was ever looked at — so a
+  non-ASCII install surfaced through an 8.3 short name had its short name embedded in
+  `forge.cmd`/`deciders.cmd` literally, unrewritten. A path containing `~` is now
+  canonicalized to its long form first, and the ASCII-ness decision (and, when it isn't
+  ASCII, the prefix rewrite) is made on that long form. A path with no `~` still takes the
+  fast path with no `GetLongPathName` call at all; every path that misses the fast path, and
+  every prefix value, is canonicalized. (#12)
+- **The new guard's "not found" message could run a command instead of just printing a
+  path.** `cmd.exe` expands every `%VAR%` in a line before parsing it, so the message
+  printed the *expanded* path unquoted; an `&` in it (a legal filename character, present in
+  e.g. `R&D`) split the line and ran the trailing fragment as a command on the very path
+  meant to fail closed. The message now prints the unexpanded `%ENVVAR%` form (every `%`
+  doubled) wrapped in double quotes, so it is inert. (#12)
+- **`Test-WrapperPythonEmbeddable` kept a second copy of the literal-embed rule** and so
+  could call a candidate embeddable that the real check then refused, aborting the install
+  (exit 2) instead of falling back to the next interpreter source. The rule now has a single
+  implementation, consulted from one place. (#12)
 
 ### Known issues
 
-- **`HERMES_ROOT` is not canonicalized to its long form before the 8.3-short-name
-  comparison that decides whether it can be used as an `%ENVVAR%` prefix.** Unlike
-  `LOCALAPPDATA`/`APPDATA`/`USERPROFILE`/`ProgramW6432`/`ProgramFiles`, a persisted
-  `HERMES_ROOT` that arrives (or is compared against) in 8.3 short form is not passed
-  through `Get-LongPathName` before the match. This fails *closed*: at worst the
-  comparison does not match and the installer falls through to the next candidate or
-  refuses (exit 2) rather than embedding a wrong path, since `HERMES_ROOT` is already the
-  lowest-priority (tier 2) candidate. Tracked for a future round.
+- **A persisted `HERMES_ROOT` is not canonicalized to its long (non-8.3) form before the
+  equality check that decides whether it is offered as an `%ENVVAR%` prefix at all.** The
+  *prefix match itself* does canonicalize it, like every other candidate. What is not
+  canonicalized is the separate comparison of the effective persisted `HERMES_ROOT` value
+  against the Hermes root this installer is working on: if one side arrives in 8.3 short
+  form and the other in long form, that comparison fails and `HERMES_ROOT` is never added as
+  a candidate. This fails *closed* — at worst the installer falls through to the next
+  candidate or refuses (exit 2) rather than embedding a wrong path, and `HERMES_ROOT` is
+  already the lowest-priority (tier 2) candidate. Tracked for a future round. (#12)
 
 ## [1.3.1] - 2026-11-04
 
