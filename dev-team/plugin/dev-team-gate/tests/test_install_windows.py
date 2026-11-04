@@ -738,7 +738,14 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_root_climb_logic_climbs_out_of_a_profile_directory(self):
         start = self.text.index("$RootConfig = Get-HermesLastLine")
-        end = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        # Stop before $WrapperPython = Resolve-WrapperPython is actually
+        # invoked: the root-climb logic this test exercises is fully
+        # computed by $HermesRoot above, and this sandbox has no 'python'
+        # (or Hermes tools / py launcher) to resolve, so running the
+        # wrapper-python resolution here would fail closed on a host that
+        # legitimately lacks a 'python' command, unrelated to what this
+        # test checks.
+        end = self.text.index("$WrapperPython = Resolve-WrapperPython")
         snippet = self.text[start:end]
         self.assertIn("-eq 'profiles'", snippet, "no profiles-climb check")
         with tempfile.TemporaryDirectory() as tmp:
@@ -760,7 +767,10 @@ class WindowsT4TeamHomeRootTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_root_climb_logic_leaves_the_true_root_alone(self):
         start = self.text.index("$RootConfig = Get-HermesLastLine")
-        end = self.text.index("$PluginSrcMnemo = Join-Path $HermesRoot")
+        # See the sibling test above: stop before the wrapper-python
+        # resolution is invoked, so this test doesn't require a 'python'
+        # command on the host.
+        end = self.text.index("$WrapperPython = Resolve-WrapperPython")
         snippet = self.text[start:end]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "hermes"

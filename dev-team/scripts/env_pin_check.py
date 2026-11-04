@@ -25,14 +25,20 @@ or Mnemosyne: the readers are TRANSCRIBED, function by function, each with a
 diffs every transcription against the real reader when one is installed.
 
 Upstream versions transcribed:
-  * python-dotenv 1.2.2 (dotenv/version.py:1), from the venv the running
-    Hermes gateway maps: ~/.hermes/installs/310929d25cb8ca43/environments/
-    d0b4cbcc48074b63927a9cf7b9618132/venv/lib/python3.14/site-packages/dotenv/
+  * python-dotenv 1.2.2 (dotenv/version.py:1), e.g. a venv's
+    lib/python3.14/site-packages/dotenv/ -- any install of that exact
+    release reads identically.
   * Hermes hermes-agent commit bf0203a794a07aac3ff764972ab9087baa4e4f4e
     (2026-10-22; pyproject version 0.0.0), ~/.hermes/hermes-agent/
-  * mnemosyne 4.0.0b6 (as named by the PR #9 review; the installed
-    dist-info is mnemosyne_memory-4.0.0, __version__ "4.0.0"),
-    ~/.mnemosyne-venv/lib/python3.14/site-packages/mnemosyne/mcp_server.py
+  * mnemosyne: verified line-for-line identical against both
+    mnemosyne_memory-4.0.0b6 and the installed mnemosyne_memory-4.0.0
+    (__version__ "4.0.0"), mnemosyne/mcp_server.py.
+  * Hermes agent/secret_scope.py:_parse_env_text (348-361, plus the
+    _strip_inline_comment/_parse_env_value helpers it calls, 271-345) --
+    a third Hermes .env reader (behind profile secret scopes), not
+    transcribed below but confirmed by the differential fuzz (section 3
+    of the PR #10 review) to agree with this checker on every accepted
+    value.
 
 Fail closed: where a real reader's result depends on something this checker
 cannot know (the process environment for ``${VAR}``, the Unicode database of
@@ -421,8 +427,9 @@ def hermes_read(content, rewrite_newline):
 
 # =============================================================================
 # Mnemosyne reader.
-# TRANSCRIPTION of mnemosyne 4.0.0b6 (as named by the PR #9 review; verified
-# against the installed dist-info mnemosyne_memory-4.0.0, __version__ "4.0.0")
+# TRANSCRIPTION of mnemosyne, verified line-for-line identical in both
+# mnemosyne_memory-4.0.0b6 (as named by the PR #9 review) and the installed
+# mnemosyne_memory-4.0.0, __version__ "4.0.0":
 #   mnemosyne/mcp_server.py:793-842, _load_dotenv, line handling :820-841.
 # =============================================================================
 def mnemosyne_read(content):
