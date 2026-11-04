@@ -492,5 +492,30 @@ class PrStatusTests(unittest.TestCase):
                 self.assertIn("error", json.loads(out))
 
 
+class GithubTokenRedactTests(unittest.TestCase):
+    """M1: `redact()` covers bare GitHub token shapes, not only `token=<value>`."""
+
+    def test_redact_strips_bare_classic_token_shapes(self):
+        for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"):
+            with self.subTest(prefix=prefix):
+                secret = prefix + "C" * 36
+                redacted = redact(f"gh: failed to authenticate with {secret}; retry")
+                self.assertNotIn(secret, redacted)
+                self.assertIn("retry", redacted)
+
+    def test_redact_strips_bare_fine_grained_pat(self):
+        secret = "github_pat_" + "D" * 22 + "_" + "E" * 59
+        redacted = redact("remote: Invalid credentials " + secret)
+        self.assertNotIn(secret, redacted)
+
+    def test_redact_is_case_insensitive_on_the_prefix(self):
+        secret = "GHP_" + "F" * 36
+        self.assertNotIn(secret, redact("error " + secret))
+
+    def test_redact_leaves_ordinary_text_alone(self):
+        text = "pull request #15 is not mergeable: ghost branch missing"
+        self.assertEqual(redact(text), text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -104,6 +104,14 @@ ADAPTERS: Dict[str, Callable[[ProjectRecord], Adapter]] = {}
 _SECRET_SUBSTITUTIONS = (
     (re.compile(r"token=\S+", re.IGNORECASE), "token=***"),
     (re.compile(r"Bearer\s+\S+", re.IGNORECASE), "Bearer ***"),
+    # Bare GitHub token values. The `token=<value>` shape is covered above;
+    # a token on its own in an error string ("failed to authenticate with
+    # ghp_...") was not. Classic, OAuth, user-to-server, server-to-server and
+    # refresh tokens are all `gh[pours]_<body>`; fine-grained PATs are
+    # `github_pat_<body>_<body>`. Matched by prefix and a generous body so a
+    # future length change cannot silently un-redact a token.
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{8,}", re.IGNORECASE), "github_pat_***"),
+    (re.compile(r"\bgh[pours]_[A-Za-z0-9]{8,}", re.IGNORECASE), "gh_***"),
     (re.compile(r"Authorization:\s*[^\r\n\"']*", re.IGNORECASE), "Authorization: ***"),
 )
 
