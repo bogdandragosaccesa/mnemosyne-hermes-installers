@@ -891,14 +891,16 @@ function Test-ContainsUnsafeCmdEmbedChar {
        be embedded in forge.cmd/deciders.cmd LITERALLY -- unrewritten,
        unguarded, exactly as 1.3.1 wrote it -- or must instead be rewritten
        to a %ENVVAR% form or refused outright. Safe when this returns
-       $false, not safe when it returns $true. It has exactly ONE call
-       site, in Resolve-CmdEmbeddablePath; Test-WrapperPythonEmbeddable
-       reaches the same rule through that function's -NoRefuse probe rather
-       than asking again. That is deliberate: this file has now produced
-       three separate findings (round-6 F1, round-7 N1 and N2) that were
-       all the same bug -- two copies of this rule drifting apart -- so a
-       second call site is a defect, not an optimisation, and
-       test_D2_the_literal_embed_rule_has_exactly_one_call_site fails if
+       $false, not safe when it returns $true. It has exactly ONE DECIDING
+       call site, in Resolve-CmdEmbeddablePath's fast path;
+       Test-WrapperPythonEmbeddable reaches the same rule through that
+       function's -NoRefuse probe rather than asking again. That is
+       deliberate: this file has now produced three separate findings
+       (round-6 F1, round-7 N1 and N2) that were all the same bug -- two
+       copies of this rule drifting apart -- so a second DECIDING call site
+       is a defect, not an optimisation, and
+       test_D2_the_literal_embed_rule_has_exactly_one_deciding_call_site
+       fails if
        one appears.
        WHICH characters: cmd.exe's full metacharacter set is
        '& ^ % ! ( ) " < >', and an earlier version of this gate

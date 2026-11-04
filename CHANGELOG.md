@@ -70,12 +70,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `%LOCALAPPDATA%\hermes\tools` is preferred purely by discovery order again —
   representability no longer steers which interpreter is chosen for that one source, only
   whether its path can be embedded — and it is still never skipped in favour of a fallback,
-  unlike `py -3`/`PATH`. An all-ASCII install's wrapper is byte-identical to 1.3.1's with
-  exactly one exception: when a literally embedded path contains a `^`, the wrapper gains a
-  single `setlocal DisableDelayedExpansion` line, so `cmd /v:on`'s delayed-expansion pass
-  cannot strip that caret (it strips carets inside quotes on any line that also carries a
-  `!`, which a caller's argument can supply through `%*`) and run a path other than the one
-  embedded. (#12)
+  unlike `py -3`/`PATH`. An all-ASCII install whose path takes the literal embed (see
+  "Changed" above) gets a wrapper byte-identical to 1.3.1's with exactly one exception: when
+  that literally embedded path contains a `^`, the wrapper gains a single `setlocal
+  DisableDelayedExpansion` line, so `cmd /v:on`'s delayed-expansion pass cannot strip that
+  caret (it strips carets inside quotes on any line that also carries a `!`, which a
+  caller's argument can supply through `%*`) and run a path other than the one embedded. An
+  all-ASCII path containing `%`, `"` or `!` is not part of that byte-identical case: as
+  "Changed" above states, it is either rewritten to the `%ENVVAR%` form described here
+  (gaining the `if not defined`/`if not exist` guards and `setlocal`) or refused with exit
+  2, depending on whether it sits under a prefix folder. (#12)
 - **A Turkish-style `İ` (U+0130) or `K` (U+212A, Kelvin sign) in a path was silently
   corrupted instead of triggering the `%ENVVAR%` rewrite.** PowerShell's default
   case-insensitive `-match` folded both to an ASCII letter, so the printable-ASCII check —
