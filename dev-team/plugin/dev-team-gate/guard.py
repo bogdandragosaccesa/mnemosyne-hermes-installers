@@ -963,6 +963,28 @@ def _git_refusal(what: str, why: str) -> str:
     )
 
 
+def _non_stage_push_refusal(task_id: str) -> str:
+    """A `git push` from a card that is on the board but carries no dev-team
+    stage skill (decision 1, option B).
+
+    Such a card has no intake ancestor, so `project_slug()` cannot resolve a
+    project for it and the guard cannot learn which branch that project
+    protects: `protected()` would fall back to `{main, master}` and let a push
+    to a recorded default branch such as `develop` through. Rather than feed
+    `protected()` a second, agent-influencable project-resolution path, the
+    push itself is refused -- the branch it would create is one no validate,
+    review or pr-ci card owns.
+    """
+    return (
+        f"guard: `git push` from card {task_id} is refused: the card carries no dev-team "
+        f"stage skill, so the guard cannot establish which project it belongs to or which "
+        f"branch that project protects. Route the work through the pipeline (an intake card "
+        f"and its stages) so the push is anchored to a project, or have a human push it. "
+        f"A fence that blocks you is a reason to kanban_block(kind=\"needs_input\") and ask, "
+        f"never something to remove."
+    )
+
+
 def _config_key_redirects(key: str) -> bool:
     key = key.split("=", 1)[0].strip().lower()
     return key.startswith(_GIT_MAPPING_KEYS) or key in _GIT_MAPPING_SECTIONS
@@ -1307,6 +1329,20 @@ class _CardState:
                     ) from None
         return self._guarded
 
+    def stageless(self) -> bool:
+        """True for a card that is on the board but carries no dev-team stage skill.
+
+        `task_id is None` is deliberately excluded: that is no card at all (an
+        interactive session at a human's keyboard), not an agent working a
+        card, and there is no board-side identity to resolve a project from.
+        Refusing it would break every interactive session, so the `task_id is
+        not None` term is load-bearing -- do not "simplify" it away.
+
+        `guarded()` is memoised and raises `_Refuse` when the board cannot be
+        read or the card is not found, so this is free and fails closed.
+        """
+        return self.task_id is not None and not self.guarded()
+
     def protected(self) -> frozenset[str]:
         if self._protected is None:
             names = set(_ALWAYS_PROTECTED)
@@ -1588,6 +1624,12 @@ def _check_terminal(board, task_id, command, open_board=None):
                     f"{MERGE_LABEL}: `git push` to {dst!r}, the default branch, is "
                     f"human-only. Push the feature branch and let the PR carry the change."
                 )
+        # Ordering is load-bearing: the protected-destination loop runs first,
+        # so a non-stage card pushing main/master keeps its existing
+        # `merge: human-only` message byte for byte and this refusal covers
+        # only the pushes that would otherwise have been allowed.
+        if card.stageless():
+            raise _Refuse(_non_stage_push_refusal(task_id))
 
     if parse_error is not None and card.guarded():
         raise _Refuse(
@@ -1724,6 +1766,79 @@ def forge_pr_status(slug: str, pr_url: str) -> dict:
     return ForgeReader().pr_status(slug, pr_url)
 
 
+# ---------------------------------------------------------------------------
+# kanban_create: the new card's assignee must be an installed dev-team profile.
+# ---------------------------------------------------------------------------
+
+PREFIX_FILE = "dev-team-prefix"
+
+
+def _prefix_refusal(assignee: str, prefix: str) -> str:
+    return (
+        f"guard: kanban_create assignee '{assignee}' does not start with the installed "
+        f"team prefix '{prefix}'; refusing. A bare or unprefixed role name makes the "
+        f"dispatcher spawn a different, unguarded profile, so the card would run with no "
+        f"dev-team gate. Use '{prefix}{assignee}'. A fence that blocks you is a reason to "
+        f"kanban_block(kind=\"needs_input\") and ask, never something to remove."
+    )
+
+
+def _prefix_unreadable_refusal(path, reason: str) -> str:
+    return (
+        f"guard: cannot read the installed team prefix from {path}, so kanban_create "
+        f"cannot be verified; refusing ({reason}). A fence that blocks you is a reason to "
+        f"kanban_block(kind=\"needs_input\") and ask, never something to remove."
+    )
+
+
+def _installed_prefix() -> str:
+    """The team prefix the installer wrote to `$HERMES_HOME/dev-team-prefix`.
+
+    Trailing whitespace and the trailing newline are stripped. Raises when the
+    file is missing, unreadable or empty after stripping; the caller turns
+    that into a refusal, because a missing prefix file must never become a
+    bypass.
+    """
+    text = (_hermes_home() / PREFIX_FILE).read_text(encoding="utf-8")
+    prefix = text.strip()
+    if not prefix:
+        raise ValueError("the file is empty")
+    return prefix
+
+
+def check_create(args: dict) -> str | None:
+    """`kanban_create` whose `assignee` is not a prefixed dev-team profile.
+
+    A bare role name (`assignee="qa"`) makes the dispatcher spawn the
+    unprefixed `qa` profile -- another team's worker, or an unguarded root
+    profile -- so the new card would run with no dev-team gate at all.
+
+    Two deliberate properties, both tested:
+
+    * Not gated on the *creating* card's stage. A card with no skills, or with
+      an unknown `dev-team-stage-*` skill, must not be able to create an
+      unguarded card either, so this check consults no board and runs for
+      every `kanban_create`.
+    * The comparison is exact and case-sensitive. The dispatcher resolves a
+      profile by its exact directory name, so under prefix `dev-` an assignee
+      `Dev-qa` names a profile that is not the installed one and is refused.
+      This differs from `protected()` (which casefolds branch names) and from
+      `_protected_path` (which is case-insensitive) on purpose -- do not
+      "harmonize" them.
+    """
+    path = _hermes_home() / PREFIX_FILE
+    try:
+        prefix = _installed_prefix()
+    except Exception as exc:
+        return _prefix_unreadable_refusal(path, _describe(exc))
+    assignee = args.get("assignee") if isinstance(args, dict) else None
+    if not isinstance(assignee, str) or not assignee.strip():
+        return _prefix_refusal("" if assignee is None else str(assignee), prefix)
+    if not assignee.startswith(prefix):
+        return _prefix_refusal(assignee, prefix)
+    return None
+
+
 def _make_board(board: str | None) -> Board:
     return KanbanBoard(board)
 
@@ -1733,13 +1848,18 @@ def _block(message: str) -> dict:
 
 
 def pre_tool_call(tool_name, args, **kw):
-    """Hermes `pre_tool_call` hook. Only `kanban_complete` and `terminal` are
-    checked; every other tool (`kanban_block` included) passes untouched."""
-    if tool_name not in ("kanban_complete", "terminal"):
+    """Hermes `pre_tool_call` hook. Only `kanban_complete`, `kanban_create` and
+    `terminal` are checked; every other tool (`kanban_block` included) passes
+    untouched."""
+    if tool_name not in ("kanban_complete", "kanban_create", "terminal"):
         return None
     try:
         args = args if isinstance(args, dict) else {}
-        if tool_name == "kanban_complete":
+        if tool_name == "kanban_create":
+            # No board read: this check must hold for the creating card
+            # whatever (or whether) its stage skill is.
+            msg = check_create(args)
+        elif tool_name == "kanban_complete":
             # Resolve the id the way kanban_complete does: args first, then the env.
             task_id = args.get("task_id") or os.environ.get("HERMES_KANBAN_TASK")
             if not isinstance(task_id, str) or not task_id:
