@@ -153,10 +153,17 @@ right after `plugins enable` the list can lag the reload. If a `forge` already e
 this installer didn't write it (Laravel Forge, Foundry), the installer refuses before it touches
 any profile; move the other tool aside and re-run. On Windows, `forge.cmd` and `deciders.cmd` name
 the Python and the dev-team checkout by absolute path, and cmd.exe reads a `.cmd` file in the
-console code page, so neither path can be non-ASCII. The installer picks the first ASCII-path
-Python it finds (Hermes's own, then `py -3`, then `python` on PATH). If there is none — e.g. a
-non-ASCII user name and no other Python — it exits 2 before touching any profile: install a
-Python 3 on an ASCII path (such as `C:\Python312`, on PATH) and re-run.
+console code page, so neither path can be literally non-ASCII in the file. The installer picks the
+first Python it finds (Hermes's own under `%LOCALAPPDATA%\hermes\tools`, then `py -3`, then
+`python` on PATH), regardless of whether its path is ASCII. A non-ASCII path is then embedded as an
+`%ENVVAR%` prefix (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `%ProgramFiles%`, or a persisted
+`HERMES_ROOT`) plus an ASCII remainder — cmd.exe expands the variable from its own environment at
+run time, so a non-ASCII user name and a dev-team checkout under the user's profile now install
+normally, with a guard in the wrapper that fails clearly if the expanded path doesn't exist (e.g.
+run under a different user). Only when a non-ASCII path sits under none of those folders does the
+installer still exit 2 before touching any profile, naming the offending path: install a Python 3
+(and/or move the checkout) onto an ASCII path (such as `C:\Python312`) or under one of those
+folders, then re-run.
 
 Both installers check every `MNEMOSYNE_HOME`/`MNEMOSYNE_DATA_DIR` value they pin with
 `dev-team/scripts/env_pin_check.py`, run on the resolved value, and refuse (exit 2) any value

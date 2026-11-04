@@ -7,6 +7,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resolves the v1.3.1 known issues "no ASCII-path Python, no wrappers" and "a non-ASCII
+  `py -3` path gives a vague error".** A non-ASCII wrapper Python, `forge.py` or
+  `deciders.py` path is now embedded in `forge.cmd` / `deciders.cmd` as an `%ENVVAR%`
+  prefix (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`, `%ProgramFiles%`, or a *persisted*
+  `HERMES_ROOT`) plus an ASCII remainder, instead of refusing outright — so a Windows user
+  with a non-ASCII user name whose only Python is Hermes' own under `%LOCALAPPDATA%`, and
+  whose checkout is under their profile, can now install. `cmd.exe` expands the variable
+  from its own UTF-16 environment at run time, so the `.cmd` file on disk stays pure ASCII.
+  Each rewritten path gets an `if not exist` guard (via `goto`, not a parenthesized block,
+  since an expanded value can contain `)`) that fails with a clear message instead of
+  silently running a stale or wrong interpreter. A non-ASCII path under none of those
+  folders is still refused with exit 2, before anything is written, naming the offending
+  path and the folders it was *not* found under. `py -3` discovery now asks Python to print
+  `sys.executable` as an ASCII-only hex encoding of its UTF-16LE code units, decoded in
+  PowerShell, so a non-ASCII launcher path is no longer mangled by the console code page
+  under Windows PowerShell 5.1 and no longer reported as "No Python 3 found" when the
+  launcher did in fact report one (the message now says so and names the reported path).
+  The interpreter Hermes itself installed under `%LOCALAPPDATA%\hermes\tools` is preferred
+  purely by discovery order again — representability no longer steers which interpreter is
+  chosen, only whether its path can be embedded. An all-ASCII install's wrapper stays
+  byte-identical to 1.3.1's.
+
 ## [1.3.1] - 2026-11-04
 
 ### Added

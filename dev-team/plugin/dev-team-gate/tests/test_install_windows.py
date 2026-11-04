@@ -2002,5 +2002,302 @@ class WorkflowTests(unittest.TestCase):
                       f"{job_name}: Install Mnemosyne memory step has no GITHUB_TOKEN env")
 
 
+class WindowsCmdWrapperNonAsciiTests(unittest.TestCase):
+    """D1-D9 (pr10-review.md section 4): forge.cmd/deciders.cmd stay pure
+    ASCII under a non-ASCII checkout/Python path via %ENVVAR% prefix
+    rewriting, and py -3 discovery survives a non-ASCII sys.executable
+    under PowerShell 5.1."""
+
+    def setUp(self):
+        self.text = PS1.read_text(encoding="utf-8")
+
+    _WRAPPER_FUNCS = (
+        "Format-EnvPinForDisplay", "Get-CmdPrefixCandidates",
+        "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii",
+        "Get-CmdGuardBlock",
+    )
+
+    def _wrapper_prelude(self):
+        return "".join(_function(self.text, f) + "\n" for f in self._WRAPPER_FUNCS)
+
+    def _assert_cmd_wrapper_paths_ascii_fn(self):
+        return _function(self.text, "Assert-CmdWrapperPathsAscii") + "\n"
+
+    def _write_build_harness(self, tmp, hermes_root, wrapper_python, forge_py, deciders_py,
+                              extra_env_lines=""):
+        """Runs real path resolution (Assert-CmdWrapperPathsAscii) through
+        the real forge.cmd/deciders.cmd content-building snippet (the exact
+        source slice from the installer, not a reimplementation), writing
+        both files under tmp. Returns the completed subprocess."""
+        start = self.text.index("$ForgeEmbedPairs = @(")
+        end = self.text.index('Write-Host "deciders installed: $decidersCmdPath"') + \
+            len('Write-Host "deciders installed: $decidersCmdPath"')
+        build_snippet = self.text[start:end]
+        forge_path = Path(tmp) / "forge.cmd"
+        deciders_path = Path(tmp) / "deciders.cmd"
+
+        def q(s):
+            return s.replace("'", "''")
+
+        harness = Path(tmp) / "wrapper_harness.ps1"
+        harness.write_text(
+            extra_env_lines
+            + f"$HermesRoot = '{q(str(hermes_root))}'\n"
+            + f"$WrapperPython = '{q(wrapper_python)}'\n"
+            + f"$ForgePy = '{q(forge_py)}'\n"
+            + f"$DecidersPy = '{q(deciders_py)}'\n"
+            + f"$ForgeMarker = 'REM dev-team forge wrapper (install-dev-team-windows.ps1)'\n"
+            + f"$DecidersMarker = 'REM dev-team deciders wrapper (install-dev-team-windows.ps1)'\n"
+            + f"$forgeCmdPath = '{q(str(forge_path))}'\n"
+            + f"$decidersCmdPath = '{q(str(deciders_path))}'\n"
+            + self._wrapper_prelude()
+            + self._assert_cmd_wrapper_paths_ascii_fn()
+            + "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
+            + "$WrapperPythonCmd = $CmdPaths.WrapperPython\n"
+            + "$ForgePyCmd = $CmdPaths.ForgePy\n"
+            + "$DecidersPyCmd = $CmdPaths.DecidersPy\n"
+            + build_snippet + "\n"
+            + "Write-Output 'WRAPPERS_WRITTEN'\n")
+        proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                              capture_output=True, text=True, timeout=60)
+        return proc, forge_path, deciders_path
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_non_ascii_python_under_localappdata_is_rewritten_and_guarded(self):
+        # Acceptance #1: Python at
+        # C:\Users\Dragos\AppData\Local\hermes\tools\python-3.12\python.exe
+        # with LOCALAPPDATA set to that AppData\Local.
+        local = "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local"
+        wrapper_python = local + "\\hermes\\tools\\python-3.12\\python.exe"
+        forge_py = "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local\\dev-team\\forge\\forge.py"
+        deciders_py = "C:\\Users\\Dr\u0103go\u0219\\AppData\\Local\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n"
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            for p in (forge_path, deciders_path):
+                raw = p.read_bytes()
+                raw.decode("ascii")  # raises on any non-ASCII byte
+                text = raw.decode("ascii")
+                self.assertIn("%LOCALAPPDATA%\\hermes\\tools\\python-3.12\\python.exe", text)
+                self.assertIn("if not exist", text, f"{p} missing the D4 guard")
+                self.assertIn("exit /b 1", text, f"{p} missing the guard's error exit")
+            forge_text = forge_path.read_bytes().decode("ascii")
+            self.assertIn("%LOCALAPPDATA%\\dev-team\\forge\\forge.py", forge_text)
+            deciders_text = deciders_path.read_bytes().decode("ascii")
+            self.assertIn("%LOCALAPPDATA%\\dev-team\\deciders\\deciders.py", deciders_text)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_non_ascii_checkout_under_userprofile_is_rewritten(self):
+        # Acceptance #1 (second half): checkout under %USERPROFILE%.
+        userprofile = "C:\\Users\\Dr\u0103go\u0219"
+        wrapper_python = "C:\\Python312\\python.exe"
+        forge_py = userprofile + "\\dev-team\\forge\\forge.py"
+        deciders_py = userprofile + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = f"$env:USERPROFILE = '{userprofile}'\n$env:LOCALAPPDATA = ''\n$env:APPDATA = ''\n"
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            forge_text = forge_path.read_bytes().decode("ascii")
+            self.assertIn("%USERPROFILE%\\dev-team\\forge\\forge.py", forge_text)
+            self.assertIn("if not exist", forge_text)
+            # The wrapper python here is plain ASCII, so it must be embedded
+            # literally with no guard line for it.
+            self.assertIn('"C:\\Python312\\python.exe"', forge_text)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_longest_prefix_wins_and_boundary_is_respected(self):
+        # Acceptance #2: LOCALAPPDATA (longer, nested under USERPROFILE)
+        # must win over USERPROFILE; case-insensitive; and a lookalike
+        # directory name must not match at a false boundary.
+        userprofile = "C:\\Users\\Dr\u0103go\u0219"
+        local = userprofile + "\\AppData\\Local"
+        wrapper_python = local.upper() + "\\hermes\\tools\\python-3.12\\python.exe"  # case-insensitive match
+        forge_py = userprofile + "\\dev-team\\forge\\forge.py"
+        deciders_py = userprofile + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = f"$env:LOCALAPPDATA = '{local}'\n$env:USERPROFILE = '{userprofile}'\n$env:APPDATA = ''\n"
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            forge_text = forge_path.read_bytes().decode("ascii")
+            self.assertIn("%LOCALAPPDATA%\\hermes\\tools\\python-3.12\\python.exe", forge_text,
+                          "longest prefix (LOCALAPPDATA) did not win over USERPROFILE")
+            self.assertNotIn("%USERPROFILE%\\AppData\\Local", forge_text)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_boundary_check_rejects_a_lookalike_sibling_directory(self):
+        # "C:\Users\Dragos2\..." must NOT match USERPROFILE "C:\Users\Dragos".
+        userprofile = "C:\\Users\\Dr\u0103go\u0219"
+        sibling = "C:\\Users\\Dr\u0103go\u02192"
+        wrapper_python = "C:\\Python312\\python.exe"
+        forge_py = sibling + "\\dev-team\\forge\\forge.py"
+        deciders_py = sibling + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = f"$env:USERPROFILE = '{userprofile}'\n$env:LOCALAPPDATA = ''\n$env:APPDATA = ''\n"
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("not printable ASCII", proc.stderr)
+        self.assertFalse(forge_path.exists(), "forge.cmd must not be written on refusal")
+        self.assertFalse(deciders_path.exists(), "deciders.cmd must not be written on refusal")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_non_ascii_path_with_no_usable_prefix_refuses_with_exit_2(self):
+        # Acceptance #3: a non-ASCII path under none of the known folders.
+        wrapper_python = "D:\\Pyth\u00f6n\\python.exe"
+        forge_py = "C:\\dev-team\\forge\\forge.py"
+        deciders_py = "C:\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("not printable ASCII", proc.stderr)
+        self.assertIn("is not under any of the folders", proc.stderr)
+        self.assertFalse(forge_path.exists())
+        self.assertFalse(deciders_path.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_ascii_path_wrapper_is_byte_identical_to_v1_3_1(self):
+        # Acceptance #4: pin the exact v1.3.1 bytes for an all-ASCII install.
+        wrapper_python = "C:\\Python312\\python.exe"
+        forge_py = "C:\\dev-team\\forge\\forge.py"
+        deciders_py = "C:\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, Path(tmp) / "hermes", wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            expected_forge = (
+                b"@echo off\r\n"
+                b"REM dev-team forge wrapper (install-dev-team-windows.ps1)\r\n"
+                b'"C:\\Python312\\python.exe" "C:\\dev-team\\forge\\forge.py" %*\r\n'
+                b"exit /b %ERRORLEVEL%\r\n")
+            expected_deciders = (
+                b"@echo off\r\n"
+                b"REM dev-team deciders wrapper (install-dev-team-windows.ps1)\r\n"
+                b'"C:\\Python312\\python.exe" "C:\\dev-team\\deciders\\deciders.py" %*\r\n'
+                b"exit /b %ERRORLEVEL%\r\n")
+            self.assertEqual(forge_path.read_bytes(), expected_forge)
+            self.assertEqual(deciders_path.read_bytes(), expected_deciders)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_process_only_hermes_root_is_not_used_as_a_prefix(self):
+        # Acceptance #6: HERMES_ROOT set only in this process's environment
+        # (not persisted in the registry) must never be used as a prefix,
+        # because a later cmd.exe would not see it either.
+        hermes_root = "C:\\Users\\Dr\u0103go\u0219\\hermes"
+        wrapper_python = "C:\\Python312\\python.exe"
+        forge_py = hermes_root + "\\dev-team\\forge\\forge.py"
+        deciders_py = hermes_root + "\\dev-team\\deciders\\deciders.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = (
+                f"$env:HERMES_ROOT = '{hermes_root}'\n"
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n"
+                "$env:APPDATA = ''\n$env:ProgramFiles = ''\n")
+            proc, forge_path, deciders_path = self._write_build_harness(
+                tmp, hermes_root, wrapper_python, forge_py, deciders_py,
+                extra_env_lines=extra)
+        # Refused (exit 2): no persisted (registry) HERMES_ROOT matches, so
+        # HERMES_ROOT must not have been used as a usable prefix despite
+        # being set (and matching $HermesRoot) in this process's own
+        # environment.
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn("%HERMES_ROOT%", proc.stdout)
+        self.assertFalse(forge_path.exists())
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_py_launcher_non_ascii_executable_is_decoded_correctly(self):
+        # Acceptance #5: a stub `py` printing the UTF-16LE/surrogatepass hex
+        # form of a non-ASCII sys.executable must be decoded and resolved.
+        func_body = _function(self.text, "Resolve-WrapperPython")
+        with tempfile.TemporaryDirectory() as tmp:
+            real_python = Path(tmp) / "Dr\u0103go\u0219" / "python.exe"
+            real_python.parent.mkdir(parents=True)
+            real_python.write_text("stub")
+            hex_form = str(real_python).encode("utf-16-le").hex()
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$env:LOCALAPPDATA = '{tmp}\\no-tools-here'\n"
+                "function py { Write-Output '" + hex_form + "'; $global:LASTEXITCODE = 0 }\n"
+                + func_body + "\n"
+                "$r = Resolve-WrapperPython\n"
+                "Write-Output \"RESOLVED=$r\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"RESOLVED={real_python}", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_py_launcher_malformed_output_falls_through_to_path(self):
+        func_body = _function(self.text, "Resolve-WrapperPython")
+        with tempfile.TemporaryDirectory() as tmp:
+            fallback_python = Path(tmp) / "fallback-python.exe"
+            fallback_python.write_text("stub")
+            fake_bin = Path(tmp) / "bin"
+            fake_bin.mkdir()
+            fake_python_path = fake_bin / "python"
+            fake_python_path.write_text("#!/bin/sh\n")
+            fake_python_path.chmod(0o755)
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$env:LOCALAPPDATA = '{tmp}\\no-tools-here'\n"
+                "function py { Write-Output 'not-valid-hex!!'; $global:LASTEXITCODE = 0 }\n"
+                "function global:Get-Command {\n"
+                "    param([string] $Name, [switch] $All, $ErrorAction)\n"
+                "    if ($Name -eq 'py') { return [pscustomobject]@{ Name = 'py' } }\n"
+                f"    if ($Name -eq 'python') {{ return @([pscustomobject]@{{ Source = '{fallback_python}' }}) }}\n"
+                "    return $null\n"
+                "}\n"
+                + func_body + "\n"
+                "$r = Resolve-WrapperPython\n"
+                "Write-Output \"RESOLVED=$r\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"RESOLVED={fallback_python}", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_never_says_no_python_3_found_when_launcher_reported_a_path(self):
+        # Acceptance #5 / D8: the top-level call site must report the
+        # launcher's path, not claim no Python 3 exists, when py -3
+        # reported one that doesn't resolve on disk.
+        start = self.text.index("$script:WrapperPythonLauncherPath = $null")
+        end = self.text.index("$CmdPaths = Assert-CmdWrapperPathsAscii")
+        snippet = self.text[start:end]
+        func_body = _function(self.text, "Resolve-WrapperPython")
+        format_fn = _function(self.text, "Format-EnvPinForDisplay")
+        missing = "C:\\Users\\Dr\u0103go\u0219\\gone\\python.exe"
+        hex_form = missing.encode("utf-16-le").hex()
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$env:LOCALAPPDATA = '{tmp}\\no-tools-here'\n"
+                "function py { Write-Output '" + hex_form + "'; $global:LASTEXITCODE = 0 }\n"
+                "function global:Get-Command {\n"
+                "    param([string] $Name, [switch] $All, $ErrorAction)\n"
+                "    if ($Name -eq 'py') { return [pscustomobject]@{ Name = 'py' } }\n"
+                "    return $null\n"
+                "}\n"
+                + format_fn + "\n" + func_body + "\n" + snippet + "\n"
+                + "Write-Output 'UNREACHABLE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("No Python 3 found", proc.stderr)
+        self.assertIn("py launcher reported", proc.stderr)
+        self.assertIn("does not exist", proc.stderr)
+        self.assertNotIn("UNREACHABLE", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

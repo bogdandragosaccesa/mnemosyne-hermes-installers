@@ -92,14 +92,70 @@ class WindowsNtEvidence(unittest.TestCase):
             py = self._non_ascii_venv_python(tmp)
             body = (
                 "$ErrorActionPreference = 'Stop'\n"
+                "$HermesRoot = $null\n"
                 + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
+                + "".join(_function(TEXT, f) + "\n" for f in (
+                    "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
+                    "Assert-WrapperTextAscii", "Get-CmdGuardBlock"))
                 + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
                 "$WrapperPython = $env:A3_PY\n$ForgePy = 'C:\\x\\forge.py'\n$DecidersPy = 'C:\\x\\deciders.py'\n"
-                "Assert-CmdWrapperPathsAscii\nWrite-Output 'WRAPPERS_OK'\n")
-            proc = self._ps51(tmp, body, {"A3_PY": str(py)})
+                "$CmdPaths = Assert-CmdWrapperPathsAscii\nWrite-Output 'WRAPPERS_OK'\n")
+            # Clear every %ENVVAR% prefix D2 would otherwise try: the venv
+            # lives under TEMP, which on real Windows usually resolves
+            # under %LOCALAPPDATA%, and this test's whole point is "no
+            # usable prefix -> still refused", not "got rewritten".
+            proc = self._ps51(tmp, body, {"A3_PY": str(py), "LOCALAPPDATA": "",
+                                          "USERPROFILE": "", "APPDATA": "", "ProgramFiles": ""})
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertNotIn("WRAPPERS_OK", proc.stdout)
         self.assertIn("not printable ASCII", proc.stderr)
+
+    def test_wrapper_guard_rewrites_a_non_ascii_python_under_localappdata_and_it_runs(self):
+        # D1-D9 end-to-end on the real target: a non-ASCII venv Python
+        # placed INSIDE a controlled %LOCALAPPDATA% is rewritten to
+        # "%LOCALAPPDATA%\\..." in forge.cmd, and cmd.exe -- which only
+        # this Windows job can exercise -- actually expands that back to
+        # the real, non-ASCII path and runs it.
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / NON_ASCII_DIR / "AppData" / "Local"
+            local.mkdir(parents=True)
+            venv_dir = local / "venv"
+            venv.create(venv_dir, with_pip=False)
+            py = venv_dir / "Scripts" / "python.exe"
+            self.assertTrue(py.exists(), py)
+            script = local / "hello.py"
+            script.write_text("print('WRAPPER_RAN')\n")
+            body = (
+                "$ErrorActionPreference = 'Stop'\n"
+                f"$HermesRoot = $null\n"
+                + _function(TEXT, "Format-EnvPinForDisplay") + "\n"
+                + "".join(_function(TEXT, f) + "\n" for f in (
+                    "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
+                    "Assert-WrapperTextAscii", "Get-CmdGuardBlock"))
+                + _function(TEXT, "Assert-CmdWrapperPathsAscii") + "\n"
+                "$WrapperPython = $env:A3_PY\n"
+                f"$ForgePy = $env:A3_SCRIPT\n$DecidersPy = $env:A3_SCRIPT\n"
+                "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
+                "$WrapperPythonCmd = $CmdPaths.WrapperPython\n$ForgePyCmd = $CmdPaths.ForgePy\n"
+                + _function(TEXT, "Get-CmdGuardBlock") + "\n"
+                "$ForgeGuard = Get-CmdGuardBlock -Prefix 'dt_forge' -Pairs @("
+                "[ordered]@{ Label = 'the wrapper Python'; Embed = $WrapperPythonCmd }, "
+                "[ordered]@{ Label = 'forge.py'; Embed = $ForgePyCmd })\n"
+                "$forgeCmdContent = \"@echo off`r`nREM t`r`n$($ForgeGuard.Guards)`\"$($WrapperPythonCmd.Embed)`\" `\"$($ForgePyCmd.Embed)`\" %*`r`nexit /b %ERRORLEVEL%`r`n$($ForgeGuard.Tail)\"\n"
+                f"Set-Content -LiteralPath {_ps_q(Path(tmp) / 'forge.cmd')} -Value $forgeCmdContent -NoNewline -Encoding ascii\n"
+                "Write-Output \"EMBED=$($WrapperPythonCmd.Embed)\"\n")
+            proc = self._ps51(tmp, body, {"A3_PY": str(py), "A3_SCRIPT": str(script),
+                                          "LOCALAPPDATA": str(local), "USERPROFILE": "",
+                                          "APPDATA": "", "ProgramFiles": ""})
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("%LOCALAPPDATA%\\venv\\Scripts\\python.exe", proc.stdout)
+            cmd_path = Path(tmp) / "forge.cmd"
+            self.assertTrue(cmd_path.read_bytes().isascii(), "forge.cmd must stay pure ASCII")
+            run = subprocess.run(["cmd.exe", "/d", "/c", str(cmd_path)], capture_output=True,
+                                 text=True, errors="replace", timeout=120,
+                                 env={**os.environ, "LOCALAPPDATA": str(local)})
+        self.assertIn("WRAPPER_RAN", run.stdout, run.stdout + run.stderr)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
     def test_premise_the_old_ascii_wrapper_cannot_run_a_non_ascii_python(self):
         with tempfile.TemporaryDirectory() as tmp:
