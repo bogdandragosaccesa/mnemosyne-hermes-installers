@@ -58,6 +58,8 @@ flowchart TB
         DLEDGER["deciders-ledger.jsonl<br/>spend of every deciders call"]
     end
 
+    FORGECODE["forge code in dev-team/forge, loaded by path<br/>(not the ~/.local/bin/forge wrapper)"]
+
     BUDGET["kanban-budget.py<br/>installed in dev-pm/bin<br/>budget ledger and reserve"]
 
     subgraph MEM["Memory"]
@@ -68,7 +70,7 @@ flowchart TB
     DISP -- "starts workers for cards" --> PROFILES
     PROFILES -- "every tool call passes" --> GATE
     GATE -- "reads cards" --> BOARD
-    GATE -- "re-reads PR and CI with forge code" --> FORGE
+    GATE -- "re-reads PR and CI" --> FORGECODE
     GATE -- "reads default branch" --> PROJ
     PROFILES -- "create and complete cards" --> BOARD
     OPS -- "clones and runs forge detect" --> REPOS
@@ -95,7 +97,7 @@ What each piece is, with the file that sets it up:
 | Kanban board per repo | pm creates one board per repository. A board other than `default` keeps its database at `$HERMES_ROOT/kanban/boards/<slug>/kanban.db`. | `dev-team/skills/running-the-pipeline/SKILL.md:23-49`; `dev-team/scripts/kanban-budget.py:100-104` |
 | Team home | `$HERMES_ROOT/dev-team`. Every profile's `dev-team/` links to it, so all profiles share the same clones, project records, tier table and deciders ledger. | `dev-team/install-dev-team-unix.sh:803`, `:1394-1402`; `dev-team/deciders/deciders_core.py:146-148` |
 | Team clones | `$TEAM_HOME/repos/<repo-slug>/`, cloned by devops during onboarding. The team never works in your own checkout. | `dev-team/skills/dev-team-stage-pr-ci/SKILL.md:28-36` |
-| Team-only memory bank | `$HERMES_ROOT/dev-team-mnemosyne` (`--team-memory` moves it). Each profile's `mnemosyne/` links to it, and each profile's `.env` pins `MNEMOSYNE_DATA_DIR=<bank>/data` and `MNEMOSYNE_HOME=<bank>`. | `dev-team/install-dev-team-unix.sh:554-560`, `:776-794`, `:1309` |
+| Team-only memory bank | `$HERMES_ROOT/dev-team-mnemosyne` (`--team-memory` sets a different location at install time). Each profile's `mnemosyne/` links to it, and each profile's `.env` pins `MNEMOSYNE_DATA_DIR=<bank>/data` and `MNEMOSYNE_HOME=<bank>`. | `dev-team/install-dev-team-unix.sh:554-560`, `:776-794`, `:1309` |
 | Budget ledger | `kanban-budget.py`, copied to `dev-pm/bin/`. It adds up spend for a board and compares it with the budget in `budget.json`. | `dev-team/install-dev-team-unix.sh:1468-1485`; `dev-team/scripts/kanban-budget.py:318-319`, `:332-410` |
 
 **One caveat about the `.env` pins.** They only work when a profile is started directly, for
@@ -147,7 +149,9 @@ flowchart TD
     PIPE -- "every kanban_complete" --> GATE
     PRCI -- "green, confirmed by the gate" --> READY --> MERGE
     GATE -. "refused: worker fixes and retries, or blocks" .-> BLOCK
-    IMPL -. "4th round refused: review: rounds-exhausted" .-> BLOCK
+    VAL -. "4th implement round refused: review: rounds-exhausted" .-> BLOCK
+    REVW -. "4th implement round refused" .-> BLOCK
+    PRCI -. "4th implement round refused" .-> BLOCK
     PRCI -. "CI state unresolvable or forge unreachable" .-> BLOCK
     BLOCK --> DECIDE
 
@@ -169,7 +173,7 @@ Step by step, with sources:
 3. **Six stages**: intake, plan, implement, validate, review, pr-ci. Each stage is its own card,
    created as a child of the previous one. The card's stage is read from its
    `dev-team-stage-<stage>` skill. `dev-team/README.md` ("Stages");
-   `dev-team/plugin/dev-team-gate/stages.py:206-219`.
+   `dev-team/plugin/dev-team-gate/stages.py:26` (stage from skills), `:206-219` (next-stage child).
 4. **Rework** happens when validate fails, review asks for changes, or CI is red because of the
    change. Each of these creates a new `implement` card on the same branch. The limit is 3
    rounds, and the gate refuses a 4th. `dev-team/plugin/dev-team-gate/guard.py:39`, `:157-167`;
@@ -234,6 +238,6 @@ your Hermes home, `~/.hermes` by default.
 | One card | `hermes kanban --board <slug> show <id>` (comments, events, the block reason word for word). Runs: `hermes kanban --board <slug> runs <id>`. |
 | What needs a human | `hermes kanban --board <slug> ls --status blocked`. Every reason starts with a label from [Attention labels](../dev-team/README.md#attention-labels). |
 | Budget ledger | `python3 dev-team/scripts/kanban-budget.py --board <slug>` (pm's copy: `$HERMES_ROOT/profiles/dev-pm/bin/kanban-budget.py`). Add `--json` for machine-readable output. The budget is in `$HERMES_ROOT/kanban/boards/<slug>/budget.json`. Deciders spend is in `$HERMES_ROOT/dev-team/deciders-ledger.jsonl` (`dev-team/scripts/kanban-budget.py:240-248`, `:318-319`). |
-| Worker logs | `hermes kanban --board <slug> log <id>` (`--tail N` for the last N bytes). To follow live: `hermes kanban --board <slug> tail <id>`. These are Hermes CLI commands, see `hermes kanban --help`. |
+| Worker logs | `hermes kanban --board <slug> log <id>` (`--tail N` for the last N bytes). To follow the card's event stream (not the worker log): `hermes kanban --board <slug> tail <id>`. These are Hermes CLI commands, see `hermes kanban --help`. |
 | Project record | `$HERMES_ROOT/dev-team/projects/<slug>.json`, written by `forge detect`. Never edit it by hand (`dev-team/skills/dev-team-stage-pr-ci/SKILL.md:28-45`). |
 | The team's clone | `$HERMES_ROOT/dev-team/repos/<slug>/`. |
