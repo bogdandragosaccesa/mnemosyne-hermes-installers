@@ -7,6 +7,74 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`forge` honours `DEV_TEAM_GH_TOKEN`.** The GitHub adapter's single subprocess choke point,
+  `GithubAdapter._gh`, now passes an explicit environment to `gh`: when `DEV_TEAM_GH_TOKEN` is
+  set and non-empty and `GH_TOKEN` is unset or empty, `GH_TOKEN` is set from it **for that
+  subprocess only**. `os.environ` is never mutated, the value never reaches argv (which the
+  `dev-team-gate` guard lexes) and is never printed or logged; an existing `GH_TOKEN` always
+  wins, so an operator's own configuration is untouched. Without a token configured, behaviour
+  is exactly as before. The module docstring no longer claims the adapter reads no token
+  itself. (#15)
+- **The `pr-ci` stage skill documents how the forge credential reaches a worker.**
+  `export GH_TOKEN="$DEV_TEAM_GH_TOKEN"` followed by `gh auth setup-git`, and nothing else. This
+  mechanism was chosen over a `GIT_ASKPASS` helper for three verified reasons: `gh auth
+  setup-git` writes only `credential.*` git-config keys, which is not among the key prefixes the
+  guard refuses as push-redirecting (`alias.`, `remote.`, `push.`, `branch.`, `include.`,
+  `includeif.`, `url.`), whereas `GIT_ASKPASS` needs a helper **script file on disk**; `gh` reads
+  `GH_TOKEN` from the environment, so the value never appears in a command line; and `GH_TOKEN`
+  is not a `HERMES_*` variable, so exporting it touches no Hermes fence. The skill states the
+  token is passed **by reference** only — never echoed, never interpolated into a URL, never
+  written to a file — and that a missing or empty `DEV_TEAM_GH_TOKEN` is a
+  `kanban_block(kind="needs_input")` labelled `setup: no-forge-token` with **no** fallback to
+  `gh auth login`, a stored credential, a keyring, SSH, or `GITHUB_TOKEN`. (#15)
+
+### Changed
+
+- **`git push` from a card with no dev-team stage skill is now refused.** Such a card has no
+  intake ancestor, so the guard cannot resolve a project for it and `_CardState.protected()`
+  fell back to `{main, master}` — which let a push through to a project whose recorded default
+  branch is something else (`develop`, say). Rather than give `protected()` a second
+  project-resolution path fed by an input the worker controls (a card's `workspace_path` is
+  editable via `hermes kanban edit`, which is permitted against a non-stage card), the push
+  itself is refused: the branch it would create is one no `validate`, `review` or `pr-ci` card
+  owns. `_ALWAYS_PROTECTED`, `protected()`, `guarded()`, `project_slug()`,
+  `_record_default_branch()` and `stage_from_skills()` are all unchanged. The new check runs
+  **after** the existing protected-destination check, so a non-stage card pushing `main` or
+  `master` keeps its `merge: human-only` message byte for byte. Local commits, branches and all
+  read-only git are unaffected, and **no card at all** (`HERMES_KANBAN_TASK` unset — an
+  interactive operator shell) is deliberately unchanged, since there is no board-side identity
+  to resolve a project from and refusing it would break every interactive session. (#15)
+- **`kanban_create` is now checked: the new card's `assignee` must carry the installed team
+  prefix.** A bare role name (`assignee="qa"`) makes the dispatcher spawn the unprefixed `qa`
+  profile — another team's worker, or an unguarded root profile — so the created card would run
+  with no dev-team gate at all. The prefix is read from `$HERMES_HOME/dev-team-prefix`, what the
+  installer writes, and the comparison is **exact and case-sensitive**: under prefix `dev-`, an
+  assignee `Dev-qa` names a profile directory that is not the installed one and is refused.
+  (This differs on purpose from branch handling, which casefolds, and from the protected-path
+  check, which is case-insensitive.) It **fails closed**: a missing, unreadable or empty prefix
+  file refuses the create rather than becoming a bypass. The check consults no board and is not
+  gated on the creating card's stage, so a card with no skills or with an unknown
+  `dev-team-stage-*` skill cannot bypass it; the plugin still declares only the `pre_tool_call`
+  hook. (#15)
+- **`running-the-pipeline` states `--default-workdir` as a requirement**, not just an example,
+  and says why `pr-ci` depends on it: cards inherit their workspace from the board's
+  `default_workdir`, so a board created without it leaves `pr-ci` with no clone to push from —
+  it blocks and the PR is never opened, after plan, implement, validate and review have all been
+  paid for. `pr-ci` will not fall back to the operator's own checkout, and no later step can set
+  the value, so such a board has to be recreated. (#15)
+
+### Fixed
+
+- **`redact()` missed a bare GitHub token.** `_SECRET_SUBSTITUTIONS` covered `token=<value>` and
+  `Bearer <value>`, so a token appearing on its own in a `gh` error message — "failed to
+  authenticate with ghp_…", which becomes `forge`'s JSON error through `_emit_error` → `redact`
+  — was printed in full. Both GitHub token shapes are now redacted: `gh[pours]_<body>` (classic,
+  OAuth, user-to-server, server-to-server, refresh) and `github_pat_<body>` (fine-grained),
+  case-insensitively and by prefix rather than exact length, so a future length change cannot
+  silently un-redact one. (#15)
+
 ## [1.3.2] - 2026-11-04
 
 ### Changed
