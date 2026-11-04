@@ -2184,6 +2184,160 @@ class WindowsCmdWrapperNonAsciiTests(unittest.TestCase):
         self.assertFalse(deciders_path.exists(), "deciders.cmd must not be written on refusal")
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_8_3_short_path_is_canonicalized_before_the_ascii_fast_path(self):
+        # F1 (round 3 review): an 8.3 SHORT name is printable ASCII by
+        # construction even when the LONG form it denotes is not -- the
+        # OLD code tested $Path itself for ASCII-ness and took the
+        # "already ASCII, embed literally" fast path before
+        # Get-LongPathName ever ran, so a short-named $Path (e.g. a
+        # non-ASCII checkout surfaced through 8.3 names, as can happen
+        # under some launchers/CI runners) silently embedded the SHORT
+        # name verbatim in forge.cmd instead of rewriting it to
+        # %LOCALAPPDATA%. Exact repro from the review: a stub
+        # Get-LongPathName mapping the short form below to its non-ASCII
+        # long form, with LOCALAPPDATA set to that same long non-ASCII
+        # form.
+        short_path = "C:\\DEV-TE~1\\DRGO~1\\AppData\\Local\\Python\\python.exe"
+        long_local = "C:\\dev-team\\Dr\u0103go\u0219\\AppData\\Local"
+        long_path = long_local + "\\Python\\python.exe"
+
+        def q(s):
+            return s.replace("'", "''")
+
+        stub = (
+            "function Get-LongPathName {\n"
+            "    param([string] $Path)\n"
+            f"    if ($Path -eq '{q(short_path)}') {{ return '{q(long_path)}' }}\n"
+            f"    if ($Path -eq '{q(long_local)}') {{ return '{q(long_local)}' }}\n"
+            "    return $Path\n"
+            "}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$env:LOCALAPPDATA = '{q(long_local)}'\n"
+                "$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+                + self._wrapper_prelude() + stub +
+                "$prefixes = Get-CmdPrefixCandidates\n"
+                f"$r = Resolve-CmdEmbeddablePath -Label 'python' -Path '{q(short_path)}' -Prefixes $prefixes\n"
+                "Write-Output \"EMBED=$($r.Embed)\"\n"
+                "Write-Output \"REWRITTEN=$($r.Rewritten)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("EMBED=%LOCALAPPDATA%\\Python\\python.exe", proc.stdout, proc.stdout)
+        self.assertIn("REWRITTEN=True", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_ascii_short_path_with_no_tilde_stays_on_the_fast_path(self):
+        # F1 regression guard: a path with NO '~' at all must never pay
+        # for a GetLongPathName call on the ASCII fast path, and must
+        # stay byte-identical (Rewritten = $false, Embed = the literal
+        # input) -- the '~'-gated canonicalization must not widen to
+        # ordinary ASCII paths.
+        path = "C:\\Python312\\python.exe"
+        # A Get-LongPathName stub that FAILS the test if ever called for
+        # this path proves the fast path never reaches it.
+        stub = (
+            "function Get-LongPathName {\n"
+            "    param([string] $Path)\n"
+            "    Write-Output 'LONGPATHNAME_CALLED'\n"
+            "    return $Path\n"
+            "}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+                + self._wrapper_prelude() + stub +
+                "$prefixes = Get-CmdPrefixCandidates\n"
+                f"$r = Resolve-CmdEmbeddablePath -Label 'python' -Path '{path}' -Prefixes $prefixes\n"
+                "Write-Output \"EMBED=$($r.Embed)\"\n"
+                "Write-Output \"REWRITTEN=$($r.Rewritten)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"EMBED={path}", proc.stdout, proc.stdout)
+        self.assertIn("REWRITTEN=False", proc.stdout, proc.stdout)
+        self.assertNotIn("LONGPATHNAME_CALLED", proc.stdout,
+                          "Get-LongPathName must not be called for a path with no '~'")
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_F2_prefix_side_short_name_value_is_canonicalized_to_match(self):
+        # F2: Get-LongPathName canonicalization on the PREFIX side (round
+        # 2's existing behaviour, line "$val = (Get-LongPathName
+        # ([string]$p.Value))...") was never directly exercised by a
+        # test. Here $Path is already a long, non-ASCII form (no '~', so
+        # the F1 fast-path gate never fires) and LOCALAPPDATA itself
+        # holds an 8.3 SHORT value that must be canonicalized to the long
+        # form before it can match $Path's prefix.
+        long_local = "C:\\dev-team\\Dr\u0103go\u0219\\AppData\\Local"
+        short_local = "C:\\DEV-TE~1\\DRGO~1\\AppData\\Local"
+        path = long_local + "\\Python\\python.exe"
+
+        def q(s):
+            return s.replace("'", "''")
+
+        stub = (
+            "function Get-LongPathName {\n"
+            "    param([string] $Path)\n"
+            f"    if ($Path -eq '{q(short_local)}') {{ return '{q(long_local)}' }}\n"
+            f"    if ($Path -eq '{q(path)}') {{ return '{q(path)}' }}\n"
+            "    return $Path\n"
+            "}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$env:LOCALAPPDATA = '{q(short_local)}'\n"
+                "$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+                + self._wrapper_prelude() + stub +
+                "$prefixes = Get-CmdPrefixCandidates\n"
+                f"$r = Resolve-CmdEmbeddablePath -Label 'python' -Path '{q(path)}' -Prefixes $prefixes\n"
+                "Write-Output \"EMBED=$($r.Embed)\"\n"
+                "Write-Output \"REWRITTEN=$($r.Rewritten)\"\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("EMBED=%LOCALAPPDATA%\\Python\\python.exe", proc.stdout, proc.stdout)
+        self.assertIn("REWRITTEN=True", proc.stdout, proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
+    def test_F5_assert_cmd_wrapper_paths_ascii_refuses_an_empty_embed(self):
+        # F5: Assert-CmdWrapperPathsAscii's own defence-in-depth check
+        # (round 2 review) -- if Resolve-CmdEmbeddablePath ever returned
+        # an empty Embed (normally impossible: it either embeds the
+        # literal path, embeds a non-empty "%NAME%\<remainder>", or exits
+        # 2 itself), Assert-CmdWrapperPathsAscii must refuse (exit 2)
+        # rather than let Set-Content write a wrapper with no interpreter
+        # path at all. Shadow Resolve-CmdEmbeddablePath with a stub that
+        # returns an empty Embed to force that path, since the real
+        # function cannot be made to return one.
+        def q(s):
+            return s.replace("'", "''")
+
+        stub = (
+            "function Resolve-CmdEmbeddablePath {\n"
+            "    param([string] $Label, [string] $Path, [object[]] $Prefixes, [switch] $NoRefuse)\n"
+            "    return [ordered]@{ Embed = ''; Rewritten = $false; PrefixName = $null }\n"
+            "}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = Path(tmp) / "harness.ps1"
+            harness.write_text(
+                f"$HermesRoot = '{q(str(Path(tmp) / 'hermes'))}'\n"
+                "$WrapperPython = 'C:\\Python312\\python.exe'\n"
+                "$ForgePy = 'C:\\dev-team\\forge\\forge.py'\n"
+                "$DecidersPy = 'C:\\dev-team\\deciders\\deciders.py'\n"
+                "$env:LOCALAPPDATA = ''\n$env:USERPROFILE = ''\n$env:APPDATA = ''\n$env:ProgramFiles = ''\n"
+                + self._wrapper_prelude() + stub +
+                self._assert_cmd_wrapper_paths_ascii_fn() +
+                "$CmdPaths = Assert-CmdWrapperPathsAscii\n"
+                "Write-Output 'UNREACHABLE'\n")
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                                  capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("resolved empty", proc.stderr, proc.stderr)
+        self.assertIn("refusing to write forge.cmd/deciders.cmd", proc.stderr, proc.stderr)
+        self.assertNotIn("UNREACHABLE", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh not installed")
     def test_non_ascii_path_with_no_usable_prefix_refuses_with_exit_2(self):
         # Acceptance #3: a non-ASCII path under none of the known folders.
         wrapper_python = "D:\\Pyth\u00f6n\\python.exe"

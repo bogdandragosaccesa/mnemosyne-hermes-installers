@@ -995,7 +995,27 @@ function Resolve-CmdEmbeddablePath {
        Test-WrapperPythonEmbeddable to PROBE embeddability for the py
        launcher/PATH fallback (M3) without the exit-2 side effect. #>
     param([string] $Label, [string] $Path, [object[]] $Prefixes, [switch] $NoRefuse)
-    if (Test-AsciiOrdinalRange $Path 0x20 0x7E) {
+    # F1 (round 3 review): an 8.3 SHORT name is printable ASCII BY
+    # CONSTRUCTION (that is the whole point of the 8.3 fallback form) even
+    # when the LONG form -- the real directory name -- is not, e.g.
+    # "C:\DEV-TE~1\DRGO~1\AppData\Local\Python\python.exe" for a checkout
+    # under a non-ASCII user name. Round 2's canonicalization ran only
+    # AFTER this ASCII check, so a short-named $Path took the "already
+    # ASCII, embed literally" fast path before Get-LongPathName ever saw
+    # it, silently embedding the short name verbatim in forge.cmd/
+    # deciders.cmd instead of either matching a prefix or refusing. '~' is
+    # the one character common to every 8.3 short component
+    # (https://learn.microsoft.com/windows/win32/fileio/naming-a-file#short-vs-long-names)
+    # and never appears in the long form of the same path, so testing for
+    # it is a safe, cheap gate: only pay for a GetLongPathName call when
+    # $Path could possibly be a short name, and an ordinary long path (no
+    # '~') is still routed through the ASCII check completely unchanged --
+    # byte-identical to before this fix.
+    $asciiCheckPath = $Path
+    if ($Path -and $Path.Contains('~')) {
+        $asciiCheckPath = Get-LongPathName $Path
+    }
+    if (Test-AsciiOrdinalRange $asciiCheckPath 0x20 0x7E) {
         return [ordered]@{ Embed = $Path; Rewritten = $false; PrefixName = $null }
     }
     # Round 2 (review): canonicalize to the LONG path form on BOTH sides
@@ -1003,8 +1023,9 @@ function Resolve-CmdEmbeddablePath {
     # canonicalized too (not just the prefixes) so an 8.3-short $Path still
     # matches a long-form LOCALAPPDATA/USERPROFILE/etc, and the computed
     # remainder is relative to the long form the %ENVVAR% will actually
-    # expand to at run time.
-    $longPath = Get-LongPathName $Path
+    # expand to at run time. Reuse the canonicalization done above when
+    # $Path contained '~' instead of calling GetLongPathName twice.
+    $longPath = if ($Path -and $Path.Contains('~')) { $asciiCheckPath } else { Get-LongPathName $Path }
     $bestName = $null; $bestTier = [int]::MaxValue; $bestLen = -1; $bestRemainder = $null
     foreach ($p in $Prefixes) {
         $val = (Get-LongPathName ([string]$p.Value)).TrimEnd('\')
@@ -1192,18 +1213,19 @@ function Assert-CmdWrapperPathsAscii {
        which almost never has a matching hermes\tools\python-3.x there,
        so the D4 guard fails closed (exit 1, no silent run) rather than
        accidentally picking up a real user's interpreter.
-       C6 (review round 1, known issue, not fixed): if DelayedExpansion
+       C6 (review round 1) / m1 (round 2 review, fixed): if DelayedExpansion
        is enabled for cmd.exe (registry default, or the caller invoking
        this wrapper via `cmd /v:on`), a literal '!' inside an EXPANDED
        %ENVVAR% value is consumed by cmd's `!var!` syntax instead of
        being left alone, and '!' is a legal Windows user-name/path
        character. This is not new in this change -- it already affects
-       any literal, non-rewritten ASCII path with '!' in v1.3.1 -- and
-       DelayedExpansion is off by default, so it is left as a known
-       issue rather than adding `setlocal DisableDelayedExpansion` (which
-       would need to apply only to wrappers that actually contain a
-       rewritten path, since an all-ASCII wrapper must stay
-       byte-identical to v1.3.1). #>
+       any literal, non-rewritten ASCII path with '!' in v1.3.1. F4 (round
+       3 review): this paragraph used to say DelayedExpansion was left as
+       a known issue rather than adding `setlocal DisableDelayedExpansion`
+       -- that was stale even when round 2 landed: Get-CmdGuardBlock DOES
+       emit `setlocal DisableDelayedExpansion` (see its m1 note), and ONLY
+       when there is at least one rewritten path, so an all-ASCII
+       wrapper's bytes are unaffected. #>
     $prefixes = Get-CmdPrefixCandidates -HermesRoot $HermesRoot
     $embeds = [ordered]@{}
     foreach ($pair in @(

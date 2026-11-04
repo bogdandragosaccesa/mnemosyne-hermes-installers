@@ -62,6 +62,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `-Encoding ascii` turned them into `?`. Both checks now compare ordinal character codes
   with no case folding and no regex engine, so the result no longer depends on the
   machine's culture. (#12)
+- **An 8.3 short name (e.g. `C:\DEV-TE~1\DRGO~1\...`) silently bypassed the `%ENVVAR%`
+  rewrite instead of triggering it.** A short name is printable ASCII *by construction*
+  even when the long form it denotes is not, and the ASCII-ness check that decides the
+  wrapper's fast path ran on the path exactly as given, before its long form was ever
+  looked at — so a non-ASCII install surfaced through an 8.3 short name had its short name
+  embedded in `forge.cmd`/`deciders.cmd` literally, unrewritten. A path containing `~` is
+  now canonicalized to its long form first, and the ASCII-ness decision (and, when it
+  isn't ASCII, the prefix rewrite) is made on that long form; a path with no `~` is
+  completely unaffected (still no `GetLongPathName` call at all, still byte-identical).
+
+### Known issues
+
+- **`HERMES_ROOT` is not canonicalized to its long form before the 8.3-short-name
+  comparison that decides whether it can be used as an `%ENVVAR%` prefix.** Unlike
+  `LOCALAPPDATA`/`APPDATA`/`USERPROFILE`/`ProgramW6432`/`ProgramFiles`, a persisted
+  `HERMES_ROOT` that arrives (or is compared against) in 8.3 short form is not passed
+  through `Get-LongPathName` before the match. This fails *closed*: at worst the
+  comparison does not match and the installer falls through to the next candidate or
+  refuses (exit 2) rather than embedding a wrong path, since `HERMES_ROOT` is already the
+  lowest-priority (tier 2) candidate. Tracked for a future round.
 
 ## [1.3.1] - 2026-11-04
 
