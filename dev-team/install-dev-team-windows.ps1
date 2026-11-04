@@ -853,6 +853,33 @@ function Test-AsciiOrdinalRange {
     }
     return $true
 }
+function Test-ContainsCmdShellMetachar {
+    <# A3 round-5 fix: cmd.exe's shell metacharacters -- & ^ % ! ( ) " < > --
+       are all printable ASCII (0x20-0x7E), so Resolve-CmdEmbeddablePath's
+       ASCII-ordinal fast path used to let a path containing one of them
+       through untouched (Rewritten = $false), embedding it into forge.cmd/
+       deciders.cmd literally with no %ENVVAR% rewrite and therefore no
+       Get-CmdGuardBlock existence guard (that guard only fires for
+       Rewritten = $true). A LOCALAPPDATA such as
+       "C:\...\R&D (x)\AppData\Local" is pure ASCII and triggered exactly
+       this: confirmed on a real Windows VM to fail closed (cmd.exe itself
+       reports "not found", rc=3) rather than inject, but the function's own
+       contract -- rewrite-or-refuse for anything that cannot be embedded
+       safely -- was not honoured. This check keeps such a path OFF the
+       literal-embed fast path (see its call sites below) so it is forced
+       through the %ENVVAR%-rewrite-plus-guard path, or refused outright
+       when no prefix covers it. A plain per-character scan, not `-match`,
+       for the same reason as Test-AsciiOrdinalRange: these are punctuation
+       characters, not letters, so .NET's culture-sensitive case folding
+       cannot apply to them, but a bare loop keeps this function's
+       behaviour independent of the regex engine entirely, matching the
+       style of every other classification helper in this file. #>
+    param([string] $Value)
+    foreach ($ch in $Value.ToCharArray()) {
+        if ('&^%!()"<>'.IndexOf($ch) -ge 0) { return $true }
+    }
+    return $false
+}
 function Get-LongPathName {
     <# Round 2 (review): prefix matching in Resolve-CmdEmbeddablePath compares
        $Path against LOCALAPPDATA/APPDATA/USERPROFILE/ProgramFiles. On a CI
@@ -1015,7 +1042,14 @@ function Resolve-CmdEmbeddablePath {
     if ($Path -and $Path.Contains('~')) {
         $asciiCheckPath = Get-LongPathName $Path
     }
-    if (Test-AsciiOrdinalRange $asciiCheckPath 0x20 0x7E) {
+    # A3 round-5 fix: printable-ASCII alone is not enough to embed $Path
+    # literally -- '&','^','%','!','(',')','"','<','>' are all in
+    # 0x20-0x7E too, and cmd.exe treats each one specially (see
+    # Test-ContainsCmdShellMetachar). A path containing one of them must
+    # fall through to the %ENVVAR%-rewrite-or-refuse logic below instead of
+    # taking this fast path, even though it reads as "already ASCII".
+    if ((Test-AsciiOrdinalRange $asciiCheckPath 0x20 0x7E) -and
+            -not (Test-ContainsCmdShellMetachar $asciiCheckPath)) {
         return [ordered]@{ Embed = $Path; Rewritten = $false; PrefixName = $null }
     }
     # Round 2 (review): canonicalize to the LONG path form on BOTH sides
@@ -1036,6 +1070,20 @@ function Resolve-CmdEmbeddablePath {
         if ($rest.Length -gt 0 -and $rest[0] -ne '\') { continue }   # separator-boundary check
         $remainder = $rest.TrimStart('\')
         if (-not (Test-AsciiOrdinalRange $remainder 0x20 0x7E)) { continue }
+        # Only '%' (would start another expansion) and '"' (would break
+        # the wrapper's quoting) are excluded here -- other cmd.exe
+        # metacharacters such as '&' are LEGAL in this remainder: the
+        # embed is always wrapped in double quotes at every use site
+        # (the run line, and the guard's echo via Get-CmdGuardBlock,
+        # which also doubles '%'), which cmd.exe treats as literal text
+        # for '&','^','(',')' -- see Get-CmdGuardBlock's S1 comment and
+        # test_guard_echo_pins_quoted_doubled_percent_bytes_for_ampersand_remainder.
+        # A3 round-5 fix only changes the ASCII FAST-PATH check above
+        # (Test-ContainsCmdShellMetachar), so a path like
+        # "...\R&D (x)\AppData\Local\..." is forced through this
+        # rewrite logic instead of being embedded unrewritten and
+        # unguarded; it does not change what this remainder check
+        # already allowed once a path gets here.
         if ($remainder.Contains('%') -or $remainder.Contains('"')) { continue }
         $tier = if ($null -ne $p.Tier) { [int]$p.Tier } else { 1 }
         if ($tier -lt $bestTier -or ($tier -eq $bestTier -and $val.Length -gt $bestLen)) {

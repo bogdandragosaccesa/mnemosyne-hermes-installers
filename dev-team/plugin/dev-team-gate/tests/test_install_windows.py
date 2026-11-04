@@ -76,9 +76,9 @@ def _function(text: str, name: str) -> str:
 # without these three is exactly the stale-dependency-list bug fixed here --
 # every call site must use this one tuple instead of hand-rolling its own.
 CMD_WRAPPER_FUNCS = (
-    "Test-AsciiOrdinalRange", "Get-LongPathName", "Get-PersistedEnvVar",
-    "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath", "Assert-WrapperTextAscii",
-    "Get-CmdGuardBlock",
+    "Test-AsciiOrdinalRange", "Test-ContainsCmdShellMetachar", "Get-LongPathName",
+    "Get-PersistedEnvVar", "Get-CmdPrefixCandidates", "Resolve-CmdEmbeddablePath",
+    "Assert-WrapperTextAscii", "Get-CmdGuardBlock",
 )
 RESOLVE_WRAPPER_PYTHON_DEPS = CMD_WRAPPER_FUNCS + ("Test-WrapperPythonEmbeddable",)
 
