@@ -198,8 +198,19 @@ class WindowsNtEvidence(unittest.TestCase):
         # here; the fixed echo must print the literal, UNEXPANDED
         # "%LOCALAPPDATA%" token (doubled '%', quoted), so the value is
         # never substituted into the line at all.
+        # N1 (round 7): this needs a path that is actually REWRITTEN, since
+        # only a rewritten path gets a guard (and therefore an echo). An
+        # all-ASCII path whose only metacharacters are the quote-safe ones
+        # ('&', '^', '(', ')') is now embedded literally and unguarded --
+        # that is N1's fix, verified against real cmd.exe by
+        # test_R1_a_literal_ascii_path_with_ampersand_and_parens_runs_under_cmd
+        # below -- so the '&' must sit in a LOCALAPPDATA value that ALSO
+        # carries a non-ASCII character, which is what forces the rewrite.
+        # The '&' then appears only in the EXPANDED value, which is exactly
+        # the S1 hazard: the echo must never expand it.
         with tempfile.TemporaryDirectory() as tmp:
-            local_value = str(Path(tmp) / "R&D (x)" / "AppData" / "Local")
+            local_value = str(Path(tmp) / f"R&D (x) {NON_ASCII_DIR}" / "AppData" / "Local")
+            self.assertFalse(local_value.isascii(), "LOCALAPPDATA must be non-ASCII to be rewritten")
             sentinel_dir = Path(tmp) / "sentinel_bin"
             sentinel_dir.mkdir(parents=True)
             marker = Path(tmp) / "SENTINEL_RAN.txt"
