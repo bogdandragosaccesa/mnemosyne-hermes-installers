@@ -40,6 +40,19 @@ ADOPT_TEAM_MEMORY=0
 TIER_FAST_PM=""
 TIER_STANDARD_PM=""
 TIER_DEEP_PM=""
+# --forge-token-source: the operator's command that prints
+# DEV_TEAM_GH_TOKEN=<value>. Only the command STRING is ever stored, and a
+# COMMAND containing a literal token shape is refused outright at parse
+# time below. See configure_forge_token_source() for what Hermes itself
+# does with the command once the source is enabled.
+FORGE_TOKEN_SOURCE=""
+# The variable the recorded command is contracted to print, and the one the
+# devops profile's terminal must pass through.
+FORGE_TOKEN_ENV_VAR="DEV_TEAM_GH_TOKEN"
+# The role whose profile holds the forge credential: pr-ci is devops' stage.
+# The PROFILE name is derived as "$PREFIX$FORGE_TOKEN_ROLE" at use, never
+# hardcoded, so a --prefix t2- install writes t2-devops.
+FORGE_TOKEN_ROLE="devops"
 # The profile a human talks to. It gets the pipeline-orchestration skill and
 # the budget script; every other profile is a worker the dispatcher spawns.
 ENTRY_PROFILE="pm"
@@ -81,6 +94,25 @@ Usage: install-dev-team-unix.sh [options]
                      Default: $MID_MODEL split on its first '/'.
   --tier-deep P:M     deciders tier table entry for the deep tier.
                      Default: $FRONTIER_MODEL split on its first '/'.
+  --forge-token-source COMMAND
+                     Record COMMAND as the devops profile's secrets.command
+                     helper. COMMAND must print a line
+                     DEV_TEAM_GH_TOKEN=<value>; pr-ci reads that variable to
+                     push and to talk to the forge. Only the COMMAND STRING
+                     is stored, and a COMMAND that itself contains a
+                     literal token shape is refused (nothing written). This
+                     installer itself never executes COMMAND -- but once
+                     the source is enabled, Hermes runs it at the start of
+                     every later `hermes -p <prefix>devops ...` call this
+                     install makes, discarding the helper's stderr and
+                     never printing the value it returns. Writes exactly
+                     two leaf keys on the <prefix>devops profile --
+                     secrets.command.command and secrets.command.enabled --
+                     plus DEV_TEAM_GH_TOKEN appended to
+                     terminal.env_passthrough. Re-running with the same
+                     COMMAND changes nothing, even over an already-correct
+                     mapping; a different COMMAND replaces only
+                     secrets.command.command.
   --dry-run          Print what would happen and change nothing
   -h, --help         Show help
 
@@ -115,6 +147,14 @@ while [[ $# -gt 0 ]]; do
             TIER_DEEP_PM="${2:-}"
             [[ -n $TIER_DEEP_PM ]] || { echo "--tier-deep needs a value" >&2; exit 2; }
             [[ $TIER_DEEP_PM == *:* ]] || { echo "--tier-deep must be PROVIDER:MODEL (got '$TIER_DEEP_PM')" >&2; exit 2; }
+            shift 2 ;;
+        --forge-token-source)
+            FORGE_TOKEN_SOURCE="${2:-}"
+            [[ -n $FORGE_TOKEN_SOURCE ]] || { echo "--forge-token-source needs a value" >&2; exit 2; }
+            if printf '%s' "$FORGE_TOKEN_SOURCE" | grep -qiE 'github_pat_[A-Za-z0-9_]{8,}|gh[pours]_[A-Za-z0-9]{8,}'; then
+                echo "--forge-token-source must not contain a literal token value; pass a COMMAND that prints one instead. Refusing -- nothing written." >&2
+                exit 2
+            fi
             shift 2 ;;
         --dry-run)    DRY_RUN=1;    shift ;;
         -h|--help) usage; exit 0 ;;
@@ -271,6 +311,73 @@ selected() {
     # stays the same whether or not --prefix is in play.
     case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac
 }
+
+# --forge-token-source: record the operator's token command on the devops
+# profile and pass $FORGE_TOKEN_ENV_VAR through to that profile's terminal.
+#
+# Secrecy contract: only the command STRING is stored, and a COMMAND that
+# itself contains a literal token shape is refused before anything is
+# written (see the --forge-token-source parse-time check above, which reuses
+# forge_core.py's github_pat_/gh[pours]_ patterns). This installer itself
+# never executes COMMAND. But once the source is enabled, Hermes runs it at
+# the start of every later `hermes -p <prefix>devops ...` call this install
+# makes -- once per run, with an empty key cache -- and discards the
+# helper's stderr and never prints the value it returns. So no token value
+# is fetched, printed or written by THIS script: not to a config, not to
+# stdout, not under --dry-run.
+#
+# Exactly three keys are touched. `hermes config set` merges into the
+# existing config, so nothing else in it is clobbered. CommandSource
+# requires a MAPPING with two leaf keys -- secrets.command.command and
+# secrets.command.enabled; `enabled` defaults to false, and writing the
+# parent key as a plain string is itself refused once it already holds a
+# correct mapping ("it must be a mapping, got a string"). Writing the two
+# leaf keys is idempotent even over an already-correct mapping: re-running
+# with the same COMMAND writes the same two values (a no-op), and a
+# different COMMAND replaces only secrets.command.command.
+# `terminal.env_passthrough` is a list, so it is read first and MERGED --
+# env_passthrough_merge.py appends the variable only when absent, which keeps
+# a re-run a no-op and never drops a name the profile already passes through.
+configure_forge_token_source() {  # profile_name
+    local name="$1" current merged
+    if (( DRY_RUN )); then
+        say "  would run: hermes -p $name config set secrets.command.command $FORGE_TOKEN_SOURCE"
+        say "  would run: hermes -p $name config set secrets.command.enabled true"
+        say "  would add $FORGE_TOKEN_ENV_VAR to $name's terminal.env_passthrough"
+        return 0
+    fi
+    if [[ ! -f $ENV_PASSTHROUGH_MERGE_PY ]]; then
+        echo "Missing $ENV_PASSTHROUGH_MERGE_PY, so $name's terminal.env_passthrough cannot be merged. Refusing." >&2
+        exit 1
+    fi
+    hermes -p "$name" config set secrets.command.command "$FORGE_TOKEN_SOURCE" >/dev/null || {
+        echo "Setting secrets.command.command on '$name' failed." >&2
+        exit 1
+    }
+    hermes -p "$name" config set secrets.command.enabled true >/dev/null || {
+        echo "Setting secrets.command.enabled on '$name' failed." >&2
+        exit 1
+    }
+    # An unset key exits non-zero and prints nothing; the merge treats empty
+    # input as an empty list. stderr is dropped: `config get` prefixes its
+    # output with secret-helper progress lines.
+    current="$(hermes -p "$name" config get terminal.env_passthrough --json 2>/dev/null || true)"
+    merged="$(printf '%s' "$current" | python3 -I "$ENV_PASSTHROUGH_MERGE_PY" "$FORGE_TOKEN_ENV_VAR")" || {
+        echo "Cannot merge $name's terminal.env_passthrough." >&2
+        exit 1
+    }
+    hermes -p "$name" config set terminal.env_passthrough "$merged" >/dev/null || {
+        echo "Setting terminal.env_passthrough on '$name' failed." >&2
+        exit 1
+    }
+    say "  forge token: secrets.command.command and secrets.command.enabled set, $FORGE_TOKEN_ENV_VAR passed through"
+}
+
+# --forge-token-source only has a target when the devops profile is in this
+# run. Say so rather than silently doing nothing.
+if [[ -n $FORGE_TOKEN_SOURCE ]] && ! selected "$FORGE_TOKEN_ROLE"; then
+    echo "--forge-token-source was given but --only does not include '$FORGE_TOKEN_ROLE', so there is no profile to configure; nothing was written for it." >&2
+fi
 
 command -v hermes >/dev/null 2>&1 || {
     echo "hermes not found on PATH." >&2
@@ -527,6 +634,9 @@ env_value_unsafe_reason() {  # value -> prints a reason if unsafe, else nothing
 # a different module. Called directly (never inside `$(...)`), so its
 # `exit 2` ends the installer.
 ENV_PIN_CHECK_PY="$SCRIPT_DIR/scripts/env_pin_check.py"
+# The shared terminal.env_passthrough list merge (one implementation for both
+# installers; see configure_forge_token_source below).
+ENV_PASSTHROUGH_MERGE_PY="$SCRIPT_DIR/scripts/env_passthrough_merge.py"
 env_pin_check_or_die() {  # key value subject
     local key="$1" value="$2" subject="$3" out rc=0
     if ! command -v python3 >/dev/null 2>&1; then
@@ -1236,6 +1346,14 @@ for i in "${!NAMES[@]}"; do
             esac
         fi
         run hermes -p "$name" config set model.default "$role_model"
+    fi
+
+    # 3b. --forge-token-source, devops only: the pr-ci stage is devops' work,
+    # so that is the one profile that needs the forge credential. The profile
+    # name is "$PREFIX$FORGE_TOKEN_ROLE", derived here, so a --prefix t2-
+    # install configures t2-devops.
+    if [[ -n $FORGE_TOKEN_SOURCE && $role == "$FORGE_TOKEN_ROLE" ]]; then
+        configure_forge_token_source "$name"
     fi
 
     # 4. Mnemosyne plugin and data links. The gap this closes: a named

@@ -59,6 +59,17 @@
     deciders tier table entry for the deep tier. Default: $FrontierModel
     split on its first '/'.
 
+.PARAMETER ForgeTokenSource
+    Refused outright: Hermes' command secret source is POSIX-only (it needs
+    /bin/sh), so this flag would record devops profile config that Hermes
+    running on Windows can never read. Rather than silently writing a key
+    nothing will ever use -- a failure that would otherwise only surface
+    much later as a pr-ci card blocking with "no forge token", disconnected
+    from its install-time cause -- this installer exits 2 and writes
+    nothing. Use the Unix installer's --forge-token-source on a POSIX
+    Hermes host instead, or configure secrets.command.command /
+    secrets.command.enabled on the devops profile by hand from there.
+
 .EXAMPLE
     .\install-dev-team-windows.ps1
 
@@ -79,7 +90,8 @@ param(
     [switch]   $DryRun,
     [string]   $TierFast,
     [string]   $TierStandard,
-    [string]   $TierDeep
+    [string]   $TierDeep,
+    [string]   $ForgeTokenSource
 )
 
 $ErrorActionPreference = 'Stop'
@@ -180,6 +192,27 @@ $DecidersSkillDir = Join-Path $SkillsDir 'dev-team-deciders'
 # every MNEMOSYNE_HOME / MNEMOSYNE_DATA_DIR pin this installer writes
 # (Get-EnvPinCheckerReason / Assert-EnvPinSafe, below).
 $EnvPinCheckPy    = Join-Path (Join-Path $ScriptDir 'scripts') 'env_pin_check.py'
+# The shared terminal.env_passthrough list merge, used by -ForgeTokenSource
+# (Set-ForgeTokenSource, below). One implementation for both installers.
+$EnvPassthroughMergePy = Join-Path (Join-Path $ScriptDir 'scripts') 'env_passthrough_merge.py'
+# -ForgeTokenSource: the variable the recorded command is contracted to print,
+# and the role whose profile holds it. The PROFILE name is always built as
+# "$Prefix$ForgeTokenRole", never hardcoded, so a -Prefix t2- install
+# configures t2-devops.
+$ForgeTokenEnvVar = 'DEV_TEAM_GH_TOKEN'
+$ForgeTokenRole   = 'devops'
+
+# -ForgeTokenSource is refused unconditionally on this (Windows) installer:
+# Hermes' `command` secret source only ever resolves on POSIX (it shells out
+# to /bin/sh), so no shape of this flag would ever do useful work here. Exit
+# 2 before anything is written -- see .PARAMETER ForgeTokenSource above for
+# why refusal, not a silent no-op, is the right failure mode. Set-ForgeTokenSource
+# below is therefore unreachable; its body is kept correct (two leaf keys,
+# same contract as the Unix installer) in case this refusal is ever lifted.
+if ($ForgeTokenSource) {
+    [Console]::Error.WriteLine("-ForgeTokenSource is refused on Windows: Hermes' command secret source is POSIX-only, so this flag would record devops profile config Hermes can never read here. Nothing was written. Use the Unix installer's --forge-token-source from a POSIX Hermes host instead.")
+    exit 2
+}
 
 # Refuse a decisions-only model in the tier table before anything is
 # written: an agent worker on a card routed to it could not run at all. The
@@ -263,6 +296,83 @@ if ($Only) {
 function Test-Selected([string] $Name) {
     if (-not $Only) { return $true }
     return $Only -contains $Name
+}
+
+function Set-ForgeTokenSource {
+    <#
+      -ForgeTokenSource: record the operator's token command on the devops
+      profile and pass $ForgeTokenEnvVar through to that profile's terminal.
+
+      Unreachable on this (Windows) installer -- the unconditional refusal
+      above exits before this function is ever called. Kept correct so a
+      lifted refusal does not resurrect the wrong-shape bug defect A fixed
+      on the Unix side.
+
+      Secrecy contract: only the command STRING is stored. This installer
+      itself never executes COMMAND, so no token value is fetched, printed
+      or written here - not to a config, not to the console, not under
+      -DryRun.
+
+      Exactly three keys are touched. `hermes config set` merges into the
+      existing config, so nothing else in it is clobbered. CommandSource
+      requires a MAPPING with two leaf keys - secrets.command.command and
+      secrets.command.enabled; `enabled` defaults to false, so writing only
+      the parent key (or only .command) would leave the source disabled.
+      Writing the two leaf keys is idempotent even over an already-correct
+      mapping. `terminal.env_passthrough` is a list, so it is read first and
+      MERGED by dev-team\scripts\env_passthrough_merge.py, which appends the
+      variable only when absent - keeping a re-run a no-op and never
+      dropping a name the profile already passes through.
+    #>
+    param([string] $Name)
+
+    if ($DryRun) {
+        Write-Host "  would run:  hermes -p $Name config set secrets.command.command $ForgeTokenSource"
+        Write-Host "  would run:  hermes -p $Name config set secrets.command.enabled true"
+        Write-Host "  would add:  $ForgeTokenEnvVar to $Name's terminal.env_passthrough"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $EnvPassthroughMergePy)) {
+        Write-Error "Missing $EnvPassthroughMergePy, so $Name's terminal.env_passthrough cannot be merged."
+        exit 1
+    }
+    if (-not $WrapperPython) {
+        Write-Error "No Python was resolved, so $Name's terminal.env_passthrough cannot be merged."
+        exit 1
+    }
+
+    $out = Invoke-Hermes '-p' $Name 'config' 'set' 'secrets.command.command' $ForgeTokenSource
+    if ($LASTEXITCODE -ne 0) { Write-Error "Setting secrets.command.command on '$Name' failed: $out"; exit 1 }
+    $out = Invoke-Hermes '-p' $Name 'config' 'set' 'secrets.command.enabled' 'true'
+    if ($LASTEXITCODE -ne 0) { Write-Error "Setting secrets.command.enabled on '$Name' failed: $out"; exit 1 }
+
+    # An unset key exits non-zero; the merge treats empty input as an empty
+    # list. Invoke-Hermes folds stderr in, so take the last non-empty line.
+    $raw = Invoke-Hermes '-p' $Name 'config' 'get' 'terminal.env_passthrough' '--json'
+    $current = if ($LASTEXITCODE -eq 0) { Get-HermesLastLine $raw } else { '' }
+
+    $previousEA = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $merged = ($current | & $WrapperPython '-I' $EnvPassthroughMergePy $ForgeTokenEnvVar 2>&1 | Out-String).Trim()
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousEA
+    }
+    if ($code -ne 0 -or -not $merged) {
+        Write-Error "Cannot merge $Name's terminal.env_passthrough: $merged"
+        exit 1
+    }
+
+    $out = Invoke-Hermes '-p' $Name 'config' 'set' 'terminal.env_passthrough' $merged
+    if ($LASTEXITCODE -ne 0) { Write-Error "Setting terminal.env_passthrough on '$Name' failed: $out"; exit 1 }
+    Write-Host "  forge token: secrets.command.command and secrets.command.enabled set, $ForgeTokenEnvVar passed through"
+}
+
+# -ForgeTokenSource only has a target when the devops profile is in this run.
+# Say so rather than silently doing nothing.
+if ($ForgeTokenSource -and -not (Test-Selected $ForgeTokenRole)) {
+    [Console]::Error.WriteLine("-ForgeTokenSource was given but -Only does not include '$ForgeTokenRole', so there is no profile to configure; nothing was written for it.")
 }
 
 function Invoke-Hermes {
@@ -2369,6 +2479,7 @@ foreach ($role in $Profiles.Keys) {
         }
         Write-Host "  would link: $profileDir\plugins\dev-team-gate -> $PluginSrcGate"
         Write-Host "  would run:  hermes -p $name config set model.default ..."
+        if ($ForgeTokenSource -and $role -eq $ForgeTokenRole) { Set-ForgeTokenSource -Name $name }
         Write-Host "  would run:  hermes -p $name plugins enable dev-team-gate --no-allow-tool-override"
         Write-Host "  would link: $profileDir\dev-team -> $DevTeamHome"
         foreach ($stageDir in (Get-ChildItem -LiteralPath $SkillsDir -Directory -Filter 'dev-team-stage-*' -ErrorAction SilentlyContinue)) {
@@ -2469,6 +2580,14 @@ foreach ($role in $Profiles.Keys) {
         }
         $out = Invoke-Hermes '-p' $name 'config' 'set' 'model.default' $roleModel
         if ($LASTEXITCODE -ne 0) { Write-Error "Setting model on '$name' failed: $out"; exit 1 }
+    }
+
+    # 5b. -ForgeTokenSource, devops only: the pr-ci stage is devops' work, so
+    # that is the one profile that needs the forge credential. The profile
+    # name is "$Prefix$ForgeTokenRole", derived here, so a -Prefix t2- install
+    # configures t2-devops.
+    if ($ForgeTokenSource -and $role -eq $ForgeTokenRole) {
+        Set-ForgeTokenSource -Name $name
     }
 
     # 6. Kanban is how this team actually works: the pm profile writes

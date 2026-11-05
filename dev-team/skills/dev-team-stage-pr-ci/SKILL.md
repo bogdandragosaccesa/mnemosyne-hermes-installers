@@ -64,12 +64,68 @@ This record is what the guard itself reads later (`_record_default_branch`) to k
 branch `git push` must never target on this project, and what `forge ci-status` resolves
 against. Get `repo-slug` right the first time — intake already fixed it; don't re-derive it.
 
+## The forge token
+
+`forge` and `git push` both need a credential for the forge. The operator supplies it as
+**`DEV_TEAM_GH_TOKEN`** in your environment — set up once by the installer's
+`--forge-token-source` / `-ForgeTokenSource` flag, which records only a *command* that prints
+the token (never the value) and passes the variable through to this profile. You never see,
+choose, or store the token.
+
+**Before you push anything, check it is there:**
+
+```
+test -n "$DEV_TEAM_GH_TOKEN" || echo MISSING
+```
+
+If it is unset or empty, `kanban_block(kind="needs_input")` with a reason starting
+**`setup: no-forge-token`**. There is **no fallback**: never run `gh auth login` (in any form,
+interactive or `--with-token`), never reach for a stored credential, a keyring, an SSH key, or
+`GITHUB_TOKEN`, and never ask the operator to paste the token into the chat or into a file.
+A missing credential is an operator setup task, not something to work around.
+
+When it is present, hand it to `git` through `gh`'s credential helper, once, at the start of
+your run:
+
+```
+export GH_TOKEN="$DEV_TEAM_GH_TOKEN"
+gh auth setup-git
+```
+
+That is the whole mechanism. Why this one and not a `GIT_ASKPASS` helper:
+
+- `gh auth setup-git` only writes `credential.*` git-config keys. The guard refuses `git config`
+  writes to keys that could redirect a push (`alias.`, `remote.`, `push.`, `branch.`,
+  `include.`, `includeif.`, `url.`); `credential.` is not among them, so the command runs. A
+  `GIT_ASKPASS` approach needs a helper **script file on disk** — a file that can be committed,
+  read, or left behind.
+- `gh` reads `GH_TOKEN` from the environment, so the value never appears in a command line (the
+  guard lexes argv) and never lands on disk.
+- `GH_TOKEN` is not a `HERMES_*` variable, so exporting it does not touch a Hermes fence.
+- `forge`'s GitHub adapter reads `DEV_TEAM_GH_TOKEN` itself, for the `gh` subprocess only, so
+  `forge pr-open`, `forge ci-status` and `forge mark-ready` need nothing further from you.
+
+**Invariants — these are not style preferences:**
+
+- `export GH_TOKEN="$DEV_TEAM_GH_TOKEN"` passes the token **by reference**. Never type the
+  literal value, never `echo` it, never interpolate it into a URL
+  (`https://$TOKEN@github.com/...` is forbidden — it lands in `.git/config`, in the reflog and
+  in error messages), never write it to a file, and never put it in a card, comment, commit
+  message or completion metadata.
+- Never `gh auth login --with-token` from an `echo` or a pipe: that puts the value in a command
+  line and in the shell's history.
+- If a command's output might contain it, do not paste that output anywhere. `forge` redacts
+  known token shapes from its own errors, but your shell does not.
+
 ## Shipping the branch
 
 Once your parent `review` card has approved `head_sha`:
 
-1. Push the branch: `git push origin <branch>`. (The guard only blocks pushes to the project's
-   protected default branch — this is not that.)
+1. Set up credentials as above (`test -n "$DEV_TEAM_GH_TOKEN"`, then
+   `export GH_TOKEN="$DEV_TEAM_GH_TOKEN"` and `gh auth setup-git`), then push the branch:
+   `git push origin <branch>`. (The guard only blocks pushes to the project's protected default
+   branch — this is not that. It also refuses a push from a card with no dev-team stage skill;
+   yours carries `dev-team-stage-pr-ci`, so that is not you either.)
 2. Open the PR: `forge pr-open --slug <repo-slug> --branch <branch> --title <title>
    --body-file <path>`.
 3. Poll `forge ci-status --slug <repo-slug> --sha <head_sha>` while it reports `pending`, up to

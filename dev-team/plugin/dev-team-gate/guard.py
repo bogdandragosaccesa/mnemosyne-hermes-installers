@@ -48,8 +48,22 @@ class _Refuse(Exception):
     pass
 
 
+def _redact(text: str) -> str:
+    """`forge_core.redact` applied to anything on its way to the agent.
+
+    Loaded by path, like every other forge read (see `_forge_core`). If the
+    forge cannot be imported at all the installation is broken in a way that
+    already breaks `kanban_complete`; fail closed here rather than hand back
+    text nothing has redacted.
+    """
+    try:
+        return _forge_core().redact(text)
+    except BaseException:
+        return "<redaction unavailable>"
+
+
 def _describe(exc: BaseException) -> str:
-    text = f"{type(exc).__name__}: {exc}"
+    text = f"{type(exc).__name__}: {_redact(str(exc))}"
     return text if len(text) <= _DETAIL_MAX else text[: _DETAIL_MAX - 3] + "..."
 
 
@@ -292,8 +306,30 @@ _IMAGE_BUILDERS = frozenset({"docker", "podman", "buildah", "nerdctl"})
 _SIDE_DOOR_VERBS = frozenset({
     "complete", "request-changes", "edit", "unblock", "reopen-review",
     "promote", "request-review", "archive", "assign", "reassign", "reclaim",
-    "link", "unlink",
+    "link", "unlink", "create",
 })
+# Verbs that name no target card at all: `create` makes one. They are here
+# only for their ASSIGNEE argument (see `_SIDE_DOOR_ASSIGNEE_ATTRS`), so the
+# "which card does this target" check is skipped for them.
+_SIDE_DOOR_NO_TARGET = frozenset({"create"})
+# Verbs whose argv carries a profile name the dispatcher would spawn. The
+# prefix rule applies to EVERY one of these calls, whatever card they name:
+# an unprefixed assignee hands the card to a different, unguarded profile,
+# which is exactly as bad on an ordinary card as on a stage card.
+#
+# Real-parser path: the argparse attribute holding it. `create` takes
+# `--assignee`; `assign`/`reassign` take the profile as their second
+# positional, which Hermes' parser calls `profile`.
+_SIDE_DOOR_ASSIGNEE_ATTRS: dict[str, tuple[str, ...]] = {
+    "create": ("assignee",),
+    "assign": ("profile",),
+    "reassign": ("profile",),
+}
+# Fallback path: verbs whose assignee is the Nth positional (0-based) rather
+# than an option value.
+_SIDE_DOOR_ASSIGNEE_POSITIONAL: dict[str, int] = {"assign": 1, "reassign": 1}
+# Fallback path: the option carrying the assignee, per verb.
+_SIDE_DOOR_ASSIGNEE_OPT: dict[str, str] = {"create": "--assignee"}
 # Verbs with exactly one target positional (others, like `complete`, take
 # every remaining positional as a target -- see `_SIDE_DOOR_TARGET_ATTRS` and
 # the fallback parser).
@@ -320,6 +356,7 @@ _SIDE_DOOR_TARGET_ATTRS: dict[str, tuple[str, ...]] = {
     "reclaim": ("task_id",),
     "link": ("parent_id", "child_id"),
     "unlink": ("parent_id", "child_id"),
+    "create": (),  # creates a card; it targets none
 }
 # Fallback path: exact long options each verb accepts, by how they consume
 # argv. `_VALUE`: one following word. `_MULTI`: every following word up to
@@ -338,6 +375,13 @@ _SIDE_DOOR_VALUE_OPTS: dict[str, frozenset[str]] = {
     "reclaim": frozenset({"--reason"}),
     "link": frozenset(),
     "unlink": frozenset(),
+    # `hermes kanban create` (hermes_cli/kanban_parser.py's task `create`).
+    "create": frozenset({
+        "--body", "--body-file", "--assignee", "--parent", "--workspace", "--branch",
+        "--project", "--tenant", "--priority", "--idempotency-key", "--max-runtime",
+        "--created-by", "--skill", "--max-retries", "--model", "--provider",
+        "--completion-contract", "--goal-max-turns", "--initial-status",
+    }),
 }
 _SIDE_DOOR_MULTI_OPTS: dict[str, frozenset[str]] = {
     "promote": frozenset({"--ids"}),
@@ -348,6 +392,7 @@ _SIDE_DOOR_FLAG_OPTS: dict[str, frozenset[str]] = {
     "promote": frozenset({"--dry-run", "--json"}),
     "request-review": frozenset({"--force"}),
     "reassign": frozenset({"--reclaim"}),
+    "create": frozenset({"--triage", "--goal", "--json"}),
 }
 _CARD_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -498,6 +543,13 @@ _PROTECTED_PATHS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"forge\.cmd(?![\w.-])",
     r"dev-team/projects(?![\w.-])",
     r"plugins/dev-team-gate(?![\w.-])",
+    # The installed team prefix `check_create` reads. UNANCHORED on purpose:
+    # the file lives in a profile directory under $HERMES_HOME, not inside a
+    # repo, so there is no relative `dev-team-prefix` path in a clone of this
+    # repo for the anchored form to protect. Without this a worker could
+    # rewrite the very file the prefix check consults and assign itself an
+    # unguarded profile.
+    r"dev-team-prefix(?![\w.-])",
 ))
 # `dev-team/forge` and `dev-team/plugin` are also the real paths of two
 # directories any clone of THIS repo has (the team works on the guard and
@@ -963,6 +1015,28 @@ def _git_refusal(what: str, why: str) -> str:
     )
 
 
+def _non_stage_push_refusal(task_id: str) -> str:
+    """A `git push` from a card that is on the board but carries no dev-team
+    stage skill (decision 1, option B).
+
+    Such a card has no intake ancestor, so `project_slug()` cannot resolve a
+    project for it and the guard cannot learn which branch that project
+    protects: `protected()` would fall back to `{main, master}` and let a push
+    to a recorded default branch such as `develop` through. Rather than feed
+    `protected()` a second, agent-influencable project-resolution path, the
+    push itself is refused -- the branch it would create is one no validate,
+    review or pr-ci card owns.
+    """
+    return (
+        f"guard: `git push` from card {task_id} is refused: the card carries no dev-team "
+        f"stage skill, so the guard cannot establish which project it belongs to or which "
+        f"branch that project protects. Route the work through the pipeline (an intake card "
+        f"and its stages) so the push is anchored to a project, or have a human push it. "
+        f"A fence that blocks you is a reason to kanban_block(kind=\"needs_input\") and ask, "
+        f"never something to remove."
+    )
+
+
 def _config_key_redirects(key: str) -> bool:
     key = key.split("=", 1)[0].strip().lower()
     return key.startswith(_GIT_MAPPING_KEYS) or key in _GIT_MAPPING_SECTIONS
@@ -1214,11 +1288,11 @@ def _protected_path(token: str) -> bool:
 
     `_PROTECTED_PATHS` matches anywhere (as before): those filenames
     (`.local/bin/forge`, `forge.cmd`, `dev-team/projects`,
-    `plugins/dev-team-gate`) do not collide with ordinary relative
-    development paths. `_PROTECTED_PATHS_ANCHORED` additionally requires a
-    path separator right before the match, since `dev-team/forge` and
-    `dev-team/plugin` are also real relative paths inside any clone of this
-    repo (N5): see the comment above `_PROTECTED_PATHS_ANCHORED`.
+    `plugins/dev-team-gate`, `dev-team-prefix`) do not collide with ordinary
+    relative development paths. `_PROTECTED_PATHS_ANCHORED` additionally
+    requires a path separator right before the match, since `dev-team/forge`
+    and `dev-team/plugin` are also real relative paths inside any clone of
+    this repo (N5): see the comment above `_PROTECTED_PATHS_ANCHORED`.
     """
     text = token.replace("\\", "/")
     if any(p.search(text) for p in _PROTECTED_PATHS):
@@ -1307,6 +1381,20 @@ class _CardState:
                     ) from None
         return self._guarded
 
+    def stageless(self) -> bool:
+        """True for a card that is on the board but carries no dev-team stage skill.
+
+        `task_id is None` is deliberately excluded: that is no card at all (an
+        interactive session at a human's keyboard), not an agent working a
+        card, and there is no board-side identity to resolve a project from.
+        Refusing it would break every interactive session, so the `task_id is
+        not None` term is load-bearing -- do not "simplify" it away.
+
+        `guarded()` is memoised and raises `_Refuse` when the board cannot be
+        read or the card is not found, so this is free and fails closed.
+        """
+        return self.task_id is not None and not self.guarded()
+
     def protected(self) -> frozenset[str]:
         if self._protected is None:
             names = set(_ALWAYS_PROTECTED)
@@ -1363,15 +1451,16 @@ def _hermes_entry_points(argv: list[str]) -> list[int]:
 
 
 def _side_door_via_real_parser(parser, argv_from_kanban: list[str]):
-    """(verb, board, targets, handled) using Hermes' own argparse tree, or
-    raises _Refuse when the call cannot be parsed at all (fail closed)."""
+    """(verb, board, targets, assignees, handled) using Hermes' own argparse
+    tree, or raises _Refuse when the call cannot be parsed at all (fail
+    closed)."""
     buf = io.StringIO()
     try:
         with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
             ns, _extra = parser.parse_known_args(argv_from_kanban)
     except SystemExit as exc:
         if exc.code in (0, None):  # --help or similar: nothing to check
-            return None, None, [], False
+            return None, None, [], [], False
         # A required positional missing (no reason, no task id, ...) is not
         # an option-abbreviation ambiguity: fall back to the strict allowlist
         # parse, which still finds the verb and whatever targets ARE given
@@ -1379,7 +1468,7 @@ def _side_door_via_real_parser(parser, argv_from_kanban: list[str]):
         return _side_door_via_fallback(argv_from_kanban)
     verb = getattr(ns, "kanban_action", None)
     if verb not in _SIDE_DOOR_VERBS:
-        return None, None, [], False
+        return None, None, [], [], False
     board = getattr(ns, "board", None)
     targets: list[str] = []
     for attr in _SIDE_DOOR_TARGET_ATTRS[verb]:
@@ -1387,13 +1476,16 @@ def _side_door_via_real_parser(parser, argv_from_kanban: list[str]):
         if value is None:
             continue
         targets.extend(str(v) for v in value) if isinstance(value, list) else targets.append(str(value))
-    return verb, board, targets, True
+    assignees: list = []
+    for attr in _SIDE_DOOR_ASSIGNEE_ATTRS.get(verb, ()):
+        assignees.append(getattr(ns, attr, None))
+    return verb, board, targets, assignees, True
 
 
 def _side_door_via_fallback(argv_from_kanban: list[str]):
-    """(verb, board, targets, handled): a strict, exact-allowlist parse used
-    only when `hermes_cli` cannot be imported. Any `--option` not on the
-    verb's exact allowlist makes the call unparseable (raises _Refuse):
+    """(verb, board, targets, assignees, handled): a strict, exact-allowlist
+    parse used only when `hermes_cli` cannot be imported. Any `--option` not on
+    the verb's exact allowlist makes the call unparseable (raises _Refuse):
     argparse's abbreviations (`--ti` means `--title`) cannot be replicated
     here, so an unrecognised option is never assumed to be a bare flag."""
     rest = argv_from_kanban[1:]  # past "kanban"
@@ -1413,25 +1505,30 @@ def _side_door_via_fallback(argv_from_kanban: list[str]):
             f"(Hermes' own parser is unavailable to check it); refusing"
         )
     if j >= len(rest):
-        return None, None, [], False
+        return None, None, [], [], False
     verb = rest[j]
     if verb not in _SIDE_DOOR_VERBS:
-        return None, None, [], False
+        return None, None, [], [], False
     value_opts = _SIDE_DOOR_VALUE_OPTS.get(verb, frozenset())
     multi_opts = _SIDE_DOOR_MULTI_OPTS.get(verb, frozenset())
     flag_opts = _SIDE_DOOR_FLAG_OPTS.get(verb, frozenset())
+    assignee_opt = _SIDE_DOOR_ASSIGNEE_OPT.get(verb)
+    assignees: list = []
     targets: list[str] = []
     k = j + 1
     while k < len(rest):
         a = rest[k]
         if a in ("-h", "--help"):
-            return None, None, [], False
+            return None, None, [], [], False
         if a == "--":
             targets.extend(rest[k + 1:])
             break
         if a.startswith("--"):
             name = a.split("=", 1)[0]
             if name in value_opts:
+                if name == assignee_opt:
+                    assignees.append(a.split("=", 1)[1] if "=" in a
+                                     else (rest[k + 1] if k + 1 < len(rest) else None))
                 k += 1 if "=" in a else 2
                 continue
             if name in multi_opts:
@@ -1450,16 +1547,25 @@ def _side_door_via_fallback(argv_from_kanban: list[str]):
             )
         targets.append(a)
         k += 1
-    if verb in _SIDE_DOOR_ONE_TARGET:
+    # `assign`/`reassign` take the profile as their second positional, so it
+    # must be read off the positionals before they are trimmed to targets.
+    index = _SIDE_DOOR_ASSIGNEE_POSITIONAL.get(verb)
+    if index is not None:
+        assignees.append(targets[index] if len(targets) > index else None)
+    if assignee_opt is not None and not assignees:
+        assignees.append(None)  # the option was absent: fail closed below
+    if verb in _SIDE_DOOR_NO_TARGET:
+        targets = []
+    elif verb in _SIDE_DOOR_ONE_TARGET:
         targets = targets[:1]
     elif verb in _SIDE_DOOR_TWO_TARGETS:
         targets = targets[:2]
-    return verb, board, targets, True
+    return verb, board, targets, assignees, True
 
 
-def _side_doors(argv: list[str]) -> list[tuple[str, str | None, list[str]]]:
-    """(verb, board named in argv or None, target card ids) for every
-    `hermes [opts] kanban [--board b] <verb> ...` in argv, `python3 -m
+def _side_doors(argv: list[str]) -> list[tuple[str, str | None, list[str], list]]:
+    """(verb, board named in argv or None, target card ids, assignees) for
+    every `hermes [opts] kanban [--board b] <verb> ...` in argv, `python3 -m
     hermes_cli.main kanban ...` included. Checks EVERY positional target, not
     just the first (N1)."""
     out = []
@@ -1470,18 +1576,46 @@ def _side_doors(argv: list[str]) -> list[tuple[str, str | None, list[str]]]:
             continue
         argv_from_kanban = rest[rest.index("kanban"):]
         if parser is not None:
-            verb, board, targets, handled = _side_door_via_real_parser(parser, argv_from_kanban)
+            verb, board, targets, assignees, handled = _side_door_via_real_parser(
+                parser, argv_from_kanban)
         else:
-            verb, board, targets, handled = _side_door_via_fallback(argv_from_kanban)
+            verb, board, targets, assignees, handled = _side_door_via_fallback(
+                argv_from_kanban)
         if handled:
-            out.append((verb, board, targets))
+            out.append((verb, board, targets, assignees))
     return out
 
 
-def _check_side_door(verb: str, board: Board, targets: list[str]) -> None:
+def _check_side_door_assignees(verb: str, assignees: list) -> None:
+    """Finding 2: the installed-prefix rule applies to the terminal verbs that
+    set an assignee, for EVERY card, whether or not it carries a stage skill.
+
+    `hermes kanban create --assignee qa` and `hermes kanban assign <card> qa`
+    both make the dispatcher spawn the unprefixed `qa` profile, which runs
+    with no dev-team gate -- the same hole `check_create` closes on the tool
+    path. `none` is the CLI's unassign sentinel, not a profile name, so it is
+    let through.
+    """
+    for assignee in assignees:
+        if isinstance(assignee, str) and _normalize_profile_name(assignee) == _UNASSIGN:
+            continue
+        msg = _check_assignee(assignee, f"hermes kanban {verb}")
+        if msg:
+            raise _Refuse(msg)
+
+
+def _check_side_door(verb: str, board: Board, targets: list[str],
+                     assignees: list | None = None) -> None:
     """Refuse a side-door verb unless every TARGET card can be read and is
     not a dev-team card (and, for `unblock`/`promote`, is not waiting on a
-    human with kind `needs_input`: `promote` is also an unblock)."""
+    human with kind `needs_input`: `promote` is also an unblock).
+
+    The assignee check runs first and is independent of the target card: see
+    `_check_side_door_assignees`.
+    """
+    _check_side_door_assignees(verb, assignees or [])
+    if verb in _SIDE_DOOR_NO_TARGET:
+        return
     if not targets:
         raise _Refuse(f"guard: cannot tell which card `hermes kanban {verb}` targets; refusing")
     for target in targets:
@@ -1588,6 +1722,12 @@ def _check_terminal(board, task_id, command, open_board=None):
                     f"{MERGE_LABEL}: `git push` to {dst!r}, the default branch, is "
                     f"human-only. Push the feature branch and let the PR carry the change."
                 )
+        # Ordering is load-bearing: the protected-destination loop runs first,
+        # so a non-stage card pushing main/master keeps its existing
+        # `merge: human-only` message byte for byte and this refusal covers
+        # only the pushes that would otherwise have been allowed.
+        if card.stageless():
+            raise _Refuse(_non_stage_push_refusal(task_id))
 
     if parse_error is not None and card.guarded():
         raise _Refuse(
@@ -1595,12 +1735,12 @@ def _check_terminal(board, task_id, command, open_board=None):
             f"({parse_error}); refusing. Quote it so it tokenises."
         )
     for argv in commands:
-        for verb, board_name, targets in _side_doors(argv):
+        for verb, board_name, targets, assignees in _side_doors(argv):
             if board_name is None or open_board is None:
                 target_board = board
             else:
                 target_board = open_board(board_name)
-            _check_side_door(verb, target_board, targets)
+            _check_side_door(verb, target_board, targets, assignees)
     return None
 
 
@@ -1624,6 +1764,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 FORGE_DIR = PLUGIN_DIR.parent.parent / "forge"
 
 _FORGE: tuple | None = None  # (forge_core module, adapter registry), loaded once
+_FORGE_CORE = None  # the forge_core module alone, loaded once
 _FORGE_LOCK = threading.Lock()
 
 
@@ -1642,16 +1783,30 @@ def _import_path(name: str, path: Path, package: bool = False):
     return module
 
 
-def _load_forge():
-    """(forge_core, {vendor: adapter class}) imported by path from FORGE_DIR."""
-    global _FORGE
+def _forge_core():
+    """The `forge_core` module, imported by path from FORGE_DIR and cached.
+
+    Separate from `_load_forge` so `redact` (which needs nothing else) does
+    not depend on the vendor adapter package importing cleanly.
+    """
+    global _FORGE_CORE
     with _FORGE_LOCK:
-        if _FORGE is None:
+        if _FORGE_CORE is None:
             if not (FORGE_DIR / "forge_core.py").is_file():
                 raise FileNotFoundError(
                     f"forge not found next to the plugin at {FORGE_DIR} (a copied, not "
                     f"linked, plugin cannot verify CI)")
-            core = _import_path("_dev_team_gate_forge_core", FORGE_DIR / "forge_core.py")
+            _FORGE_CORE = _import_path("_dev_team_gate_forge_core",
+                                       FORGE_DIR / "forge_core.py")
+        return _FORGE_CORE
+
+
+def _load_forge():
+    """(forge_core, {vendor: adapter class}) imported by path from FORGE_DIR."""
+    global _FORGE
+    core = _forge_core()
+    with _FORGE_LOCK:
+        if _FORGE is None:
             pkg = _import_path("_dev_team_gate_forge_adapters",
                                FORGE_DIR / "adapters" / "__init__.py", package=True)
             _FORGE = (core, dict(pkg.ADAPTERS))
@@ -1724,6 +1879,107 @@ def forge_pr_status(slug: str, pr_url: str) -> dict:
     return ForgeReader().pr_status(slug, pr_url)
 
 
+# ---------------------------------------------------------------------------
+# kanban_create: the new card's assignee must be an installed dev-team profile.
+# ---------------------------------------------------------------------------
+
+PREFIX_FILE = "dev-team-prefix"
+# `hermes kanban assign|reassign <card> none` unassigns; it names no profile.
+_UNASSIGN = "none"
+
+
+def _normalize_profile_name(name: str) -> str:
+    """Hermes' own `profiles.normalize_profile_name`: strip, then lower-case.
+
+    Both sides of the prefix comparison go through this. An assignee is
+    lower-cased before Hermes stores it, so `Dev-qa` IS the installed
+    `dev-qa`, and an upper-case `--prefix` install must be able to create its
+    own pipeline cards.
+    """
+    return name.strip().lower()
+
+
+def _prefix_refusal(assignee: str, prefix: str, surface: str = "kanban_create") -> str:
+    return (
+        f"guard: {surface} assignee '{assignee}' does not start with the installed "
+        f"team prefix '{prefix}'; refusing. A bare or unprefixed role name makes the "
+        f"dispatcher spawn a different, unguarded profile, so the card would run with no "
+        f"dev-team gate. Use '{prefix}{assignee}'. A fence that blocks you is a reason to "
+        f"kanban_block(kind=\"needs_input\") and ask, never something to remove."
+    )
+
+
+def _prefix_unreadable_refusal(path, reason: str, surface: str = "kanban_create") -> str:
+    return (
+        f"guard: cannot read the installed team prefix from {path}, so {surface} "
+        f"cannot be verified; refusing ({reason}). A fence that blocks you is a reason to "
+        f"kanban_block(kind=\"needs_input\") and ask, never something to remove."
+    )
+
+
+def _installed_prefix() -> str:
+    """The team prefix the installer wrote to `$HERMES_HOME/dev-team-prefix`.
+
+    Trailing whitespace and the trailing newline are stripped. Raises when the
+    file is missing, unreadable or empty after stripping; the caller turns
+    that into a refusal, because a missing prefix file must never become a
+    bypass.
+    """
+    text = (_hermes_home() / PREFIX_FILE).read_text(encoding="utf-8")
+    prefix = text.strip()
+    if not prefix:
+        raise ValueError("the file is empty")
+    return prefix
+
+
+def _check_assignee(assignee, surface: str) -> str | None:
+    """The one prefix rule, shared by the `kanban_create` tool and the
+    terminal verbs that set an assignee (`hermes kanban create --assignee`,
+    `assign`, `reassign`).
+
+    `surface` only names the caller in the refusal. Fails closed: an
+    unreadable prefix file refuses rather than becoming a bypass, and that
+    check comes first, since with no prefix there is nothing to compare
+    against.
+    """
+    path = _hermes_home() / PREFIX_FILE
+    try:
+        prefix = _installed_prefix()
+    except Exception as exc:
+        return _prefix_unreadable_refusal(path, _describe(exc), surface)
+    if not isinstance(assignee, str) or not assignee.strip():
+        return _prefix_refusal("" if assignee is None else str(assignee), prefix, surface)
+    if not _normalize_profile_name(assignee).startswith(_normalize_profile_name(prefix)):
+        return _prefix_refusal(assignee, prefix, surface)
+    return None
+
+
+def check_create(args: dict) -> str | None:
+    """`kanban_create` whose `assignee` is not a prefixed dev-team profile.
+
+    A bare role name (`assignee="qa"`) makes the dispatcher spawn the
+    unprefixed `qa` profile -- another team's worker, or an unguarded root
+    profile -- so the new card would run with no dev-team gate at all.
+
+    Two deliberate properties, both tested:
+
+    * Not gated on the *creating* card's stage. A card with no skills, or with
+      an unknown `dev-team-stage-*` skill, must not be able to create an
+      unguarded card either, so this check consults no board and runs for
+      every `kanban_create`.
+    * The comparison is case-INSENSITIVE, on both sides, through
+      `_normalize_profile_name` (Hermes' own `profiles.normalize_profile_name`
+      transcribed). Hermes lower-cases an assignee before storing it, so
+      `Dev-qa` resolves to the installed `dev-qa` -- it is not some other
+      profile -- and an operator who installed with `--prefix T2-` must be
+      able to create `T2-qa` cards. This now agrees with `protected()`
+      (which casefolds branch names) and with `_protected_path`
+      (case-insensitive).
+    """
+    return _check_assignee(
+        args.get("assignee") if isinstance(args, dict) else None, "kanban_create")
+
+
 def _make_board(board: str | None) -> Board:
     return KanbanBoard(board)
 
@@ -1733,13 +1989,18 @@ def _block(message: str) -> dict:
 
 
 def pre_tool_call(tool_name, args, **kw):
-    """Hermes `pre_tool_call` hook. Only `kanban_complete` and `terminal` are
-    checked; every other tool (`kanban_block` included) passes untouched."""
-    if tool_name not in ("kanban_complete", "terminal"):
+    """Hermes `pre_tool_call` hook. Only `kanban_complete`, `kanban_create` and
+    `terminal` are checked; every other tool (`kanban_block` included) passes
+    untouched."""
+    if tool_name not in ("kanban_complete", "kanban_create", "terminal"):
         return None
     try:
         args = args if isinstance(args, dict) else {}
-        if tool_name == "kanban_complete":
+        if tool_name == "kanban_create":
+            # No board read: this check must hold for the creating card
+            # whatever (or whether) its stage skill is.
+            msg = check_create(args)
+        elif tool_name == "kanban_complete":
             # Resolve the id the way kanban_complete does: args first, then the env.
             task_id = args.get("task_id") or os.environ.get("HERMES_KANBAN_TASK")
             if not isinstance(task_id, str) or not task_id:

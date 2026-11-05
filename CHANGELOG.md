@@ -7,6 +7,157 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`forge` honours `DEV_TEAM_GH_TOKEN`.** The GitHub adapter's single subprocess choke point,
+  `GithubAdapter._gh`, now passes an explicit environment to `gh`: when `DEV_TEAM_GH_TOKEN` is
+  set and non-empty and `GH_TOKEN` is unset or empty, `GH_TOKEN` is set from it **for that
+  subprocess only**. `os.environ` is never mutated, the value never reaches argv (which the
+  `dev-team-gate` guard lexes) and is never printed or logged; an existing `GH_TOKEN` always
+  wins, so an operator's own configuration is untouched. Without a token configured, behaviour
+  is exactly as before. The module docstring no longer claims the adapter reads no token
+  itself. (#15)
+- **The `pr-ci` stage skill documents how the forge credential reaches a worker.**
+  `export GH_TOKEN="$DEV_TEAM_GH_TOKEN"` followed by `gh auth setup-git`, and nothing else. This
+  mechanism was chosen over a `GIT_ASKPASS` helper for three verified reasons: `gh auth
+  setup-git` writes only `credential.*` git-config keys, which is not among the key prefixes the
+  guard refuses as push-redirecting (`alias.`, `remote.`, `push.`, `branch.`, `include.`,
+  `includeif.`, `url.`), whereas `GIT_ASKPASS` needs a helper **script file on disk**; `gh` reads
+  `GH_TOKEN` from the environment, so the value never appears in a command line; and `GH_TOKEN`
+  is not a `HERMES_*` variable, so exporting it touches no Hermes fence. The skill states the
+  token is passed **by reference** only — never echoed, never interpolated into a URL, never
+  written to a file — and that a missing or empty `DEV_TEAM_GH_TOKEN` is a
+  `kanban_block(kind="needs_input")` labelled `setup: no-forge-token` with **no** fallback to
+  `gh auth login`, a stored credential, a keyring, SSH, or `GITHUB_TOKEN`. (#15)
+- **The installers wire up the forge credential: `--forge-token-source COMMAND` (Unix) /
+  `-ForgeTokenSource COMMAND` (Windows, refused).** The `pr-ci` stage skill already promised
+  these two flag names, and neither installer had them, so the credential the whole stage
+  depends on had no documented way in. **Unix only** actually configures anything: the flag
+  records `COMMAND` as the `<prefix>devops` profile's `secrets.command.command` **and** sets
+  `secrets.command.enabled true` — Hermes' `CommandSource` requires both leaf keys (`enabled`
+  defaults to `false`, and a bare `secrets.command` string is refused once the key already holds
+  a correct mapping) — and **appends** `DEV_TEAM_GH_TOKEN` to that profile's
+  `terminal.env_passthrough`, so a name already in that list is kept. The profile name is derived
+  from the installed prefix, so a `--prefix t2-` install configures `t2-devops`, never a
+  hardcoded `dev-devops`. `hermes config set` merges into the existing config, the write of the
+  two leaf keys is idempotent even over an already-correct mapping, and the list merge is one
+  shared implementation, `dev-team/scripts/env_passthrough_merge.py`, called by both installers
+  (it fails closed on malformed input rather than silently treating it as an empty list).
+  Re-running with the same `COMMAND` is a no-op; a different `COMMAND` replaces only
+  `secrets.command.command`. A `COMMAND` containing a literal token shape (reusing `forge_core.py`'s
+  `github_pat_`/`gh[pours]_` patterns) is refused outright, exit 2, before anything is written —
+  so neither `--dry-run` output nor the config can ever hold a token. **`-ForgeTokenSource` on
+  the Windows installer is refused outright, exit 2, nothing written:** Hermes' `command` secret
+  source is POSIX-only (it shells out to `/bin/sh`), so the flag would otherwise record devops
+  profile config Hermes running on Windows can never read — a failure that would only surface
+  much later as a `pr-ci` card blocking with "no forge token", disconnected from its install-time
+  cause. **Only the command string is ever stored, and this installer itself never executes
+  `COMMAND`** — not to a config, not to stdout, and not under `--dry-run`. Once the source is
+  enabled, though, Hermes itself runs the helper at the start of every later
+  `hermes -p <prefix>devops ...` call the install makes and discards its stderr, so the value
+  still never leaks, but it is not true that nothing ever runs `COMMAND`. A canary test asserts a
+  sentinel token value appears in no file the installer writes and in neither stdout nor stderr,
+  on a real run and under `--dry-run`, and that the command was not run; a separate test runs the
+  real `hermes config set` against a real Hermes install and confirms the registry reports
+  `command` enabled (skipped cleanly when Hermes is not importable). The flag is documented in
+  `dev-team/README.md` and `docs/how-the-dev-team-works.md`; with `--only` excluding `devops` the
+  Unix installer says on stderr that there was no profile to configure rather than silently doing
+  nothing. (#15)
+
+### Changed
+
+- **`git push` from a card with no dev-team stage skill is now refused.** Such a card has no
+  intake ancestor, so the guard cannot resolve a project for it and `_CardState.protected()`
+  fell back to `{main, master}` — which let a push through to a project whose recorded default
+  branch is something else (`develop`, say). Rather than give `protected()` a second
+  project-resolution path fed by an input the worker controls (a card's `workspace_path` is
+  editable via `hermes kanban edit`, which is permitted against a non-stage card), the push
+  itself is refused: the branch it would create is one no `validate`, `review` or `pr-ci` card
+  owns. `_ALWAYS_PROTECTED`, `protected()`, `guarded()`, `project_slug()`,
+  `_record_default_branch()` and `stage_from_skills()` are all unchanged. The new check runs
+  **after** the existing protected-destination check, so a non-stage card pushing `main` or
+  `master` keeps its `merge: human-only` message byte for byte. Local commits, branches and all
+  read-only git are unaffected, and **no card at all** (`HERMES_KANBAN_TASK` unset — an
+  interactive operator shell) is deliberately unchanged, since there is no board-side identity
+  to resolve a project from and refusing it would break every interactive session. (#15)
+- **`kanban_create` is now checked: the new card's `assignee` must carry the installed team
+  prefix.** A bare role name (`assignee="qa"`) makes the dispatcher spawn the unprefixed `qa`
+  profile — another team's worker, or an unguarded root profile — so the created card would run
+  with no dev-team gate at all. The prefix is read from `$HERMES_HOME/dev-team-prefix`, what the
+  installer writes, and the comparison is **case-insensitive on both sides**
+  (`.strip().lower()`, matching Hermes' own `profiles.normalize_profile_name`): Hermes
+  lower-cases an assignee before storing it, so under prefix `dev-` an assignee `Dev-qa`
+  resolves to the installed `dev-qa` and is accepted, and an operator who installed with
+  `--prefix T2-` can create `T2-qa` cards. (This now agrees with branch handling, which
+  casefolds, and with the protected-path check, which is case-insensitive.) It **fails closed**:
+  a missing, unreadable or empty prefix file refuses the create rather than becoming a bypass.
+  The check consults no board and is not gated on the creating card's stage, so a card with no
+  skills or with an unknown `dev-team-stage-*` skill cannot bypass it; the plugin still declares
+  only the `pre_tool_call` hook. (#15)
+- **The assignee prefix rule now covers the terminal too.** `hermes kanban create --assignee`
+  was not a side-door verb at all, and `hermes kanban assign` / `reassign` refused only when
+  the *target card* carried a stage skill — so a worker could hand an ordinary card to the
+  unprefixed, unguarded `qa` profile from a shell and bypass `check_create` entirely. `create`
+  is now in `_SIDE_DOOR_VERBS` (with its own exact option allowlist for the fallback parser, and
+  no target card, since it makes one), and the one prefix rule (`_check_assignee`) is applied to
+  the assignee of `create`, `assign` and `reassign` for **every** card, stage skill or not,
+  before any board read. Both parse paths are covered: Hermes' own `kanban` argparse tree when
+  `hermes_cli` can be imported, and the strict fallback otherwise. `none` — the CLI's unassign
+  sentinel — is let through; a `create` with no assignee at all is refused, exactly as the tool
+  path refuses it. The pre-existing stage-card refusal on `assign`/`reassign` is unchanged and
+  still applies on top. (#15)
+- **`dev-team-prefix` is now a protected path.** `_PROTECTED_PATHS` trusted the forge, the
+  plugin and the project records, but not the file the prefix check itself reads — so a worker
+  could rewrite `$HERMES_HOME/dev-team-prefix` and then assign itself any profile it liked,
+  defeating the rule above. The **unanchored** variant is the right one here: the file lives in
+  a profile directory under `$HERMES_HOME`, not inside a repo, so there is no relative
+  `dev-team-prefix` path in a clone of this repository for the anchored form (the N5 carve-out
+  for `dev-team/forge` and `dev-team/plugin`) to protect. Reads are still allowed; any
+  non-read-only command naming it is refused. (#15)
+- **`redact()` also removes the literal token values.** The `_SECRET_SUBSTITUTIONS` shapes are a
+  heuristic about what a credential looks like; whenever `DEV_TEAM_GH_TOKEN` or `GH_TOKEN` is
+  set and non-blank, the operator's actual value is known exactly. Those literals are now
+  stripped **on top of** (never instead of) the shape match, by literal string replacement so a
+  value containing regex metacharacters is handled, and a blank value is skipped — replacing
+  `" "` would rewrite every space in the message. A forge whose tokens do not match a GitHub
+  shape, or a vendor that changes its prefixes, can therefore no longer leak a value verbatim
+  through `forge`'s JSON error. (#15)
+- **The guard redacts `_describe(exc)` before the agent sees it.** Every fail-closed refusal
+  embeds an exception string — a `gh` failure, a git error, a forge response — and that text went
+  to the worker unfiltered. It now goes through `forge_core.redact` (imported by path, like
+  every other forge read, through a new core-only loader so `redact` does not depend on the
+  vendor adapter package importing cleanly); if the forge cannot be imported at all the
+  description becomes `<redaction unavailable>` rather than unredacted text. Truncation to
+  `_DETAIL_MAX` is unchanged. (#15)
+- **`running-the-pipeline` states `--default-workdir` as a requirement**, not just an example,
+  and says why `pr-ci` depends on it: cards inherit their workspace from the board's
+  `default_workdir`, so a board created without it leaves `pr-ci` with no clone to push from —
+  it blocks and the PR is never opened, after plan, implement, validate and review have all been
+  paid for. `pr-ci` will not fall back to the operator's own checkout, and no later step can set
+  the value, so such a board has to be recreated. (#15)
+
+### Fixed
+
+- **`redact()` missed a bare GitHub token.** `_SECRET_SUBSTITUTIONS` covered `token=<value>` and
+  `Bearer <value>`, so a token appearing on its own in a `gh` error message — "failed to
+  authenticate with ghp_…", which becomes `forge`'s JSON error through `_emit_error` → `redact`
+  — was printed in full. Both GitHub token shapes are now redacted: `gh[pours]_<body>` (classic,
+  OAuth, user-to-server, server-to-server, refresh) and `github_pat_<body>` (fine-grained),
+  case-insensitively and by prefix rather than exact length, so a future length change cannot
+  silently un-redact one. (#15)
+
+### Known issues
+
+- **`gh repo sync` can write a remote branch when the clone's `origin` is a fork.** The `pr-ci`
+  stage skill tells devops to sync before pushing, and `gh repo sync` with no explicit
+  `--source`/`--branch` will update a branch on the *fork's* remote — a remote write the guard
+  does not inspect, since it sees `gh repo sync` and not a `git push`. This **predates PR #15**
+  (the command and the skill text both do) and is deliberately **out of scope** here: PR #15
+  fixes the five findings of its own independent review and nothing else. It is recorded so the
+  next change to the `pr-ci` stage does not have to rediscover it. Branch protection on the
+  default branch, and a forge token without merge rights, remain the controls that actually
+  bound this (see `dev-team/README.md`, "Required controls"). (#15)
+
 ## [1.3.2] - 2026-11-04
 
 ### Changed

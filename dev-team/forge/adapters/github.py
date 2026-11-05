@@ -1,11 +1,16 @@
 """GitHub adapter: the ``gh`` CLI for pull requests, ``gh api`` for CI.
 
-Credentials are gh's own login (``gh auth login``); this adapter never
-reads or writes a token itself.
+Credentials are gh's own login (``gh auth login``), or ``GH_TOKEN`` in the
+environment. As a convenience for the dev-team pipeline, when
+``DEV_TEAM_GH_TOKEN`` is set and ``GH_TOKEN`` is not, this adapter passes it
+through as ``GH_TOKEN`` **for the ``gh`` subprocess only** (see ``_gh_env``):
+``os.environ`` is never mutated, the value never reaches argv, and it is never
+printed or logged. An existing ``GH_TOKEN`` always wins.
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import urllib.request as urllib_request
 from pathlib import Path
@@ -66,8 +71,29 @@ class GithubAdapter:
     def detect(self, repo_dir) -> bool:
         return detect_from_remote_url(self._remote_url(repo_dir)) == self.name
 
+    def _gh_env(self) -> dict:
+        """The environment for a `gh` subprocess.
+
+        A copy of `os.environ` with `GH_TOKEN` filled in from
+        `DEV_TEAM_GH_TOKEN` when, and only when, `gh` has no token of its own.
+        The token is passed by reference through the child's environment, so
+        it never appears in argv (which the dev-team guard lexes) and never
+        lands on disk. `os.environ` is left untouched: the value is visible to
+        this one subprocess and nothing else. An existing, non-empty
+        `GH_TOKEN` always wins, so an operator's own configuration is never
+        overridden.
+        """
+        env = dict(os.environ)
+        if not env.get("GH_TOKEN"):
+            token = env.get("DEV_TEAM_GH_TOKEN") or ""
+            if token:
+                env["GH_TOKEN"] = token
+        return env
+
     def _gh(self, args, timeout=30):
-        result = self._run(args, capture_output=True, text=True, timeout=timeout)
+        result = self._run(
+            args, capture_output=True, text=True, timeout=timeout, env=self._gh_env()
+        )
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or f"{args[0]} failed").strip())
         return result.stdout

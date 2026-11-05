@@ -39,6 +39,17 @@ class _Base(HomeMixin, unittest.TestCase):
             with self.subTest(caller=caller, cmd=cmd):
                 self.assertIsNone(terminal(self.b, caller, cmd))
 
+    def allowed_for(self, cmd, callers):
+        """`allowed` over a subset of CALLERS. Needed since decision 1 (option
+        B): `t_misc` -- on the board, no dev-team stage skill -- can no longer
+        push at all, so it is not a valid caller for a push that is otherwise
+        allowed. Other classes in this file still rely on module-level
+        CALLERS, so narrow per test rather than mutating it.
+        """
+        for caller in callers:
+            with self.subTest(caller=caller, cmd=cmd):
+                self.assertIsNone(terminal(self.b, caller, cmd))
+
 
 # ---------------------------------------------------------------------------
 # #1 push bypasses
@@ -136,6 +147,13 @@ class PushBypassTests(_Base):
         self.refused("echo main | xargs git push origin feat", MERGE)
 
     def test_feature_branch_push_still_allowed(self):
+        """A feature-branch push stays allowed for an interactive session and
+        for a real stage card. Since decision 1 (option B) `t_misc` -- on the
+        board with no dev-team stage skill -- is refused instead.
+
+        `git push origin --tags` is listed separately: it names no branch, so
+        it produces no push destination and never reaches either check.
+        """
         for cmd in (
             "git push origin feat",
             "git push origin feat:feat",
@@ -144,10 +162,13 @@ class PushBypassTests(_Base):
             "git push origin refs/heads/feat:refs/heads/feat",
             "git push origin HEAD:refs/heads/feat",
             "git -C repo push origin feat",
-            "git push origin --tags",
         ):
             with self.subTest(cmd=cmd):
-                self.allowed(cmd)
+                self.allowed_for(cmd, (None, "t_impl1"))
+                msg = terminal(self.b, "t_misc", cmd)
+                self.assertIsInstance(msg, str, f"allowed: {cmd!r} from t_misc")
+                self.assertEqual(msg, guard_mod._non_stage_push_refusal("t_misc"))
+        self.allowed("git push origin --tags")
 
     def test_ordinary_git_still_allowed(self):
         for cmd in (

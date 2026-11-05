@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from board import TaskView, implement_rounds, project_slug  # noqa: E402
 from guard import check_complete  # noqa: E402
 
+import guard as guard_mod  # noqa: E402
+
 SHA = "9f4cbf1a2b3c4d5e6f708192a3b4c5d6e7f80912"
 OTHER_SHA = "0123456789abcdef0123456789abcdef01234567"
 SLUG = "widgets"
@@ -692,13 +694,88 @@ class PushTests(HomeMixin, unittest.TestCase):
                 self.assertIsNone(terminal(b, "t_impl1", cmd))
 
     def test_push_without_card_protects_main_and_master(self):
+        """With no card at all (an interactive session) main/master are protected
+        and a feature branch is allowed. `t_misc` -- a card on the board with no
+        dev-team stage skill -- keeps the identical main/master message, but
+        since decision 1 (option B) can no longer push a feature branch either.
+        The `None` case is the invariant that interactive sessions keep working;
+        do not delete it.
+        """
         b = guarded_board("develop", home=self.home)
         for task_id in (None, "t_misc"):
             with self.subTest(task_id=task_id):
                 self.assertTrue(terminal(b, task_id, "git push origin main").startswith(MERGE))
                 self.assertTrue(terminal(b, task_id, "git push origin master").startswith(MERGE))
                 self.assertTrue(terminal(b, task_id, "git push").startswith(MERGE))
-                self.assertIsNone(terminal(b, task_id, "git push origin feat/x"))
+        self.assertIsNone(terminal(b, None, "git push origin feat/x"))
+        self.assertEqual(terminal(b, "t_misc", "git push origin feat/x"),
+                         guard_mod._non_stage_push_refusal("t_misc"))
+
+    def test_push_from_non_stage_card_to_recorded_default_branch_refused(self):
+        """Decision 1 (option B): the project's recorded default branch is
+        protected against a card with no stage skill without the guard ever
+        resolving a project for that card.
+
+        `protected()` is only widened past {main, master} for a guarded card,
+        so before this change `git push origin develop` from `t_misc` was
+        allowed even though `develop` is the project's default branch.
+        """
+        b = guarded_board("develop", home=self.home)
+        msg = terminal(b, "t_misc", "git push origin develop")
+        self.assertIsInstance(msg, str)
+        self.assertEqual(msg, guard_mod._non_stage_push_refusal("t_misc"))
+        self.assertTrue(msg.startswith("guard: "), msg)
+        self.assertIn("t_misc", msg)
+        self.assertIn("no dev-team stage skill", msg)
+        # A stage card on the same board still gets the pre-existing message
+        # for the same destination: no existing refusal changed.
+        self.assertTrue(terminal(b, "t_impl1", "git push origin develop").startswith(MERGE))
+
+    def test_push_from_non_stage_card_to_feature_branch_refused(self):
+        """And to a feature branch -- but this is not a blanket "not a stage
+        card" rule: no card at all, and a real stage card, are unchanged."""
+        b = guarded_board("develop", home=self.home)
+        self.assertEqual(terminal(b, "t_misc", "git push origin feat/x"),
+                         guard_mod._non_stage_push_refusal("t_misc"))
+        self.assertIsNone(terminal(b, None, "git push origin feat/x"))
+        self.assertIsNone(terminal(b, "t_impl1", "git push origin feat/x"))
+
+    def test_push_from_non_stage_card_still_fails_closed_on_board_failure(self):
+        """Case 3 of the boundary table: a board read that fails refuses from
+        `guarded()`, not from the new helper."""
+        b = guarded_board("develop", home=self.home)
+        b.fail = OSError("database is locked")
+        msg = terminal(b, "t_misc", "git push origin feat/x")
+        self.assertIsInstance(msg, str)
+        self.assertTrue(msg.startswith("guard: "), msg)
+        self.assertIn("cannot tell whether card", msg)
+        self.assertIn("database is locked", msg)
+
+    def test_push_from_card_not_on_the_board_fails_closed(self):
+        """Case 3, other half: a card id the board does not know refuses."""
+        b = guarded_board("develop", home=self.home)
+        msg = terminal(b, "t_nosuch", "git push origin feat/x")
+        self.assertIsInstance(msg, str)
+        self.assertIn("cannot tell whether card", msg)
+
+    def test_push_from_card_with_unknown_stage_skill_still_fails_closed(self):
+        """The `ValueError` fail-closed on an *unknown* dev-team stage skill is
+        untouched: it must keep refusing from `guarded()`, not fall through to
+        the new non-stage refusal."""
+        b = guarded_board("develop", home=self.home)
+        b.add("t_weird", None, extra_skills=["dev-team-stage-nonesuch"])
+        msg = terminal(b, "t_weird", "git push origin feat/x")
+        self.assertIsInstance(msg, str)
+        self.assertIn("cannot tell whether card", msg)
+        self.assertNotEqual(msg, guard_mod._non_stage_push_refusal("t_weird"))
+
+    def test_non_stage_card_keeps_local_git_and_reads(self):
+        """Only the push is refused: local work and read-only git still pass."""
+        b = guarded_board("develop", home=self.home)
+        for cmd in ("git commit -m wip", "git switch -c feat/x", "git status",
+                    "git log --oneline -5", "git fetch origin"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(terminal(b, "t_misc", cmd))
 
     def test_push_on_guarded_card_without_record_fails_closed(self):
         b = guarded_board(default_branch=None, home=self.home)  # no record written
@@ -830,13 +907,26 @@ class PreToolCallTests(HomeMixin, unittest.TestCase):
         self.assertEqual(self.made, ["proj-b"])
 
     def test_kanban_block_never_guarded(self):
+        """Tools other than kanban_complete, kanban_create and terminal pass
+        untouched, and none of them opens a board.
+
+        `kanban_create` moved out of this list in 1.3.3 (M3): its assignee is
+        now checked. It still opens no board -- see the `self.made` assertion
+        below -- so a board failure cannot affect it.
+        """
         os.environ["HERMES_KANBAN_TASK"] = "t_impl1"
         self.board.fail = OSError("database is locked")
-        for tool in ("kanban_block", "kanban_comment", "kanban_create", "read_file"):
+        for tool in ("kanban_block", "kanban_comment", "read_file"):
             with self.subTest(tool=tool):
                 self.assertIsNone(guard_mod.pre_tool_call(
                     tool, {"task_id": "t_impl1", "reason": "review: rounds-exhausted",
                            "command": "hermes kanban complete t_impl1"}))
+        # kanban_create is checked now, and fails closed here because this
+        # test's HERMES_HOME has no dev-team-prefix file.
+        out = guard_mod.pre_tool_call("kanban_create", {"title": "t", "assignee": "dev-qa"})
+        self.assertIsInstance(out, dict)
+        self.assertTrue(out["message"].startswith(
+            "guard: cannot read the installed team prefix from "), out)
         self.assertEqual(self.made, [])
 
     def test_terminal_dispatch(self):

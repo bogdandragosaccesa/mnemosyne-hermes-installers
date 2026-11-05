@@ -1,12 +1,14 @@
 """Tests for forge_core: project record and vendor-neutral CLI contract."""
 import io
 import json
+import os
 import stat
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -490,6 +492,111 @@ class PrStatusTests(unittest.TestCase):
                 code, out = self.run_pr_status("1", adapter)
                 self.assertEqual(code, EXIT_UNVERIFIABLE)
                 self.assertIn("error", json.loads(out))
+
+
+class GithubTokenRedactTests(unittest.TestCase):
+    """M1: `redact()` covers bare GitHub token shapes, not only `token=<value>`."""
+
+    def test_redact_strips_bare_classic_token_shapes(self):
+        for prefix in ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"):
+            with self.subTest(prefix=prefix):
+                secret = prefix + "C" * 36
+                redacted = redact(f"gh: failed to authenticate with {secret}; retry")
+                self.assertNotIn(secret, redacted)
+                self.assertIn("retry", redacted)
+
+    def test_redact_strips_bare_fine_grained_pat(self):
+        secret = "github_pat_" + "D" * 22 + "_" + "E" * 59
+        redacted = redact("remote: Invalid credentials " + secret)
+        self.assertNotIn(secret, redacted)
+
+    def test_redact_is_case_insensitive_on_the_prefix(self):
+        secret = "GHP_" + "F" * 36
+        self.assertNotIn(secret, redact("error " + secret))
+
+    def test_redact_leaves_ordinary_text_alone(self):
+        text = "pull request #15 is not mergeable: ghost branch missing"
+        self.assertEqual(redact(text), text)
+
+
+class EnvTokenRedactTests(unittest.TestCase):
+    """Finding 5 of the PR #15 review: the token shapes are a heuristic, but
+    the operator's ACTUAL token value is known exactly whenever
+    `DEV_TEAM_GH_TOKEN` or `GH_TOKEN` is set. Redact those literals too, on
+    top of (never instead of) the shape match -- a forge that mints
+    non-GitHub-shaped credentials, or a vendor that changes its prefixes,
+    otherwise leaks the value verbatim into a `forge` error.
+    """
+
+    LITERAL = "zzz-opaque-credential-value-9876"
+
+    def _with(self, **env):
+        return mock.patch.dict(os.environ, env)
+
+    def test_dev_team_token_value_is_redacted(self):
+        with self._with(DEV_TEAM_GH_TOKEN=self.LITERAL):
+            out = redact(f"remote: rejected using {self.LITERAL} as the password")
+        self.assertNotIn(self.LITERAL, out)
+        self.assertIn("remote: rejected using", out)
+
+    def test_gh_token_value_is_redacted(self):
+        with self._with(GH_TOKEN=self.LITERAL):
+            self.assertNotIn(self.LITERAL, redact("auth error " + self.LITERAL))
+
+    def test_both_variables_are_covered_at_once(self):
+        other = "another-opaque-value-5432"
+        with self._with(DEV_TEAM_GH_TOKEN=self.LITERAL, GH_TOKEN=other):
+            out = redact(f"{self.LITERAL} and {other}")
+        self.assertNotIn(self.LITERAL, out)
+        self.assertNotIn(other, out)
+
+    def test_every_occurrence_is_replaced(self):
+        with self._with(DEV_TEAM_GH_TOKEN=self.LITERAL):
+            out = redact(f"{self.LITERAL} / {self.LITERAL}")
+        self.assertNotIn(self.LITERAL, out)
+
+    def test_the_shape_match_still_applies_on_top(self):
+        """Additive, not a replacement: a bare `ghp_` token is still redacted
+        when the env vars are unset or hold something else."""
+        shaped = "ghp_" + "A" * 36
+        with self._with(DEV_TEAM_GH_TOKEN=self.LITERAL):
+            out = redact(f"{shaped} and {self.LITERAL}")
+        self.assertNotIn(shaped, out)
+        self.assertNotIn(self.LITERAL, out)
+
+    def test_an_unset_or_empty_variable_changes_nothing(self):
+        text = "the sky is blue and empty"
+        for env in ({}, {"DEV_TEAM_GH_TOKEN": ""}, {"GH_TOKEN": ""},
+                    {"DEV_TEAM_GH_TOKEN": "   "}):
+            with self.subTest(env=env):
+                patcher = mock.patch.dict(os.environ, env, clear=True)
+                with patcher:
+                    self.assertEqual(redact(text), text)
+
+    def test_a_whitespace_only_value_is_not_treated_as_a_secret(self):
+        """Otherwise every space in the message would be redacted."""
+        with mock.patch.dict(os.environ, {"DEV_TEAM_GH_TOKEN": " "}, clear=True):
+            self.assertEqual(redact("a b c"), "a b c")
+
+    def test_a_regex_special_value_is_matched_literally(self):
+        literal = "a.*b+c?(d)[e]"
+        with self._with(DEV_TEAM_GH_TOKEN=literal):
+            out = redact(f"failed with {literal} here")
+        self.assertNotIn(literal, out)
+        self.assertIn("here", out)
+
+    def test_an_error_emitted_by_the_cli_is_redacted(self):
+        """The whole point: `_emit_error` -> `redact` is the only path a
+        `forge` error takes to stdout."""
+        out = io.StringIO()
+        with self._with(DEV_TEAM_GH_TOKEN=self.LITERAL):
+            rc = main(["pr-status", "--slug", self.LITERAL, "--pr", "1"],
+                      home=Path("/nonexistent-forge-home"), adapters={}, out=out)
+        self.assertEqual(rc, EXIT_UNVERIFIABLE)
+        # The slug is echoed in `no project record for slug ...`; with the
+        # value in the environment that echo is a credential leak.
+        self.assertIn("no project record", out.getvalue())
+        self.assertNotIn(self.LITERAL, out.getvalue())
 
 
 if __name__ == "__main__":

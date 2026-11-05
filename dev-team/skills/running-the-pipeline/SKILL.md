@@ -34,6 +34,26 @@ TEAM_HOME="$(cd "$HERMES_HOME/dev-team" && pwd -P)"
 hermes kanban boards create <repo-slug> --name "<repo> dev-team pipeline" --default-workdir "$TEAM_HOME/repos/<repo-slug>"
 ```
 
+**`--default-workdir` is required, not optional.** A board created without it cannot run this
+pipeline to the end, and the failure surfaces late — at `pr-ci`, after plan, implement, validate
+and review have all been paid for:
+
+- `pr-ci` pushes the branch and opens the PR from the team's own clone at
+  `$TEAM_HOME/repos/<repo-slug>`. Cards inherit their workspace from the board's
+  `default_workdir`, so without it `pr-ci` has **no clone to push from**: it blocks
+  (`onboarding: default_workdir missing/mismatched`) and the PR is never opened. It will not
+  fall back to the operator's own checkout, by design — pushing from a human's working tree is
+  not a thing an agent gets to do.
+- `pr-ci` also *verifies* `default_workdir` against its clone path by resolved real path, and
+  blocks on a mismatch rather than mutating the board. Only you, here, at board-creation time,
+  set this value.
+- Devops onboarding clones into that same path. A board whose `default_workdir` points
+  somewhere else gives you two clones and a pipeline that pushes from the wrong one.
+
+There is no later step that can fix this: the `hermes kanban` verb that would change a board's
+default workdir after creation is one of the commands nothing in this team may run, so a board
+created without `--default-workdir` has to be recreated. Get it right at creation.
+
 The `--default-workdir` path is deterministic at creation time — it is the clone path devops
 will create during onboarding below, not a path that exists yet. Setting it here, as the
 resolved real path rather than the profile-relative `$HERMES_HOME/dev-team`, means no later step

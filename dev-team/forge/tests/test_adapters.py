@@ -642,5 +642,79 @@ class JenkinsStateTableTests(unittest.TestCase):
         self.assertEqual(self._adapter(http).ci_status("abc123"), "red")
 
 
+class GithubTokenEnvTests(unittest.TestCase):
+    """M1: `_gh` hands DEV_TEAM_GH_TOKEN to the `gh` subprocess as GH_TOKEN.
+
+    The token is passed for that subprocess only: never written into
+    os.environ, never into argv (which the dev-team guard lexes), never
+    printed. An existing GH_TOKEN always wins.
+    """
+
+    TOKEN = "ghp_" + "A" * 36
+    OTHER = "ghp_" + "B" * 36
+
+    def _adapter(self, run):
+        return GithubAdapter(make_record("github", "github"), run=run)
+
+    def _call(self, environ, run=None):
+        """Run one `gh` call under `environ` and return (run, env kwarg)."""
+        run = run or FakeRun(stdout="https://github.com/acme/widgets/pull/7\n")
+        with mock.patch.dict(os.environ, environ, clear=True):
+            before = dict(os.environ)
+            self._adapter(run).pr_open("feat/x", "title", "body")
+            self.assertEqual(dict(os.environ), before, "os.environ must not be mutated")
+        self.assertEqual(len(run.calls), 1)
+        return run, run.calls[0][1].get("env")
+
+    def test_dev_team_token_becomes_gh_token_for_the_subprocess(self):
+        run, env = self._call({"DEV_TEAM_GH_TOKEN": self.TOKEN})
+        self.assertIsInstance(env, dict)
+        self.assertEqual(env.get("GH_TOKEN"), self.TOKEN)
+        self.assertNotIn(self.TOKEN, " ".join(run.calls[0][0]),
+                         "the token must never reach argv")
+
+    def test_existing_gh_token_wins(self):
+        _, env = self._call({"DEV_TEAM_GH_TOKEN": self.TOKEN, "GH_TOKEN": self.OTHER})
+        self.assertEqual(env.get("GH_TOKEN"), self.OTHER)
+
+    def test_empty_gh_token_is_treated_as_unset(self):
+        _, env = self._call({"DEV_TEAM_GH_TOKEN": self.TOKEN, "GH_TOKEN": ""})
+        self.assertEqual(env.get("GH_TOKEN"), self.TOKEN)
+
+    def test_empty_dev_team_token_sets_nothing(self):
+        _, env = self._call({"DEV_TEAM_GH_TOKEN": ""})
+        self.assertNotIn("GH_TOKEN", env or {})
+
+    def test_absent_dev_team_token_sets_nothing(self):
+        _, env = self._call({"PATH": "/usr/bin"})
+        self.assertEqual(env.get("PATH"), "/usr/bin")
+        self.assertNotIn("GH_TOKEN", env or {})
+
+    def test_every_gh_call_carries_the_env(self):
+        for call in (
+            lambda a: a.mark_ready("7"),
+            lambda a: a.pr_status("7"),
+        ):
+            with self.subTest(call=call):
+                run = FakeRun(stdout=json.dumps({"number": 7, "state": "open", "draft": False}))
+                with mock.patch.dict(os.environ, {"DEV_TEAM_GH_TOKEN": self.TOKEN}, clear=True):
+                    call(self._adapter(run))
+                self.assertEqual(run.calls[0][1].get("env", {}).get("GH_TOKEN"), self.TOKEN)
+
+    def test_token_in_gh_stderr_is_redacted_on_the_error_path(self):
+        import io
+
+        from forge_core import _emit_error
+
+        run = FakeRun(stdout="", returncode=1,
+                      stderr=f"gh: failed to authenticate with {self.TOKEN}")
+        with mock.patch.dict(os.environ, {"DEV_TEAM_GH_TOKEN": self.TOKEN}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._adapter(run).mark_ready("7")
+        out = io.StringIO()
+        _emit_error(out, ctx.exception)
+        self.assertNotIn(self.TOKEN, out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
