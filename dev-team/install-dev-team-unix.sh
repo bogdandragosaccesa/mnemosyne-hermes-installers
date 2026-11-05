@@ -321,10 +321,10 @@ selected() {
 # forge_core.py's github_pat_/gh[pours]_ patterns). This installer itself
 # never executes COMMAND. But once the source is enabled, Hermes runs it at
 # the start of every later `hermes -p <prefix>devops ...` call this install
-# makes -- once per run, with an empty key cache -- and discards the
-# helper's stderr and never prints the value it returns. So no token value
-# is fetched, printed or written by THIS script: not to a config, not to
-# stdout, not under --dry-run.
+# makes -- once per `hermes -p <prefix>devops` process, with an empty key
+# cache -- and discards the helper's stderr and never prints the value it
+# returns. So no token value is fetched, printed or written by THIS script:
+# not to a config, not to stdout, not under --dry-run.
 #
 # Exactly three keys are touched. `hermes config set` merges into the
 # existing config, so nothing else in it is clobbered. CommandSource

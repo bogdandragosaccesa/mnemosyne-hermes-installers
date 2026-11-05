@@ -113,16 +113,45 @@ class PipelineDefaultWorkdirTextTests(unittest.TestCase):
 
 
 class ChangelogUnreleasedTests(unittest.TestCase):
-    """M6: the Unreleased section carries this release's entries, each with a PR
-    number, in Keep a Changelog form."""
+    """M6: the newest CHANGELOG section that has entries carries this release's
+    entries, each with a PR number, in Keep a Changelog form.
+
+    This selector deliberately does NOT pin `[Unreleased]` itself: a test that
+    asserted `[Unreleased]` is non-empty would be wrong by construction,
+    because every release cut empties `[Unreleased]` by moving its entries
+    into a new `## [x.y.z]` section and leaving the heading present-but-empty
+    behind (Keep a Changelog form). Asserting non-empty against that heading
+    would turn red on every single release. Instead the selector reads
+    `[Unreleased]` when it carries content, and otherwise falls through to
+    the first (i.e. newest) released `## [x.y.z]` section that has entries —
+    so the same five assertions below hold true both mid-cycle, while
+    `[Unreleased]` is being filled in, and immediately after a release cut,
+    while `[Unreleased]` is empty and the entries live under the new version
+    heading instead.
+    """
 
     def setUp(self):
         self.path = DEV_TEAM.parent / "CHANGELOG.md"
         self.assertTrue(self.path.is_file(), self.path)
         text = self.path.read_text(encoding="utf-8")
-        m = re.search(r"\n## \[Unreleased\]\n(.*?)(?=\n## \[)", text, re.S)
-        self.assertIsNotNone(m, "no [Unreleased] section followed by a released one")
-        self.section = m.group(1)
+        self.section = self._newest_section_with_entries(text)
+        self.assertIsNotNone(
+            self.section, "no CHANGELOG section ([Unreleased] or released) has entries"
+        )
+
+    @staticmethod
+    def _newest_section_with_entries(text):
+        """Return the content of the first (topmost -- newest) `## [...]`
+        section in `text` whose body is non-empty, or None if every section
+        is empty. Does not hard-code any version: it parses the `## [...]`
+        headings in document order and takes the first one with content,
+        whether that is `[Unreleased]` or the first released version below
+        it."""
+        sections = re.findall(r"\n## \[[^\]]+\][^\n]*\n(.*?)(?=\n## \[|\Z)", text, re.S)
+        for section in sections:
+            if section.strip():
+                return section
+        return None
 
     def test_unreleased_is_not_empty(self):
         self.assertTrue(self.section.strip(), "[Unreleased] has no entries")
@@ -152,6 +181,20 @@ class ChangelogUnreleasedTests(unittest.TestCase):
                       "--default-workdir", "redact"):
             with self.subTest(token=token):
                 self.assertIn(token, self.section)
+
+    def test_selector_falls_through_when_unreleased_is_empty(self):
+        """An empty `[Unreleased]` must not be selected: the selector should
+        fall through to the first released section that has entries, proving
+        the exact scenario a release cut produces."""
+        text = (
+            "\n## [Unreleased]\n\n"
+            "## [1.3.3] - 2026-11-05\n\n### Fixed\n\n- did a thing (#15)\n\n"
+            "## [1.3.2] - 2026-11-04\n\n### Fixed\n\n- did an older thing (#12)\n"
+        )
+        section = self._newest_section_with_entries(text)
+        self.assertIsNotNone(section)
+        self.assertIn("did a thing (#15)", section)
+        self.assertNotIn("did an older thing", section)
 
 
 if __name__ == "__main__":
