@@ -29,26 +29,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   written to a file — and that a missing or empty `DEV_TEAM_GH_TOKEN` is a
   `kanban_block(kind="needs_input")` labelled `setup: no-forge-token` with **no** fallback to
   `gh auth login`, a stored credential, a keyring, SSH, or `GITHUB_TOKEN`. (#15)
-- **The installers wire up the forge credential: `--forge-token-source COMMAND` /
-  `-ForgeTokenSource COMMAND`.** The `pr-ci` stage skill already promised these two exact flag
-  names, and neither installer had them, so the credential the whole stage depends on had no
-  documented way in. The flag records `COMMAND` as the `<prefix>devops` profile's
-  `secrets.command` — the profile name is derived from the installed prefix, so a `--prefix t2-`
-  install configures `t2-devops`, never a hardcoded `dev-devops` — and **appends**
-  `DEV_TEAM_GH_TOKEN` to that profile's `terminal.env_passthrough`, so a name already in that
-  list is kept. Those are the only two keys written; `hermes config set` merges into the existing
-  config, and the list merge is one shared implementation,
-  `dev-team/scripts/env_passthrough_merge.py`, called by both installers (it fails closed on
-  malformed input rather than silently treating it as an empty list). Re-running with the same
-  `COMMAND` is a no-op; a different `COMMAND` replaces `secrets.command` and nothing else.
-  **Only the command string is ever stored:** the installer never executes `COMMAND`, so no
-  token value is fetched, printed or written anywhere — not to a config, not to stdout, and not
-  under `--dry-run`/`-DryRun`, which prints the command string and changes nothing. A canary
-  test asserts a sentinel token value appears in no file the installer writes and in neither
-  stdout nor stderr, on a real run and under `--dry-run`, and that the command was not run. The
-  flag is documented in `dev-team/README.md` and `docs/how-the-dev-team-works.md`; with
-  `--only`/`-Only` excluding `devops` the installer says on stderr that there was no profile to
-  configure rather than silently doing nothing. (#15)
+- **The installers wire up the forge credential: `--forge-token-source COMMAND` (Unix) /
+  `-ForgeTokenSource COMMAND` (Windows, refused).** The `pr-ci` stage skill already promised
+  these two flag names, and neither installer had them, so the credential the whole stage
+  depends on had no documented way in. **Unix only** actually configures anything: the flag
+  records `COMMAND` as the `<prefix>devops` profile's `secrets.command.command` **and** sets
+  `secrets.command.enabled true` — Hermes' `CommandSource` requires both leaf keys (`enabled`
+  defaults to `false`, and a bare `secrets.command` string is refused once the key already holds
+  a correct mapping) — and **appends** `DEV_TEAM_GH_TOKEN` to that profile's
+  `terminal.env_passthrough`, so a name already in that list is kept. The profile name is derived
+  from the installed prefix, so a `--prefix t2-` install configures `t2-devops`, never a
+  hardcoded `dev-devops`. `hermes config set` merges into the existing config, the write of the
+  two leaf keys is idempotent even over an already-correct mapping, and the list merge is one
+  shared implementation, `dev-team/scripts/env_passthrough_merge.py`, called by both installers
+  (it fails closed on malformed input rather than silently treating it as an empty list).
+  Re-running with the same `COMMAND` is a no-op; a different `COMMAND` replaces only
+  `secrets.command.command`. A `COMMAND` containing a literal token shape (reusing `forge_core.py`'s
+  `github_pat_`/`gh[pours]_` patterns) is refused outright, exit 2, before anything is written —
+  so neither `--dry-run` output nor the config can ever hold a token. **`-ForgeTokenSource` on
+  the Windows installer is refused outright, exit 2, nothing written:** Hermes' `command` secret
+  source is POSIX-only (it shells out to `/bin/sh`), so the flag would otherwise record devops
+  profile config Hermes running on Windows can never read — a failure that would only surface
+  much later as a `pr-ci` card blocking with "no forge token", disconnected from its install-time
+  cause. **Only the command string is ever stored, and this installer itself never executes
+  `COMMAND`** — not to a config, not to stdout, and not under `--dry-run`. Once the source is
+  enabled, though, Hermes itself runs the helper at the start of every later
+  `hermes -p <prefix>devops ...` call the install makes and discards its stderr, so the value
+  still never leaks, but it is not true that nothing ever runs `COMMAND`. A canary test asserts a
+  sentinel token value appears in no file the installer writes and in neither stdout nor stderr,
+  on a real run and under `--dry-run`, and that the command was not run; a separate test runs the
+  real `hermes config set` against a real Hermes install and confirms the registry reports
+  `command` enabled (skipped cleanly when Hermes is not importable). The flag is documented in
+  `dev-team/README.md` and `docs/how-the-dev-team-works.md`; with `--only` excluding `devops` the
+  Unix installer says on stderr that there was no profile to configure rather than silently doing
+  nothing. (#15)
 
 ### Changed
 

@@ -17,10 +17,14 @@ token value must appear in no file the installer writes and in neither stdout
 nor stderr, `--dry-run` included, and the token-source command must never be
 executed.
 """
+import json
 import os
 import re
+import shutil
 import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -146,7 +150,15 @@ class ForgeTokenConfigTests(InstallerSetupMixin, unittest.TestCase):
     def test_the_command_string_is_written_to_the_devops_profile(self):
         proc = self.install(UNIX_FLAG, self.COMMAND)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"dev-devops config set secrets.command {self.COMMAND}", self.calls())
+        self.assertIn(f"dev-devops config set secrets.command.command {self.COMMAND}",
+                      self.calls())
+
+    def test_the_source_is_also_enabled(self):
+        """Defect A: CommandSource defaults `enabled` to False, so writing
+        only `secrets.command.command` would leave the source disabled."""
+        proc = self.install(UNIX_FLAG, self.COMMAND)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("dev-devops config set secrets.command.enabled true", self.calls())
 
     def test_the_token_variable_is_added_to_the_passthrough_list(self):
         proc = self.install(UNIX_FLAG, self.COMMAND)
@@ -165,7 +177,7 @@ class ForgeTokenConfigTests(InstallerSetupMixin, unittest.TestCase):
     def test_the_profile_is_derived_from_the_installed_prefix(self):
         proc = self.install("--prefix", "t2-", UNIX_FLAG, self.COMMAND)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"t2-devops config set secrets.command {self.COMMAND}", self.calls())
+        self.assertIn(f"t2-devops config set secrets.command.command {self.COMMAND}", self.calls())
         self.assertNotIn("dev-devops", self.calls())
 
     def test_an_existing_passthrough_list_is_appended_to(self):
@@ -257,8 +269,182 @@ class ForgeTokenSecrecyTests(InstallerSetupMixin, unittest.TestCase):
     def test_the_command_string_itself_is_what_gets_stored(self):
         proc = self.install(UNIX_FLAG, self.command)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn(f"dev-devops config set secrets.command {self.command}",
+        self.assertIn(f"dev-devops config set secrets.command.command {self.command}",
                       (self.root / "calls.log").read_text(encoding="utf-8"))
+
+
+class WindowsRefusalTests(unittest.TestCase):
+    """Defect B: `-ForgeTokenSource` must refuse on Windows (POSIX-only
+    secret source), not silently record devops profile config Hermes will
+    never read there. Static/text-level only -- per this file's own
+    convention, real Windows execution lives in the install-windows /
+    install-windows-ps51 CI jobs, so nothing here needs a live Windows host.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = PS1.read_text(encoding="utf-8")
+
+    def test_the_flag_is_refused_before_Set_ForgeTokenSource_is_reachable(self):
+        refusal_idx = self.text.index("is refused on Windows")
+        func_idx = self.text.index("function Set-ForgeTokenSource")
+        self.assertLess(refusal_idx, func_idx,
+                        "the Windows refusal must run before Set-ForgeTokenSource "
+                        "(the function that would write config) is ever called")
+
+    def test_the_refusal_exits_2(self):
+        refusal_idx = self.text.index("is refused on Windows")
+        snippet = self.text[max(0, refusal_idx - 400):refusal_idx + 400]
+        self.assertIn("exit 2", snippet,
+                      "refusal must use the installers' existing bad-usage exit code")
+
+    def test_the_refusal_names_the_posix_only_reason(self):
+        self.assertIn("POSIX-only", self.text)
+
+    def test_the_param_doc_no_longer_promises_it_works(self):
+        doc = self.text[self.text.index(".PARAMETER ForgeTokenSource"):]
+        doc = doc[:doc.index(".EXAMPLE")]
+        self.assertIn("Refused", doc)
+        self.assertNotIn("this installer never runs it", doc)
+
+    def test_readme_and_changelog_state_the_posix_only_limit(self):
+        readme = (DEV_TEAM / "README.md").read_text(encoding="utf-8")
+        changelog = (DEV_TEAM.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        for doc_name, text in (("README.md", readme), ("CHANGELOG.md", changelog)):
+            with self.subTest(doc=doc_name):
+                self.assertIn("POSIX-only", text,
+                             f"{doc_name} does not state the POSIX-only limit")
+                self.assertIn("refused", text.lower(),
+                             f"{doc_name} does not say -ForgeTokenSource is refused")
+
+
+class TokenShapeRefusalTests(InstallerSetupMixin, unittest.TestCase):
+    """Defect D / D3: a COMMAND containing a literal token shape is refused,
+    exit 2, nothing written, reusing forge_core.py's existing
+    github_pat_/gh[pours]_ patterns (no new regexes)."""
+
+    def _calls(self):
+        p = self.root / "calls.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def test_a_classic_token_shape_is_refused(self):
+        proc = self.install(UNIX_FLAG, "echo ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn("config set secrets.command", self._calls())
+
+    def test_a_fine_grained_pat_shape_is_refused(self):
+        proc = self.install(UNIX_FLAG, "echo github_pat_aaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn("config set secrets.command", self._calls())
+
+    def test_the_refusal_holds_under_dry_run_too(self):
+        """So the shape can never even reach --dry-run's own echo of COMMAND."""
+        canary = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        proc = self.install("--dry-run", UNIX_FLAG, f"echo {canary}")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertNotIn(canary, proc.stdout)
+        self.assertNotIn(canary, proc.stderr)
+
+    def test_a_command_with_no_token_shape_still_works(self):
+        """The check must not be so broad it refuses ordinary commands."""
+        proc = self.install(UNIX_FLAG, "pass show forge/github-token")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+def _find_agent_root():
+    """Best-effort discovery of a checkout exposing `agent.secret_sources`,
+    in the same spirit as test_install_unix.py's `_find_dotenv_python`:
+    never assumed to exist, so this returns None (never raises) when it
+    can't be found -- e.g. on CI, where only this installers repo is
+    checked out and no Hermes source tree sits under the runner's home."""
+    home = Path.home()
+    for pattern in (".hermes/*/agent/secret_sources/registry.py",
+                    ".hermes/installs/*/agent/secret_sources/registry.py"):
+        for hit in home.glob(pattern):
+            root = hit.parents[2]
+            if (root / "agent" / "secret_sources" / "registry.py").is_file():
+                return root
+    return None
+
+
+class RealHermesRoundTripTests(unittest.TestCase):
+    """The non-negotiable, non-stub test for defect A: CI was green on a
+    broken flag because every prior assertion ran only against a stub
+    `hermes`. This runs the REAL `hermes config set` against a throwaway
+    HERMES_HOME and reads the result back through Hermes' own registry
+    (`enabled_source_names`), so a regression to the single-string
+    `secrets.command` shape fails here even if every stub assertion above
+    is satisfied by accident.
+
+    Skips cleanly -- never fails red -- when either the real `hermes` CLI
+    or the `agent` package it ships is not reachable from this host, so CI
+    on an environment without a real Hermes install stays green.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hermes_bin = shutil.which("hermes")
+        if not cls.hermes_bin:
+            raise unittest.SkipTest("no real `hermes` CLI on PATH")
+        agent_root = _find_agent_root()
+        if agent_root is None:
+            raise unittest.SkipTest("no importable `agent` package found under ~/.hermes")
+        if str(agent_root) not in sys.path:
+            sys.path.insert(0, str(agent_root))
+        try:
+            import agent.secret_sources.registry  # noqa: F401
+        except Exception as exc:
+            raise unittest.SkipTest(f"agent.secret_sources.registry not importable: {exc!r}")
+
+    def _hermes(self, home, *args):
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(home)
+        env.pop("HERMES_PROFILE", None)
+        env.pop("HERMES_PROFILE_NAME", None)
+        return subprocess.run([self.hermes_bin, "config", *args], env=env,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_the_two_leaf_keys_make_the_real_registry_report_command_enabled(self):
+        from agent.secret_sources.registry import enabled_source_names
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+
+            r1 = self._hermes(home, "set", "secrets.command.command", "echo hi")
+            self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+            r2 = self._hermes(home, "set", "secrets.command.enabled", "true")
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+
+            r3 = self._hermes(home, "get", "secrets", "--json")
+            self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
+            secrets_cfg = json.loads(r3.stdout)
+
+            names = enabled_source_names(secrets_cfg, home)
+            self.assertIn("command", names,
+                          "writing secrets.command.command and secrets.command.enabled "
+                          "must enable the real CommandSource -- a regression to the "
+                          "single-string shape (defect A) would make this fail")
+
+    def test_writing_only_the_command_leaf_leaves_the_source_disabled(self):
+        """Pins WHY both leaf keys are required: `enabled` defaults to False,
+        which is the exact bug defect A shipped (only `secrets.command` was
+        written, as a plain string)."""
+        from agent.secret_sources.registry import enabled_source_names
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+
+            r1 = self._hermes(home, "set", "secrets.command.command", "echo hi")
+            self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+
+            r3 = self._hermes(home, "get", "secrets", "--json")
+            self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
+            secrets_cfg = json.loads(r3.stdout)
+
+            names = enabled_source_names(secrets_cfg, home)
+            self.assertNotIn("command", names)
 
 
 if __name__ == "__main__":

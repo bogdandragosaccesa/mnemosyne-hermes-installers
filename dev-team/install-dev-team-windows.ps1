@@ -60,14 +60,15 @@
     split on its first '/'.
 
 .PARAMETER ForgeTokenSource
-    Record COMMAND as the devops profile's secrets command. COMMAND must
-    print a line DEV_TEAM_GH_TOKEN=<value>; the pr-ci stage reads that
-    variable to push and to talk to the forge. Only the COMMAND STRING is
-    stored - this installer never runs it, so no token value is ever
-    fetched, printed or written anywhere. Writes exactly two keys on the
-    <Prefix>devops profile: secrets.command, and DEV_TEAM_GH_TOKEN appended
-    to terminal.env_passthrough. Re-running with the same COMMAND changes
-    nothing; a different COMMAND replaces only secrets.command.
+    Refused outright: Hermes' command secret source is POSIX-only (it needs
+    /bin/sh), so this flag would record devops profile config that Hermes
+    running on Windows can never read. Rather than silently writing a key
+    nothing will ever use -- a failure that would otherwise only surface
+    much later as a pr-ci card blocking with "no forge token", disconnected
+    from its install-time cause -- this installer exits 2 and writes
+    nothing. Use the Unix installer's --forge-token-source on a POSIX
+    Hermes host instead, or configure secrets.command.command /
+    secrets.command.enabled on the devops profile by hand from there.
 
 .EXAMPLE
     .\install-dev-team-windows.ps1
@@ -201,6 +202,18 @@ $EnvPassthroughMergePy = Join-Path (Join-Path $ScriptDir 'scripts') 'env_passthr
 $ForgeTokenEnvVar = 'DEV_TEAM_GH_TOKEN'
 $ForgeTokenRole   = 'devops'
 
+# -ForgeTokenSource is refused unconditionally on this (Windows) installer:
+# Hermes' `command` secret source only ever resolves on POSIX (it shells out
+# to /bin/sh), so no shape of this flag would ever do useful work here. Exit
+# 2 before anything is written -- see .PARAMETER ForgeTokenSource above for
+# why refusal, not a silent no-op, is the right failure mode. Set-ForgeTokenSource
+# below is therefore unreachable; its body is kept correct (two leaf keys,
+# same contract as the Unix installer) in case this refusal is ever lifted.
+if ($ForgeTokenSource) {
+    [Console]::Error.WriteLine("-ForgeTokenSource is refused on Windows: Hermes' command secret source is POSIX-only, so this flag would record devops profile config Hermes can never read here. Nothing was written. Use the Unix installer's --forge-token-source from a POSIX Hermes host instead.")
+    exit 2
+}
+
 # Refuse a decisions-only model in the tier table before anything is
 # written: an agent worker on a card routed to it could not run at all. The
 # list is deciders_core.py's one-line DECISION_MODELS tuple, so it has one
@@ -290,23 +303,32 @@ function Set-ForgeTokenSource {
       -ForgeTokenSource: record the operator's token command on the devops
       profile and pass $ForgeTokenEnvVar through to that profile's terminal.
 
-      Secrecy contract: only the command STRING is stored. The command is
-      never executed here, so no token value is fetched, printed or written -
-      not to a config, not to the console, not under -DryRun.
+      Unreachable on this (Windows) installer -- the unconditional refusal
+      above exits before this function is ever called. Kept correct so a
+      lifted refusal does not resurrect the wrong-shape bug defect A fixed
+      on the Unix side.
 
-      Exactly two keys are touched. `hermes config set` merges into the
-      existing config, so nothing else in it is clobbered. `secrets.command`
-      is a scalar: re-running with the same COMMAND writes the same value (a
-      no-op), and a different COMMAND replaces that key and nothing else.
-      `terminal.env_passthrough` is a list, so it is read first and MERGED by
-      dev-team\scripts\env_passthrough_merge.py, which appends the variable
-      only when absent - keeping a re-run a no-op and never dropping a name
-      the profile already passes through.
+      Secrecy contract: only the command STRING is stored. This installer
+      itself never executes COMMAND, so no token value is fetched, printed
+      or written here - not to a config, not to the console, not under
+      -DryRun.
+
+      Exactly three keys are touched. `hermes config set` merges into the
+      existing config, so nothing else in it is clobbered. CommandSource
+      requires a MAPPING with two leaf keys - secrets.command.command and
+      secrets.command.enabled; `enabled` defaults to false, so writing only
+      the parent key (or only .command) would leave the source disabled.
+      Writing the two leaf keys is idempotent even over an already-correct
+      mapping. `terminal.env_passthrough` is a list, so it is read first and
+      MERGED by dev-team\scripts\env_passthrough_merge.py, which appends the
+      variable only when absent - keeping a re-run a no-op and never
+      dropping a name the profile already passes through.
     #>
     param([string] $Name)
 
     if ($DryRun) {
-        Write-Host "  would run:  hermes -p $Name config set secrets.command $ForgeTokenSource"
+        Write-Host "  would run:  hermes -p $Name config set secrets.command.command $ForgeTokenSource"
+        Write-Host "  would run:  hermes -p $Name config set secrets.command.enabled true"
         Write-Host "  would add:  $ForgeTokenEnvVar to $Name's terminal.env_passthrough"
         return
     }
@@ -319,8 +341,10 @@ function Set-ForgeTokenSource {
         exit 1
     }
 
-    $out = Invoke-Hermes '-p' $Name 'config' 'set' 'secrets.command' $ForgeTokenSource
-    if ($LASTEXITCODE -ne 0) { Write-Error "Setting secrets.command on '$Name' failed: $out"; exit 1 }
+    $out = Invoke-Hermes '-p' $Name 'config' 'set' 'secrets.command.command' $ForgeTokenSource
+    if ($LASTEXITCODE -ne 0) { Write-Error "Setting secrets.command.command on '$Name' failed: $out"; exit 1 }
+    $out = Invoke-Hermes '-p' $Name 'config' 'set' 'secrets.command.enabled' 'true'
+    if ($LASTEXITCODE -ne 0) { Write-Error "Setting secrets.command.enabled on '$Name' failed: $out"; exit 1 }
 
     # An unset key exits non-zero; the merge treats empty input as an empty
     # list. Invoke-Hermes folds stderr in, so take the last non-empty line.
@@ -342,7 +366,7 @@ function Set-ForgeTokenSource {
 
     $out = Invoke-Hermes '-p' $Name 'config' 'set' 'terminal.env_passthrough' $merged
     if ($LASTEXITCODE -ne 0) { Write-Error "Setting terminal.env_passthrough on '$Name' failed: $out"; exit 1 }
-    Write-Host "  forge token: secrets.command set, $ForgeTokenEnvVar passed through"
+    Write-Host "  forge token: secrets.command.command and secrets.command.enabled set, $ForgeTokenEnvVar passed through"
 }
 
 # -ForgeTokenSource only has a target when the devops profile is in this run.

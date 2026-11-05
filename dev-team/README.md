@@ -140,42 +140,62 @@ naming what couldn't be checked — the guard fails closed, never open.
 | `--separate-memory` | `-SeparateMemory` | Give each profile its own Mnemosyne database instead of sharing the root one. Roles then cannot read each other's notes, so the board no longer hands work between them cleanly. |
 | `--team-memory DIR` | `-TeamMemory` | Use `DIR` as the team's shared Mnemosyne bank instead of the default `$HERMES_ROOT/dev-team-mnemosyne`. Created if missing. `DIR` is made absolute before use (a relative value no longer becomes a dangling relative symlink or a bank created under the installer's cwd). Refused when it resolves to, is nested under, or contains the operator's own bank (`$HERMES_ROOT/mnemosyne`) or any `MNEMOSYNE_HOME` the operator has set — checked in both directions after canonicalising the path (`.`/`..` collapsed, every symlink/junction on it followed; a link cycle is refused). |
 | `--adopt-team-memory` | `-AdoptTeamMemory` | For each existing profile that already has a real, private `mnemosyne/` directory: move it aside to `mnemosyne.pre-team-memory-<timestamp>` (a backup, never deleted), then link it to the team bank. Without this flag such a directory is kept, unlinked, and named in the summary. Either way, merging old private memories into the team bank is out of scope for this installer — that is on the operator. |
-| `--forge-token-source COMMAND` | `-ForgeTokenSource COMMAND` | Record `COMMAND` as the `<prefix>devops` profile's `secrets.command`, and append `DEV_TEAM_GH_TOKEN` to that profile's `terminal.env_passthrough`. See [The forge token](#the-forge-token) below. |
+| `--forge-token-source COMMAND` | `-ForgeTokenSource COMMAND` | Record `COMMAND` as the `<prefix>devops` profile's forge-token helper (`secrets.command.command` + `secrets.command.enabled`), and append `DEV_TEAM_GH_TOKEN` to that profile's `terminal.env_passthrough`. **Unix only** — refused with exit 2 on the Windows installer, since Hermes' command secret source is POSIX-only; see [The forge token](#the-forge-token) below. |
 | `--dry-run` | `-DryRun` | Print what would happen and change nothing. |
 
 ### The forge token
 
 `pr-ci` needs a forge credential to push a branch and to talk to the forge, and it reads it from
 **`DEV_TEAM_GH_TOKEN`** in its environment (`dev-team/skills/dev-team-stage-pr-ci/SKILL.md`).
-`--forge-token-source COMMAND` / `-ForgeTokenSource COMMAND` is how the operator wires that up,
-once, at install time:
+`--forge-token-source COMMAND` is how the operator wires that up, once, at install time, **on the
+Unix installer only**:
 
 ```bash
-./dev-team/install-dev-team-unix.sh --forge-token-source 'pass show forge/github-token'
+./dev-team/install-dev-team-unix.sh --forge-token-source 'printf "DEV_TEAM_GH_TOKEN=%s\n" "$(pass show forge/github-token)"'
 ```
 
+`-ForgeTokenSource` on the Windows installer is refused outright (exit 2, nothing written):
+Hermes' `command` secret source only ever resolves on POSIX (it shells out to `/bin/sh`), so the
+flag would otherwise record devops profile config that Hermes running on Windows can never read —
+a failure that would only surface much later as a `pr-ci` card blocking with "no forge token",
+disconnected from its install-time cause. Wire the credential from a POSIX Hermes host with the
+Unix installer instead, for example:
+
 ```powershell
-.\dev-team\install-dev-team-windows.ps1 -ForgeTokenSource 'op read op://dev/forge/token'
+# NOT supported: -ForgeTokenSource is refused on Windows. Run the Unix
+# installer's --forge-token-source from a POSIX Hermes host, e.g.:
+#   ./dev-team/install-dev-team-unix.sh --forge-token-source 'printf "DEV_TEAM_GH_TOKEN=%s\n" "$(op read op://dev/forge/token)"'
 ```
 
 `COMMAND` must print a line `DEV_TEAM_GH_TOKEN=<value>` — Hermes' own secrets-command contract.
-Use a token that can open PRs and push feature branches but **cannot merge and cannot push to the
-default branch** (see [Required controls](#onboarding-a-project)).
+`pass show forge/github-token` and `op read op://dev/forge/token` print only the bare token, not
+that line, so they must be wrapped as shown above (`printf 'DEV_TEAM_GH_TOKEN=%s\n' "$(...)"`) or
+Hermes' dotenv parser finds nothing and the stage blocks silently. `COMMAND` containing a literal
+token shape (`github_pat_…`, `ghp_…`, etc.) is refused outright — pass a command that *prints* the
+token, never the token itself. Use a token that can open PRs and push feature branches but
+**cannot merge and cannot push to the default branch** (see [Required
+controls](#onboarding-a-project)).
 
 What the installer writes, and nothing else:
 
-- `secrets.command` on the `<prefix>devops` profile (the profile name is derived from the
-  installed prefix, so a `--prefix t2-` install configures `t2-devops`);
+- `secrets.command.command` and `secrets.command.enabled` on the `<prefix>devops` profile (the
+  profile name is derived from the installed prefix, so a `--prefix t2-` install configures
+  `t2-devops`) — both leaf keys are required: Hermes' `CommandSource` defaults `enabled` to
+  `false`, so writing only `secrets.command.command` leaves the source disabled;
 - `DEV_TEAM_GH_TOKEN` **appended** to that profile's `terminal.env_passthrough`, so a name
   already in that list is kept.
 
-**Only the command string is stored.** The installer never executes `COMMAND`, so no token value
-is ever fetched, printed, or written anywhere — not to a config, not to stdout, and not under
-`--dry-run`/`-DryRun`, which prints the command string and changes nothing. Re-running with the
-same `COMMAND` is a no-op; re-running with a different one replaces `secrets.command` and nothing
-else. The flag only has a target when `devops` is in the run: with `--only`/`-Only` excluding it,
-the installer says so on stderr and writes nothing for it. The list merge itself is
-`dev-team/scripts/env_passthrough_merge.py`, shared by both installers.
+**Only the command string is stored, and this installer itself never executes `COMMAND`.** No
+token value is ever fetched, printed, or written by the installer — not to a config, not to
+stdout, and not under `--dry-run`. Once the source is enabled, though, **Hermes itself** runs the
+helper at the start of every later `hermes -p <prefix>devops ...` call this install makes (once
+per run, with an empty key cache); Hermes discards the helper's stderr and never prints the value
+it returns, so the token still never leaks, but it is no longer true that nothing ever runs
+`COMMAND`. Re-running with the same `COMMAND` is a no-op, even over an already-correct mapping;
+re-running with a different one replaces only `secrets.command.command`. The flag only has a
+target when `devops` is in the run: with `--only` excluding it, the installer says so on stderr
+and writes nothing for it. The list merge itself is `dev-team/scripts/env_passthrough_merge.py`,
+shared by both installers.
 
 Without this flag nothing about the token changes, and a `pr-ci` card with no
 `DEV_TEAM_GH_TOKEN` blocks with `setup: no-forge-token` rather than reaching for any fallback
