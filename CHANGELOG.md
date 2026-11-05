@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-11-05
+
 ### Added
 
 - **`forge` honours `DEV_TEAM_GH_TOKEN`.** The GitHub adapter's single subprocess choke point,
@@ -30,8 +32,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `kanban_block(kind="needs_input")` labelled `setup: no-forge-token` with **no** fallback to
   `gh auth login`, a stored credential, a keyring, SSH, or `GITHUB_TOKEN`. (#15)
 - **The installers wire up the forge credential: `--forge-token-source COMMAND` (Unix) /
-  `-ForgeTokenSource COMMAND` (Windows, refused).** The `pr-ci` stage skill already promised
-  these two flag names, and neither installer had them, so the credential the whole stage
+  `-ForgeTokenSource COMMAND` (Windows, refused).** The `pr-ci` stage skill documents the
+  token as Unix-only; on Windows the operator configures the `dev-devops` profile by hand.
+  Neither installer had a flag wiring the credential in, so the credential the whole stage
   depends on had no documented way in. **Unix only** actually configures anything: the flag
   records `COMMAND` as the `<prefix>devops` profile's `secrets.command.command` **and** sets
   `secrets.command.enabled true` — Hermes' `CommandSource` requires both leaf keys (`enabled`
@@ -775,7 +778,8 @@ Hermes Agent, covering Linux, macOS and Windows.
 - `--no-embeddings` / `-NoEmbeddings` has no effect, because `mnemosyne-hermes` 0.5.0
   declares `mnemosyne-memory[embeddings]` as a hard dependency.
 
-[Unreleased]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.3...HEAD
+[1.3.3]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/bogdandragosaccesa/mnemosyne-hermes-installers/compare/v1.2.0...v1.3.0

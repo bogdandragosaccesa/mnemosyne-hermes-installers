@@ -67,10 +67,11 @@ against. Get `repo-slug` right the first time — intake already fixed it; don't
 ## The forge token
 
 `forge` and `git push` both need a credential for the forge. The operator supplies it as
-**`DEV_TEAM_GH_TOKEN`** in your environment — set up once by the installer's
-`--forge-token-source` / `-ForgeTokenSource` flag, which records only a *command* that prints
-the token (never the value) and passes the variable through to this profile. You never see,
-choose, or store the token.
+**`DEV_TEAM_GH_TOKEN`** in your environment — set up by the **Unix** installer's
+`--forge-token-source` flag, which records only a *command* that prints the token (never the
+value) and passes the variable through to this profile. On Windows, `-ForgeTokenSource` is
+**refused**, because Hermes' command secret source is POSIX-only; on that platform the operator
+must configure the `dev-devops` profile by hand. You never see, choose, or store the token.
 
 **Before you push anything, check it is there:**
 

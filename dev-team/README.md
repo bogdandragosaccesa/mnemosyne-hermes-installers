@@ -188,8 +188,8 @@ What the installer writes, and nothing else:
 **Only the command string is stored, and this installer itself never executes `COMMAND`.** No
 token value is ever fetched, printed, or written by the installer — not to a config, not to
 stdout, and not under `--dry-run`. Once the source is enabled, though, **Hermes itself** runs the
-helper at the start of every later `hermes -p <prefix>devops ...` call this install makes (once
-per run, with an empty key cache); Hermes discards the helper's stderr and never prints the value
+helper once per `hermes -p <prefix>devops` process this install makes, at the start of that
+process, with an empty key cache; Hermes discards the helper's stderr and never prints the value
 it returns, so the token still never leaks, but it is no longer true that nothing ever runs
 `COMMAND`. Re-running with the same `COMMAND` is a no-op, even over an already-correct mapping;
 re-running with a different one replaces only `secrets.command.command`. The flag only has a
